@@ -4,6 +4,16 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": null,
-  "lessons": []
+  "updatedAt": "2026-07-29T09:51:24+09:00",
+  "lessons": [
+    {
+      "day": 1,
+      "week": 1,
+      "title": "event, record, stream과 Kafka가 해결하는 결합 문제",
+      "summary": "분산 로그가 producer와 consumer의 시간·속도·장애·재처리 결합을 어떻게 분리하는지 CS와 실무 관점에서 학습합니다.",
+      "path": "day-01.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-29T09:51:24+09:00"
+    }
+  ]
 }
