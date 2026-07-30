@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-07-29T09:51:24+09:00",
+  "updatedAt": "2026-07-30T09:01:02+09:00",
   "lessons": [
     {
       "day": 1,
@@ -14,6 +14,15 @@
       "path": "day-01.html",
       "kind": "lesson",
       "publishedAt": "2026-07-29T09:51:24+09:00"
+    },
+    {
+      "day": 2,
+      "week": 1,
+      "title": "queue·pub/sub·log의 소비 의미 비교",
+      "summary": "경쟁 소비·fan-out·retention·group별 offset·replay를 비교하고 Kafka log가 queue와 pub/sub를 어떻게 조합하는지 학습합니다.",
+      "path": "day-02.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-30T09:01:02+09:00"
     }
   ]
 }
