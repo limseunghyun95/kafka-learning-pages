@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-07-30T09:01:02+09:00",
+  "updatedAt": "2026-07-31T09:00:13+09:00",
   "lessons": [
     {
       "day": 1,
@@ -23,6 +23,15 @@
       "path": "day-02.html",
       "kind": "lesson",
       "publishedAt": "2026-07-30T09:01:02+09:00"
+    },
+    {
+      "day": 3,
+      "week": 1,
+      "title": "topic·partition·offset을 직접 생성·관찰",
+      "summary": "KRaft topic 생성 control path와 produce/fetch data path를 따라 topic ID, partition log, leader, partition-local offset을 직접 관찰합니다.",
+      "path": "day-03.html",
+      "kind": "lesson",
+      "publishedAt": "2026-07-31T09:00:13+09:00"
     }
   ]
 }
