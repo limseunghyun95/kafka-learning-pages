@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-07-31T09:00:13+09:00",
+  "updatedAt": "2026-08-01T09:00:49+09:00",
   "lessons": [
     {
       "day": 1,
@@ -32,6 +32,15 @@
       "path": "day-03.html",
       "kind": "lesson",
       "publishedAt": "2026-07-31T09:00:13+09:00"
+    },
+    {
+      "day": 4,
+      "week": 1,
+      "title": "key와 partitioner, partition 단위 ordering",
+      "summary": "Kafka 4.3 producer의 partition 선택 우선순위와 partition-local ordering을 따라가며 key 직렬화, retry, hot partition, partition 증설의 실패 창을 실험합니다.",
+      "path": "day-04.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-01T09:00:49+09:00"
     }
   ]
 }
