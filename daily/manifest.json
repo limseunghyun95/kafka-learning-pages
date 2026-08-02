@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-01T09:00:49+09:00",
+  "updatedAt": "2026-08-02T09:08:10+09:00",
   "lessons": [
     {
       "day": 1,
@@ -41,6 +41,15 @@
       "path": "day-04.html",
       "kind": "lesson",
       "publishedAt": "2026-08-01T09:00:49+09:00"
+    },
+    {
+      "day": 5,
+      "week": 1,
+      "title": "consumer group과 병렬성 상한",
+      "summary": "group coordinator의 membership·assignment·offset control path와 partition leader fetch data path를 분리하고, partition 수가 consumer 병렬성의 상한이 되는 이유와 rebalance 실패 창을 실험합니다.",
+      "path": "day-05.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-02T09:08:10+09:00"
     }
   ]
 }
