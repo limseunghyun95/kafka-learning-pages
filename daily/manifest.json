@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-02T09:08:10+09:00",
+  "updatedAt": "2026-08-05T09:09:48+09:00",
   "lessons": [
     {
       "day": 1,
@@ -50,6 +50,15 @@
       "path": "day-05.html",
       "kind": "lesson",
       "publishedAt": "2026-08-02T09:08:10+09:00"
+    },
+    {
+      "day": 6,
+      "week": 1,
+      "title": "랩: 두 group, 세 partition, replay 실험",
+      "summary": "두 consumer group의 독립 offset을 관찰하고 한 group만 안전하게 reset·replay하며, 외부 side effect 중복과 운영 복구 경계를 실험합니다.",
+      "path": "day-06.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-05T09:09:48+09:00"
     }
   ]
 }
