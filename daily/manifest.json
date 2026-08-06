@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-05T09:09:48+09:00",
+  "updatedAt": "2026-08-06T09:10:58+09:00",
   "lessons": [
     {
       "day": 1,
@@ -59,6 +59,15 @@
       "path": "day-06.html",
       "kind": "lab",
       "publishedAt": "2026-08-05T09:09:48+09:00"
+    },
+    {
+      "day": 7,
+      "week": 1,
+      "title": "회상: 그림 없이 produce→consume 흐름 설명",
+      "summary": "Week 1의 producer→partition log→consumer group 흐름을 상태 소유자·성공 시점·failure window로 재구성하고 3분 기술 답변으로 방어합니다.",
+      "path": "day-07.html",
+      "kind": "review",
+      "publishedAt": "2026-08-06T09:10:58+09:00"
     }
   ]
 }
