@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-06T09:10:58+09:00",
+  "updatedAt": "2026-08-08T09:00:34+09:00",
   "lessons": [
     {
       "day": 1,
@@ -68,6 +68,15 @@
       "path": "day-07.html",
       "kind": "review",
       "publishedAt": "2026-08-06T09:10:58+09:00"
+    },
+    {
+      "day": 8,
+      "week": 2,
+      "title": "append-only log와 segment roll",
+      "summary": "Partition log를 구성하는 active·closed segment의 파일 구조와 roll·retention 상태 전이를 OS page cache, sequential I/O, recovery 비용까지 연결합니다.",
+      "path": "day-08.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-08T09:00:34+09:00"
     }
   ]
 }
