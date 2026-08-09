@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-08T09:00:34+09:00",
+  "updatedAt": "2026-08-09T09:11:24+09:00",
   "lessons": [
     {
       "day": 1,
@@ -77,6 +77,15 @@
       "path": "day-08.html",
       "kind": "lesson",
       "publishedAt": "2026-08-08T09:00:34+09:00"
+    },
+    {
+      "day": 9,
+      "week": 2,
+      "title": "offset/time index와 lookup 비용",
+      "summary": "Sparse offset/time index의 fixed-width entry와 mmap binary search, record batch scan을 연결해 offset·timestamp lookup의 실제 비용과 실패 경계를 분석합니다.",
+      "path": "day-09.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-09T09:11:24+09:00"
     }
   ]
 }
