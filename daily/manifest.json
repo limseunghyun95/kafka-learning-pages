@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-09T09:11:24+09:00",
+  "updatedAt": "2026-08-10T09:16:31+09:00",
   "lessons": [
     {
       "day": 1,
@@ -86,6 +86,15 @@
       "path": "day-09.html",
       "kind": "lesson",
       "publishedAt": "2026-08-09T09:11:24+09:00"
+    },
+    {
+      "day": 10,
+      "week": 2,
+      "title": "sequential I/O, syscall, page cache",
+      "summary": "Sequential append와 batching, syscall, page cache·writeback·fsync의 완료 시점을 분리하고 replication·ack·cold read와의 실무 trade-off를 분석합니다.",
+      "path": "day-10.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-10T09:16:31+09:00"
     }
   ]
 }
