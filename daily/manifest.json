@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-10T09:16:31+09:00",
+  "updatedAt": "2026-08-11T09:14:09+09:00",
   "lessons": [
     {
       "day": 1,
@@ -95,6 +95,15 @@
       "path": "day-10.html",
       "kind": "lesson",
       "publishedAt": "2026-08-10T09:16:31+09:00"
+    },
+    {
+      "day": 11,
+      "week": 2,
+      "title": "record batch, compression, zero-copy의 경계",
+      "summary": "Record batch header와 압축·검증·저장·fetch 경로를 따라 batching의 비용 절감과 broker 재압축, TLS·zero-copy 경계를 분석합니다.",
+      "path": "day-11.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-11T09:14:09+09:00"
     }
   ]
 }
