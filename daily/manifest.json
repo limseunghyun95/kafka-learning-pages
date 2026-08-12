@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-11T09:14:09+09:00",
+  "updatedAt": "2026-08-12T09:10:53+09:00",
   "lessons": [
     {
       "day": 1,
@@ -104,6 +104,15 @@
       "path": "day-11.html",
       "kind": "lesson",
       "publishedAt": "2026-08-11T09:14:09+09:00"
+    },
+    {
+      "day": 12,
+      "week": 2,
+      "title": "Kafka protocol, metadata request, TCP connection",
+      "summary": "Bootstrap부터 ApiVersions·Metadata·partition leader routing까지의 binary protocol과 persistent TCP connection, stale metadata·advertised listener 실패 창을 분석합니다.",
+      "path": "day-12.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-12T09:10:53+09:00"
     }
   ]
 }

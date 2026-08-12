@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 12 · Kafka protocol, metadata request, TCP connection</title>
+</head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7">
+    <tr><td align="center" style="padding:24px 10px">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#ffffff;border:1px solid #dbe3ef;border-radius:20px">
+        <tr><td style="padding:34px 30px;background:#101a33;color:#ffffff;border-radius:20px 20px 0 0">
+          <div style="color:#9db0ff;font-size:12px;font-weight:800;letter-spacing:1.5px">APACHE KAFKA 4.3 · WEEK 2 / DAY 12</div>
+          <h1 style="margin:10px 0 8px;font-size:29px;line-height:1.25">Kafka protocol, metadata request,<br>TCP connection</h1>
+          <p style="margin:0;color:#cbd5f5">bootstrap 주소 하나가 partition leader 연결로 확장되는 과정 · 예상 이론 50분 + 실습 35분</p>
+        </td></tr>
+        <tr><td style="padding:30px">
+          <div style="padding:18px;background:#eef0ff;border-left:5px solid #5865d8;border-radius:10px">
+            <strong>한 줄 요약</strong><br>
+            <code>bootstrap.servers</code>는 모든 요청이 통과하는 proxy가 아니라 cluster를 발견하기 위한 seed다. Client는 DNS·TCP·선택적 TLS/SASL을 통과하고 <strong>ApiVersions</strong>로 호환 protocol을 고른 뒤 <strong>Metadata</strong>로 broker endpoint와 partition leader를 cache한다. 이후 Produce/Fetch는 담당 broker와의 persistent TCP connection으로 직접 보내며, response의 correlation ID와 error code를 보고 완료·갱신·재시도를 결정한다.
+          </div>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">1. 선수 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr><td style="width:31%;padding:10px;border:1px solid #d5ddeb"><strong>Wire protocol</strong></td><td style="padding:10px;border:1px solid #d5ddeb">서로 다른 process가 network에서 주고받는 byte의 순서·형식·의미에 대한 약속. Kafka는 TCP 위에서 binary protocol을 쓴다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Frame</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Stream인 TCP에서 메시지 한 개의 경계를 표시한 byte 묶음. Kafka request/response는 앞의 길이 값으로 경계를 찾는다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Big-endian</strong></td><td style="padding:10px;border:1px solid #d5ddeb">여러 byte인 정수를 가장 큰 자릿값 byte부터 전송하는 순서. Network byte order라고도 한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>API key / version</strong></td><td style="padding:10px;border:1px solid #d5ddeb">요청 종류와 그 요청 schema의 세대. 예를 들어 Metadata는 API key 3이며 version에 따라 field 형식이 달라진다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Correlation ID</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Client가 request에 넣고 broker가 response에 되돌려주는 32-bit 번호. 여러 미완료 요청 중 어느 응답인지 맞춘다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Client ID</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Broker log·metric에서 호출 application을 식별하는 논리 이름. 인증 주체와는 다르다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Bootstrap server</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Cluster 전체를 발견하기 위해 처음 접속하는 seed broker. 모든 broker를 적을 필요는 없지만 장애 domain이 다른 주소를 여러 개 둔다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Metadata</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Broker node ID·host·port와 topic partition의 leader/replica 정보를 담은 client-side routing map.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>advertised.listeners</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Broker가 client에게 “이 주소로 다시 접속하라”고 metadata에 광고하는 endpoint. 실제 listen 주소와 다를 수 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>TCP connection</strong></td><td style="padding:10px;border:1px solid #d5ddeb">양 endpoint 사이의 신뢰성 있는 ordered byte stream. 연결 수립에는 SYN→SYN-ACK→ACK가 필요하다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Persistent connection</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Request마다 새 연결을 만들지 않고 여러 request에 socket을 재사용해 handshake·TLS 비용을 분산하는 방식.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Non-blocking I/O</strong></td><td style="padding:10px;border:1px solid #d5ddeb">한 socket이 준비될 때까지 thread를 묶어 두지 않고 selector/event loop가 여러 connection의 준비 상태를 처리하는 방식.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>In-flight request</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Socket에 보냈지만 아직 response로 완료되지 않은 요청. 많으면 throughput이 늘 수 있지만 memory·timeout·ordering 위험도 커진다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Backoff / jitter</strong></td><td style="padding:10px;border:1px solid #d5ddeb">실패 후 즉시 반복하지 않고 기다리는 시간과 그 시간에 넣는 무작위 흔들림. 동시 reconnect storm을 줄인다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>TLS / SASL</strong></td><td style="padding:10px;border:1px solid #d5ddeb">TLS는 전송 암호화·인증, SASL은 application protocol 수준 인증 mechanism이다. SSL listener에서는 TLS handshake가 Kafka request보다 먼저다.</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">2. 왜 중요한가</h2>
+          <p>Application에는 <code>kafka-a:9092,kafka-b:9092</code> 몇 개만 적었는데, 실제로는 수십 broker와 수천 partition에 정확히 routing된다. 이 마법의 실체가 <strong>metadata cache</strong>다. 이 지도를 이해하면 “bootstrap은 연결되는데 produce는 실패한다”, “leader election 뒤 30초 timeout이 난다”, “broker를 늘렸더니 DNS connection storm이 생긴다”를 서로 다른 장애로 분리할 수 있다.</p>
+          <p>또한 TCP 연결 성공은 Kafka 요청 성공이 아니다. DNS→TCP→TLS→SASL→API version negotiation→authorization→leader routing→broker processing→response까지 각기 다른 완료 지점과 timeout이 있다. 실무자는 <em>어느 단계까지 성공했는지</em>를 증거로 좁혀야 한다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">3. Architecture: bootstrap에서 partition leader까지</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:separate;border-spacing:0 8px">
+            <tr><td style="width:28%;padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>1 · Resolve</strong></td><td style="padding:12px;background:#f1f4fa">Client가 bootstrap hostname을 DNS로 IP 목록에 해석</td></tr>
+            <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ 실패 시 다음 seed/IP · backoff + jitter</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>2 · Connect</strong></td><td style="padding:12px;background:#f1f4fa">TCP 3-way handshake; SSL이면 TLS, SASL이면 인증 sequence 추가</td></tr>
+            <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ persistent socket 생성</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>3 · Negotiate</strong></td><td style="padding:12px;background:#f1f4fa"><code>ApiVersionsRequest</code> → broker가 API별 min/max version 반환 → 공통 최고 version 선택</td></tr>
+            <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ protocol schema 합의</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>4 · Discover</strong></td><td style="padding:12px;background:#f1f4fa"><code>MetadataRequest</code> → broker endpoint + topic/partition leader·epoch 정보를 받음</td></tr>
+            <tr><td colspan="2" align="center" style="color:#c05a2c;font-weight:800">↓ <code>advertised.listeners</code> 주소를 client metadata cache에 저장</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>5 · Route</strong></td><td style="padding:12px;background:#f1f4fa">Partition별 batch를 leader node별 request로 묶고 필요한 broker socket 연결</td></tr>
+            <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ size + request header + body</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>6 · Exchange</strong></td><td style="padding:12px;background:#f1f4fa">Produce/Fetch request 전송; response correlation ID로 요청과 결과 연결</td></tr>
+            <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ 성공 확정 또는 error code/socket failure</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>7 · Repair</strong></td><td style="padding:12px;background:#f1f4fa"><code>NOT_LEADER_OR_FOLLOWER</code>·broker 단절이면 metadata 갱신 후 deadline 안에서 재-routing</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">Data path와 control path를 섞지 말기</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">경로</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">주체</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">무엇이 흐르는가</th></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6"><strong>Client data path</strong></td><td style="padding:10px;border:1px solid #cbd3e6">Producer/consumer ↔ partition leader broker</td><td style="padding:10px;border:1px solid #cbd3e6">Produce·Fetch request, record batch, ack·error</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6"><strong>Client discovery</strong></td><td style="padding:10px;border:1px solid #cbd3e6">Client ↔ 아무 broker</td><td style="padding:10px;border:1px solid #cbd3e6">ApiVersions, Metadata와 routing cache 갱신</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6"><strong>KRaft control path</strong></td><td style="padding:10px;border:1px solid #cbd3e6">Controller quorum → broker</td><td style="padding:10px;border:1px solid #cbd3e6">Leader·replica·topic config 등 cluster metadata. 일반 client는 controller listener에 접속하지 않는다.</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">4. CS 내부 동작: framing·상태 소유권·성공 시점</h2>
+          <h3 style="margin:20px 0 8px;color:#273b8f">TCP byte stream에서 Kafka message를 자르는 법</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr><td style="padding:12px;background:#101a33;color:#ffffff"><strong>INT32 size</strong><br><span style="color:#bec9e8">뒤에 올 request bytes 길이</span></td><td style="padding:12px;background:#273b8f;color:#ffffff"><strong>Request header</strong><br><span style="color:#dce3ff">API key · API version · correlation ID · client ID</span></td><td style="padding:12px;background:#5865d8;color:#ffffff"><strong>Request body</strong><br><span style="color:#ffffff">API version별 schema</span></td></tr>
+          </table>
+          <p>TCP의 한 번의 <code>read()</code>가 request 하나와 일치한다는 보장은 없다. Header 일부만 오거나 여러 request가 한 buffer에 함께 올 수 있다. Network thread는 먼저 4-byte length를 읽고 정확한 frame이 모일 때까지 상태를 유지한다. 길이·header·body의 integer는 big-endian이다. Flexible version에서는 compact type과 tagged fields가 쓰이므로 “모든 API header가 언제나 같은 byte 수”라고 가정하면 안 된다.</p>
+
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">상태</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">소유자</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">불변식·성공 의미</th></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Seed 주소 목록</td><td style="padding:10px;border:1px solid #cbd3e6">Client config</td><td style="padding:10px;border:1px solid #cbd3e6">최소 한 주소만 살아도 bootstrap 가능; cluster 전체 routing map은 아님.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">API version 범위</td><td style="padding:10px;border:1px solid #cbd3e6">Connection별 client network layer</td><td style="padding:10px;border:1px solid #cbd3e6">Client와 해당 broker가 모두 지원하는 schema만 사용. 공식 문서상 disconnect 뒤에는 다시 얻어야 한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Cluster metadata cache</td><td style="padding:10px;border:1px solid #cbd3e6">Client instance</td><td style="padding:10px;border:1px solid #cbd3e6">Topic partition → current leader endpoint mapping. Error·age·topic 변화로 갱신된다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Authoritative cluster metadata</td><td style="padding:10px;border:1px solid #cbd3e6">KRaft controller quorum·broker cache</td><td style="padding:10px;border:1px solid #cbd3e6">Controller가 leader/replica 변경을 기록하고 broker가 반영; client cache는 지연된 snapshot일 수 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Correlation map</td><td style="padding:10px;border:1px solid #cbd3e6">Client connection</td><td style="padding:10px;border:1px solid #cbd3e6">미완료 correlation ID가 response ID와 일치해야 요청을 정확히 완료한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Socket send/receive buffer</td><td style="padding:10px;border:1px solid #cbd3e6">OS kernel</td><td style="padding:10px;border:1px solid #cbd3e6"><code>send()</code> 성공은 kernel buffer 수용일 뿐 broker 처리·replication 성공이 아니다.</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">한 TCP connection에서의 ordering과 pipelining</h3>
+          <p>Kafka 공식 protocol 문서는 한 connection에서 request와 response 순서가 보존된다고 설명한다. Client는 non-blocking I/O로 앞선 response를 기다리는 동안 다음 request bytes를 socket buffer에 넣을 수 있다. 이것이 <strong>pipelining</strong>이다. 다만 앞 요청 처리나 큰 response가 늦으면 뒤 요청도 기다리는 head-of-line 효과가 생길 수 있고, <code>max.in.flight.requests.per.connection</code>이 memory·throughput·retry ordering의 경계를 만든다.</p>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">성공이 확정되는 시점은 계층마다 다르다</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>DNS 성공</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Hostname이 IP로 해석됨. 해당 IP의 Kafka가 정상이라는 뜻은 아니다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>TCP connect 성공</strong></td><td style="padding:10px;border:1px solid #d5ddeb">양쪽 kernel이 connection 상태를 가짐. TLS·인증·Kafka API는 아직일 수 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Request write 성공</strong></td><td style="padding:10px;border:1px solid #d5ddeb">보통 local socket buffer에 수용됨. Broker가 frame을 읽었다는 보장은 없다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Response 수신</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Correlation ID·API schema를 해석하고 partition별 error code와 ack 조건을 확인해야 application 성공이다.</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">5. 실무 설계 판단</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">판단</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">권장과 이유</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">검증 증거</th></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Bootstrap 주소</td><td style="padding:10px;border:1px solid #cbd3e6">서로 다른 failure domain의 2~3개 broker endpoint를 둔다. 모든 broker 목록은 불필요하지만 하나만 두면 첫 진입점 SPOF가 된다.</td><td style="padding:10px;border:1px solid #cbd3e6">각 주소 단독 DNS·TCP·TLS 접속, 한 주소 중단 후 bootstrap</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">광고 주소</td><td style="padding:10px;border:1px solid #cbd3e6"><code>advertised.listeners</code>는 client network namespace에서 해석·접속 가능해야 한다. Docker의 localhost, 사설 DNS, NAT가 대표 함정이다.</td><td style="padding:10px;border:1px solid #cbd3e6">실제 MetadataResponse endpoint를 client 위치에서 확인</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Timeout</td><td style="padding:10px;border:1px solid #cbd3e6">Connection setup, request, delivery/API deadline을 계층별로 구분한다. 단순히 모두 늘리면 탐지와 retry traffic만 늦어진다.</td><td style="padding:10px;border:1px solid #cbd3e6">DNS/TCP/TLS/queue/request latency histogram, timeout 원인별 count</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Metadata 갱신</td><td style="padding:10px;border:1px solid #cbd3e6">기본 client 자동 갱신을 신뢰하되 leader error·metadata age·rebootstrap metric을 본다. Application loop에서 매 record마다 metadata를 조회하지 않는다.</td><td style="padding:10px;border:1px solid #cbd3e6">metadata request rate, unknown leader 시간, retry 전후 node 변화</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Reconnect</td><td style="padding:10px;border:1px solid #cbd3e6">Exponential backoff와 jitter를 유지한다. 수천 client의 고정 간격 즉시 재접속은 복구 중 broker를 다시 압박한다.</td><td style="padding:10px;border:1px solid #cbd3e6">초당 connection 생성, accept queue, SYN retransmit, request queue</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Connection 수</td><td style="padding:10px;border:1px solid #cbd3e6">Client instance당 broker별 persistent connection을 재사용한다. 일반적으로 같은 broker에 application-level pool을 임의로 늘리지 않는다.</td><td style="padding:10px;border:1px solid #cbd3e6">broker별 connection count, file descriptor, request throughput·P99</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">Best practice · anti-pattern · edge case</h3>
+          <ul style="padding-left:22px">
+            <li><strong>Best practice:</strong> <code>client.id</code>에 service·environment·instance 역할을 식별할 수 있는 안정된 이름을 넣고 broker/client metric을 함께 본다. 인증용 secret은 넣지 않는다.</li>
+            <li><strong>Best practice:</strong> Load balancer를 bootstrap에 쓰더라도 metadata가 반환한 각 broker 주소로 client가 직접 갈 수 있는지 검증한다. L4 LB 하나가 data path의 영구 proxy라고 가정하지 않는다.</li>
+            <li><strong>Anti-pattern:</strong> <code>localhost</code>가 laptop·container·Kubernetes Pod·broker에서 같은 host를 뜻한다고 생각한다. Network namespace가 다르면 완전히 다른 endpoint다.</li>
+            <li><strong>Anti-pattern:</strong> 모든 <code>Disconnected</code> log를 장애로 paging한다. Idle connection 정리나 정상 broker rolling restart도 원인일 수 있으므로 request 실패율·복구 시간과 묶는다.</li>
+            <li><strong>Edge case:</strong> DNS가 여러 IP를 반환하면 client·JVM·OS cache 정책과 IP 순회가 failover 시간을 바꾼다. 짧은 DNS TTL만 설정한다고 JVM cache가 즉시 사라지는 것은 아니다.</li>
+            <li><strong>Edge case:</strong> NAT·firewall idle timeout이 client/broker의 <code>connections.max.idle.ms</code>보다 짧으면 양 endpoint가 다른 connection 상태를 믿는 half-open window가 생긴다.</li>
+            <li><strong>Version 차이:</strong> ApiVersions가 반환한 범위에서 client와 broker가 함께 지원하는 최고 version을 쓴다. 최신 client라는 이유만으로 최신 schema를 강제하지 않는다.</li>
+          </ul>
+
+          <h2 style="margin:30px 0 12px;color:#9b352e">6. 장애 대응: 증상에서 wire 단계로 좁히기</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse;font-size:14px;line-height:1.55">
+            <tr style="background:#ffe9e7"><th align="left" style="padding:8px;border:1px solid #e1c4c0">증상</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">먼저 수집할 증거/지표</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">가능한 가설</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">안전한 첫 조치</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">rollback/복구</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">하지 말아야 할 조치</th></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">Bootstrap connection 실패</td><td style="padding:8px;border:1px solid #e1c4c0">Client 위치의 DNS 결과, TCP SYN/timeout/refused, TLS handshake, broker listener·accept queue</td><td style="padding:8px;border:1px solid #e1c4c0">잘못된 port, DNS/NACL/firewall, broker 미기동, TLS protocol 불일치</td><td style="padding:8px;border:1px solid #e1c4c0">Seed별 계층 검사를 하고 살아 있는 주소 하나로 blast radius를 제한</td><td style="padding:8px;border:1px solid #e1c4c0">최근 DNS/listener 변경을 되돌리거나 올바른 seed를 재배포</td><td style="padding:8px;border:1px solid #e1c4c0">Retry 간격 0으로 만들기, 인증서를 끄고 원인 숨기기</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">Bootstrap은 되지만 node 연결 반복 실패</td><td style="padding:8px;border:1px solid #e1c4c0">MetadataResponse의 host/port, client namespace DNS·route, <code>advertised.listeners</code></td><td style="padding:8px;border:1px solid #e1c4c0">localhost/private hostname 광고, LB 뒤 endpoint 불일치, listener 보안 protocol mapping 오류</td><td style="padding:8px;border:1px solid #e1c4c0">광고 endpoint 하나를 client 위치에서 직접 해석·접속해 mismatch 확정</td><td style="padding:8px;border:1px solid #e1c4c0">이전 advertised listener로 rollback하거나 올바른 external listener를 추가</td><td style="padding:8px;border:1px solid #e1c4c0">Bootstrap 주소만 계속 추가하기, 모든 client 방화벽을 무차별 개방</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">Leader election 직후 timeout·retry 증가</td><td style="padding:8px;border:1px solid #e1c4c0">Error code, metadata age/request rate, leader epoch·controller event, request latency와 retry count</td><td style="padding:8px;border:1px solid #e1c4c0">Stale metadata, 새 leader 연결 미완료, broker queue 포화, retry amplification</td><td style="padding:8px;border:1px solid #e1c4c0">영향 partition과 새 leader를 확인하고 retry budget·backoff를 유지한 채 metadata 회복 관찰</td><td style="padding:8px;border:1px solid #e1c4c0">불안정 broker를 복구하거나 최근 reassignment/election 작업 중단</td><td style="padding:8px;border:1px solid #e1c4c0">모든 client 동시 재시작, request timeout 무한 증가</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">TCP established인데 Kafka timeout</td><td style="padding:8px;border:1px solid #e1c4c0">TLS/SASL state, correlation별 request age, broker network/request queue, throttle, GC·CPU</td><td style="padding:8px;border:1px solid #e1c4c0">인증 대기, broker handler 포화, quota throttle, 큰 request, response HOL</td><td style="padding:8px;border:1px solid #e1c4c0">가장 오래된 API와 broker queue 단계부터 특정하고 새 traffic을 제한</td><td style="padding:8px;border:1px solid #e1c4c0">문제 배포·quota 변경 rollback, 부하를 건강한 broker로 점진 분산</td><td style="padding:8px;border:1px solid #e1c4c0">TCP connect 성공만 보고 network 무관 단정, broker 전체 강제 재시작</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">7. 35분 실습: ApiVersions·metadata·TCP 상태 관찰</h2>
+          <div style="padding:16px;background:#f7f9fc;border:1px solid #dbe3ef;border-radius:10px">
+            <strong>사전 조건</strong>: 저장소 root, Docker Desktop, 공식 <code>apache/kafka:4.3.1</code> image. 이 실습은 single-broker KRaft라 replication 장애를 검증하지 않는다.<br>
+            <strong>목표</strong>: 같은 <code>bootstrap-server</code>를 사용해도 ApiVersions·Metadata·Produce/Fetch가 서로 다른 protocol request임을 관찰한다.
+          </div>
+
+          <h3 style="margin:22px 0 8px;color:#273b8f">실행 전에 결과 예측</h3>
+          <ol style="padding-left:22px">
+            <li><code>kafka-broker-api-versions</code> 출력에는 topic record가 아니라 API별 version 범위가 나오는가?</li>
+            <li>Topic describe 결과에서 partition 0~2의 leader는 single broker의 같은 node ID인가?</li>
+            <li>9092 대신 닫힌 19092를 주면 Kafka error response를 받을까, TCP connection 단계에서 막힐까?</li>
+          </ol>
+
+          <h3 style="margin:22px 0 8px;color:#273b8f">Step 1 · Cluster와 topic 준비</h3>
+          <pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere"><code>make up
+make topic-create TOPIC=day12.protocol
+make topic-describe TOPIC=day12.protocol</code></pre>
+          <p><strong>예상:</strong> 3개 partition과 leader/replica/ISR node ID가 보인다. 이는 application이 정적으로 갖고 있던 정보가 아니라 metadata request로 받은 routing 정보다.</p>
+
+          <h3 style="margin:22px 0 8px;color:#273b8f">Step 2 · Protocol version negotiation 관찰</h3>
+          <pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere"><code>docker compose exec broker \
+  /opt/kafka/bin/kafka-broker-api-versions.sh \
+  --bootstrap-server localhost:9092</code></pre>
+          <p><strong>예상:</strong> Broker node와 Produce·Fetch·Metadata·ApiVersions 등 API별 지원 version 범위가 길게 출력된다. 이것은 “Kafka 4.3” 한 숫자로 모든 request schema를 정하는 게 아니라 API마다 공통 지원 범위를 고른다는 증거다.</p>
+
+          <h3 style="margin:22px 0 8px;color:#273b8f">Step 3 · Persistent connection과 kernel 상태</h3>
+          <p>Terminal A에서 consumer를 열어 둔다.</p>
+          <pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere"><code>make consume TOPIC=day12.protocol GROUP=day12-observer</code></pre>
+          <p>Terminal B에서 Linux TCP table을 본다. 9092의 16진수 port는 <code>2384</code>, state <code>01</code>은 ESTABLISHED, <code>0A</code>는 LISTEN이다.</p>
+          <pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere"><code>docker compose exec broker bash -lc \
+  "awk 'NR&gt;1 &amp;&amp; ($2 ~ /:2384$/ || $3 ~ /:2384$/) \
+  {print $2, $3, $4}' /proc/net/tcp"</code></pre>
+          <p><strong>예상:</strong> Listener 외에 consumer와 broker 사이 ESTABLISHED entry가 보인다. Poll할 record가 없어도 connection은 재사용을 위해 남을 수 있다.</p>
+
+          <h3 style="margin:22px 0 8px;color:#9b352e">Step 4 · 실패 주입: 닫힌 bootstrap port</h3>
+          <p>먼저 예측한다: DNS는 성공하지만 TCP RST/refused가 나면 ApiVersionsRequest가 broker에 도착할 수 있는가?</p>
+          <pre style="margin:0;padding:14px;background:#2b1717;color:#ffe9e7;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere"><code>docker compose exec broker bash -lc \
+  "timeout 12s /opt/kafka/bin/kafka-broker-api-versions.sh \
+  --bootstrap-server localhost:19092"</code></pre>
+          <p><strong>예상:</strong> Connection 실패·bootstrap broker unavailable 경고 뒤 timeout된다. 이 경우 Kafka error code가 아니라 TCP 연결 전 단계 실패다. <code>timeout</code> command가 없다면 실행 후 경고 한두 번을 확인하고 <code>Ctrl+C</code>로 종료한다.</p>
+
+          <h3 style="margin:22px 0 8px;color:#273b8f">자주 나는 오류와 해결</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr><td style="padding:9px;border:1px solid #d5ddeb"><code>Connection to node -1 failed</code></td><td style="padding:9px;border:1px solid #d5ddeb">-1은 bootstrap 전 임시 node 표기일 수 있다. Broker health·port·DNS부터 본다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #d5ddeb">Bootstrap 뒤 실제 node만 실패</td><td style="padding:9px;border:1px solid #d5ddeb">Metadata에 담긴 <code>advertised.listeners</code>가 client namespace에서 접근 가능한지 확인한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #d5ddeb"><code>UnsupportedVersionException</code></td><td style="padding:9px;border:1px solid #d5ddeb">Client/broker 공통 API version이 없는지 확인하고 지원 조합으로 client를 맞춘다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #d5ddeb">TCP entry가 안 보임</td><td style="padding:9px;border:1px solid #d5ddeb">Terminal A consumer가 종료되지 않았는지 확인한다. <code>/proc/net/tcp6</code>도 확인한다.</td></tr>
+            <tr><td style="padding:9px;border:1px solid #d5ddeb">Port는 열렸지만 SSL error</td><td style="padding:9px;border:1px solid #d5ddeb">PLAINTEXT/SSL listener 선택, truststore, hostname verification을 분리해 확인한다.</td></tr>
+          </table>
+
+          <h3 style="margin:22px 0 8px;color:#273b8f">Cleanup</h3>
+          <p>Terminal A를 <code>Ctrl+C</code>로 끝낸 뒤, 학습 cluster를 계속 쓸 거면 topic만 삭제한다. 전체 종료는 named volume을 지우지 않는 <code>make down</code>을 쓴다.</p>
+          <pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere"><code>docker compose exec broker \
+  /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --delete --topic day12.protocol
+make down</code></pre>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">8. 놓치기 쉬운 함정</h2>
+          <ul style="padding-left:22px">
+            <li><strong>Bootstrap server가 leader를 대신하지 않는다.</strong> Metadata를 받은 뒤 Produce/Fetch는 담당 broker로 직접 간다.</li>
+            <li><strong>Metadata 성공과 data request 성공 사이에는 시간차가 있다.</strong> 그 사이 election이 일어나면 cache는 즉시 stale해질 수 있다.</li>
+            <li><strong>Correlation ID는 global message ID가 아니다.</strong> Connection의 미완료 request와 response를 맞추는 client-local 값이다.</li>
+            <li><strong>TCP ordered delivery가 application exactly-once를 만들지 않는다.</strong> Timeout 뒤 broker 처리 여부를 모르는 ambiguous window와 retry 중복은 별도 문제다.</li>
+            <li><strong>KRaft controller는 일반 client bootstrap endpoint가 아니다.</strong> Controller quorum과 broker listener를 섞으면 control/data plane 경계가 깨진다.</li>
+            <li><strong>Socket buffer가 넉넉하면 장애가 늦게 보일 수 있다.</strong> Local write 성공 뒤 remote가 처리하지 못해 request age가 증가할 수 있다.</li>
+          </ul>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">9. 대기업 기술 면접 질문 3개</h2>
+          <div style="padding:16px;background:#f7f9fc;border:1px solid #dbe3ef;border-radius:10px;margin-bottom:12px">
+            <strong>Q1. Producer에 bootstrap broker 두 개만 줬는데 100개 broker로 어떻게 정확히 routing합니까?</strong><br>
+            <strong>좋은 답변 구조:</strong> 요구사항(동적 leader) → bootstrap은 seed → DNS/TCP/ApiVersions/Metadata sequence → partition→leader cache → broker별 connection → stale metadata error와 refresh → seed failure·advertised listener trade-off까지 설명한다.
+          </div>
+          <div style="padding:16px;background:#f7f9fc;border:1px solid #dbe3ef;border-radius:10px;margin-bottom:12px">
+            <strong>Q2. “Port 9092 TCP connect는 되는데 produce timeout”을 어떻게 진단합니까?</strong><br>
+            <strong>좋은 답변 구조:</strong> TCP 성공의 범위를 제한 → TLS/SASL·ApiVersions·Metadata·authorization·leader·broker queue 계층화 → client error/correlation age와 broker request queue·throttle·controller event 증거 → 안전한 traffic 제한 → listener/timeout 무작정 변경을 피한다.
+          </div>
+          <div style="padding:16px;background:#f7f9fc;border:1px solid #dbe3ef;border-radius:10px">
+            <strong>Q3. 5,000개 producer가 broker rolling restart 때 동시에 재접속합니다. 무엇을 설계합니까?</strong><br>
+            <strong>좋은 답변 구조:</strong> Connection rate·FD·accept backlog·TLS CPU 수치 가정 → persistent connection과 exponential backoff+jitter → bootstrap failure domain·DNS cache → retry/delivery deadline → rolling batch size·readiness → dashboard와 rollback 기준을 방어한다.
+          </div>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">10. 복습과 채점 기준</h2>
+          <h3 style="margin:20px 0 8px;color:#273b8f">어제 Day 11 회상 3문제</h3>
+          <ol style="padding-left:22px">
+            <li>Compression이 record별이 아니라 batch 단위일 때 유리한 이유는?<br><strong>정답:</strong> 여러 record의 반복 패턴과 header 고정비를 함께 줄여 압축률과 request/syscall amortization이 좋아진다.</li>
+            <li>Broker가 compressed batch를 저장해도 CPU가 0이 아닌 이유는?<br><strong>정답:</strong> Record count·CRC·offset/sequence 같은 불변식 검증을 위해 payload를 해제할 수 있고 codec 강제 변환 시 재압축한다.</li>
+            <li>Zero-copy가 깨지는 대표 경계 두 가지는?<br><strong>정답:</strong> User-space TLS 암호화와 message/codec 변환. Consumer의 decompression·deserialization도 별도 CPU 작업이다.</li>
+          </ol>
+          <h3 style="margin:20px 0 8px;color:#273b8f">오늘 내용 확인 3문제</h3>
+          <ol style="padding-left:22px">
+            <li>Bootstrap server와 advertised listener의 역할 차이는?<br><strong>정답:</strong> Bootstrap은 최초 metadata 획득용 seed이고, advertised listener는 metadata가 알려주는 각 broker의 후속 접속 주소다.</li>
+            <li>Correlation ID가 보장하는 것과 보장하지 않는 것은?<br><strong>정답:</strong> Request-response 대응은 보장하지만 record의 전역 identity·중복 제거·exactly-once는 보장하지 않는다.</li>
+            <li>Leader가 바뀐 직후 client의 state transition을 설명하라.<br><strong>정답:</strong> 이전 leader로 request → leader/socket error → metadata update 요청 → 새 leader endpoint cache → 새/기존 connection으로 deadline 안에서 retry한다.</li>
+          </ol>
+          <p style="padding:12px;background:#fff7e6;border-left:4px solid #d59120"><strong>채점:</strong> 각 답에 “상태 소유자 + wire 단계 + 성공 시점 + 실패 창 + 안전한 대응” 중 4개 이상이 들어가면 면접 방어 수준이다. Component 이름만 나열하면 절반 점수다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">11. 확인한 공식 자료</h2>
+          <ul style="padding-left:22px">
+            <li><a href="https://kafka.apache.org/43/design/protocol/#network" style="color:#334fc2">Apache Kafka 4.3 Protocol · Network</a></li>
+            <li><a href="https://kafka.apache.org/43/design/protocol/#partitioning-and-bootstrapping" style="color:#334fc2">Apache Kafka 4.3 Protocol · Partitioning and bootstrapping</a></li>
+            <li><a href="https://kafka.apache.org/43/design/protocol/#retrieving-supported-api-versions" style="color:#334fc2">Apache Kafka 4.3 Protocol · Retrieving supported API versions</a></li>
+            <li><a href="https://kafka.apache.org/43/configuration/broker-configs/#brokerconfigs_advertised.listeners" style="color:#334fc2">Apache Kafka 4.3 Broker config · advertised.listeners</a></li>
+          </ul>
+
+          <div style="margin-top:28px;padding:18px;background:#101a33;color:#ffffff;border-radius:12px">
+            <strong style="color:#9db0ff">내일 Day 13</strong><br>
+            <strong>통합 랩: segment·index·batch 크기 관찰</strong><br>
+            오늘의 network routing과 지난 4일의 storage 구조를 하나의 재현 가능한 증거 체인으로 묶는다.
+          </div>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
