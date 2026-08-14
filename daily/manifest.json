@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-12T09:10:53+09:00",
+  "updatedAt": "2026-08-14T09:00:11+09:00",
   "lessons": [
     {
       "day": 1,
@@ -113,6 +113,15 @@
       "path": "day-12.html",
       "kind": "lesson",
       "publishedAt": "2026-08-12T09:10:53+09:00"
+    },
+    {
+      "day": 13,
+      "week": 2,
+      "title": "랩: segment·index·batch 크기 관찰",
+      "summary": "작은 segment와 촘촘한 sparse index를 구성해 record batch append, segment roll, offset→file position lookup과 flush 비용을 실제 파일·dump로 연결합니다.",
+      "path": "day-13.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-14T09:00:11+09:00"
     }
   ]
 }

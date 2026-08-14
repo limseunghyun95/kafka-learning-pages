@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kafka Day 13 · 랩: segment·index·batch 크기 관찰</title></head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#ffffff;border:1px solid #dbe3ef;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#101a33;color:#ffffff;border-radius:20px 20px 0 0"><div style="color:#9db0ff;font-size:12px;font-weight:800;letter-spacing:1.5px">APACHE KAFKA 4.3 · WEEK 2 / DAY 13 · INTEGRATION LAB</div><h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">segment·index·batch 크기 관찰</h1><p style="margin:0;color:#cbd5f5">논리 offset이 실제 file position과 record batch가 되는 증거 체인 · 예상 이론 35분 + 실습 40분</p></td></tr>
+<tr><td style="padding:30px">
+<div style="padding:18px;background:#eef0ff;border-left:5px solid #5865d8;border-radius:10px"><strong>한 줄 요약</strong><br>Partition의 record는 record batch로 active <code>.log</code> 끝에 append되고, 누적 bytes·시간 조건이 차면 새 base offset의 segment로 roll된다. Sparse <code>.index</code>는 모든 record가 아니라 일부 relative offset→file position만 보관하므로, lookup은 index로 근처에 점프한 뒤 log batch를 순차 scan한다. 오늘은 이 관계를 설정→생산→파일→dump→조회 결과로 직접 증명한다.</div>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+<tr><td style="width:30%;padding:9px;border:1px solid #d5ddeb"><strong>Partition log</strong></td><td style="padding:9px;border:1px solid #d5ddeb">한 partition의 ordered record sequence. 논리적으로 하나지만 물리적으로 여러 segment다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Segment</strong></td><td style="padding:9px;border:1px solid #d5ddeb">Log를 관리 가능한 크기로 자른 파일 묶음. 보통 같은 base offset의 <code>.log</code>, <code>.index</code>, <code>.timeindex</code>가 한 조다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Active segment</strong></td><td style="padding:9px;border:1px solid #d5ddeb">현재 append되는 마지막 segment. 과거 closed segment와 운영 제약이 다르다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Segment roll</strong></td><td style="padding:9px;border:1px solid #d5ddeb">크기·시간 조건으로 active segment를 닫고 다음 record offset을 base offset으로 새 segment를 여는 전이.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Base offset</strong></td><td style="padding:9px;border:1px solid #d5ddeb">Segment 파일명과 record batch header에 쓰이는 기준 offset. Index에는 이 값과의 차이인 relative offset이 들어간다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Sparse index</strong></td><td style="padding:9px;border:1px solid #d5ddeb">모든 record가 아니라 일정 log bytes 간격으로만 저장하는 드문드문한 색인.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>File position</strong></td><td style="padding:9px;border:1px solid #d5ddeb">해당 <code>.log</code> 파일 시작에서 몇 번째 byte인지 나타내는 위치.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Record batch</strong></td><td style="padding:9px;border:1px solid #d5ddeb">같은 partition record와 공통 header를 묶은 전송·저장 단위. 한 batch만 있어도 records count는 여러 개일 수 있다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Compression ratio</strong></td><td style="padding:9px;border:1px solid #d5ddeb">원본 bytes÷압축 bytes. 같은 record 수라도 codec·내용에 따라 segment 증가 속도가 달라진다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Preallocation</strong></td><td style="padding:9px;border:1px solid #d5ddeb">Index가 최대 크기 공간을 미리 잡는 동작. Active index의 apparent size와 실제 entry 수를 혼동하면 안 된다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Page cache</strong></td><td style="padding:9px;border:1px solid #d5ddeb">OS가 file page를 RAM에 cache하는 영역. File size는 디스크 구조이지 현재 RAM residency를 직접 뜻하지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #d5ddeb"><strong>Invariant</strong></td><td style="padding:9px;border:1px solid #d5ddeb">상태가 바뀌어도 반드시 지켜야 하는 조건. 예: segment 안 offset 순서와 index position의 유효성.</td></tr>
+</table>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">2. 왜 중요한가</h2>
+<p>운영에서 “disk가 빨리 찬다”, “retention이 늦다”, “cold read가 느리다”를 해결하려면 topic byte rate만 봐서는 부족하다. Partition별 segment 수, active segment age, codec, batch fill ratio, sparse index 밀도를 연결해야 원인을 설명할 수 있다. Segment가 너무 작으면 file·open/close·index·retention 작업 수가 늘고, 너무 크면 retention/compaction 단위와 장애 복구 scan 비용이 커진다.</p>
+<p>면접에서도 “Kafka는 sequential I/O라 빠릅니다”에서 멈추면 약하다. <strong>어떤 bytes가 append되고, index가 무엇을 생략하며, lookup이 어디부터 scan하고, 압축이 roll 시점을 어떻게 바꾸는지</strong>를 실제 artifact로 방어해야 실무 경험이 드러난다.</p>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">3. Architecture: produce부터 lookup까지의 증거 체인</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+<tr><td style="width:27%;padding:12px;background:#273b8f;color:#fff;border-radius:8px"><strong>1 · Batch</strong></td><td style="padding:12px;background:#f1f4fa">Producer가 같은 partition의 record를 모아 header·CRC·codec을 가진 batch 생성</td></tr><tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ ProduceRequest → partition leader</td></tr>
+<tr><td style="padding:12px;background:#273b8f;color:#fff;border-radius:8px"><strong>2 · Validate</strong></td><td style="padding:12px;background:#f1f4fa">Leader가 size·CRC·sequence를 검증하고 batch에 partition offset 범위 부여</td></tr><tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ active <code>.log</code> 끝에 append</td></tr>
+<tr><td style="padding:12px;background:#273b8f;color:#fff;border-radius:8px"><strong>3 · Index</strong></td><td style="padding:12px;background:#f1f4fa">누적 bytes가 <code>index.interval.bytes</code> 경계를 넘으면 relative offset→position entry 추가</td></tr><tr><td colspan="2" align="center" style="color:#c05a2c;font-weight:800">↓ segment size/time 조건</td></tr>
+<tr><td style="padding:12px;background:#273b8f;color:#fff;border-radius:8px"><strong>4 · Roll</strong></td><td style="padding:12px;background:#f1f4fa">기존 segment close·index trim → 다음 offset 이름의 새 log/index/timeindex 생성</td></tr><tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ Fetch/ListOffsets(offset X)</td></tr>
+<tr><td style="padding:12px;background:#273b8f;color:#fff;border-radius:8px"><strong>5 · Locate</strong></td><td style="padding:12px;background:#f1f4fa">Base offset으로 segment 선택 → sparse index binary search → floor entry position으로 점프</td></tr><tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ exact record는 batch decode·sequential scan</td></tr>
+<tr><td style="padding:12px;background:#273b8f;color:#fff;border-radius:8px"><strong>6 · Transfer</strong></td><td style="padding:12px;background:#f1f4fa">Page cache/disk에서 batch bytes를 읽고 FetchResponse로 consumer에 전달</td></tr>
+</table>
+<p><strong>Control path:</strong> KRaft controller는 topic config와 partition leadership을 관리하지만 record batch의 append·index entry 작성은 partition leader broker의 data path다. Controller quorum log와 user topic segment를 같은 “Kafka log”라는 말만으로 섞지 않는다.</p>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">4. CS 내부 동작: 소유자·불변식·비용 모델</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+<tr style="background:#e7ebff"><th align="left" style="padding:9px;border:1px solid #cbd3e6">상태</th><th align="left" style="padding:9px;border:1px solid #cbd3e6">소유자</th><th align="left" style="padding:9px;border:1px solid #cbd3e6">불변식·성공 의미</th></tr>
+<tr><td style="padding:9px;border:1px solid #cbd3e6">Batch buffer</td><td style="padding:9px;border:1px solid #cbd3e6">Producer</td><td style="padding:9px;border:1px solid #cbd3e6">같은 partition record만 묶고 delivery deadline 안에 전송한다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #cbd3e6">Active segment</td><td style="padding:9px;border:1px solid #cbd3e6">Partition leader log</td><td style="padding:9px;border:1px solid #cbd3e6">Append position은 뒤로만 이동하며 batch offset 범위가 겹치지 않는다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #cbd3e6">Offset index</td><td style="padding:9px;border:1px solid #cbd3e6">Segment</td><td style="padding:9px;border:1px solid #cbd3e6">Relative offset과 file position이 단조 증가하고 실제 log 경계를 가리킨다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #cbd3e6">Page residency</td><td style="padding:9px;border:1px solid #cbd3e6">OS kernel</td><td style="padding:9px;border:1px solid #cbd3e6">Cache hit면 disk I/O 없이 읽을 수 있지만 Kafka file metadata만으로 residency를 확정할 수 없다.</td></tr>
+<tr><td style="padding:9px;border:1px solid #cbd3e6">Topic config</td><td style="padding:9px;border:1px solid #cbd3e6">KRaft metadata</td><td style="padding:9px;border:1px solid #cbd3e6">Per-topic override가 broker default보다 우선하며 broker가 적용한 뒤 새 roll 판단에 반영된다.</td></tr>
+</table>
+<h3 style="margin:24px 0 8px;color:#273b8f">Sparse index의 공간·시간 trade-off</h3>
+<p><code>index.interval.bytes</code>를 I, segment log size를 S라고 단순화하면 offset index entry 수는 대략 <code>S÷I</code> 방향으로 증가한다. I를 작게 하면 exact offset 근처로 더 가까이 점프하지만 index memory/disk와 update 비용이 늘어난다. I를 크게 하면 index는 작지만 floor entry 뒤 scan bytes가 커진다. “더 촘촘할수록 무조건 좋다”가 아닌 locality와 memory의 교환이다.</p>
+<h3 style="margin:24px 0 8px;color:#273b8f">Batch와 segment size를 분리하기</h3>
+<p>Producer <code>batch.size</code>는 보내기 전 memory buffer의 목표 상한이고 topic <code>segment.bytes</code>는 broker log file roll 기준이다. 압축 가능한 payload는 같은 record 수라도 적은 on-disk bytes를 사용하므로 roll이 늦어진다. 공식 형식에서 record batch의 disk 크기는 <code>batchLength + 12 bytes</code>다. Record 수만 세어 segment 크기를 예측하면 틀린다.</p>
+<h3 style="margin:24px 0 8px;color:#273b8f">성공 확정과 failure window</h3>
+<p>Producer ack 성공은 설정된 replication 조건의 완료이지 index file이 물리 disk에 fsync됐다는 뜻은 아니다. Log append 후 process crash, page cache writeback 전 host failure, index corruption은 서로 다른 창이다. Kafka는 log가 원본이고 index는 파생 구조라 복구 시 재구성할 수 있지만, 운영자가 live file을 직접 수정하면 offset 불변식을 깨뜨릴 수 있다.</p>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+<tr style="background:#e7ebff"><th align="left" style="padding:9px;border:1px solid #cbd3e6">판단</th><th align="left" style="padding:9px;border:1px solid #cbd3e6">Best practice와 이유</th><th align="left" style="padding:9px;border:1px solid #cbd3e6">증거</th></tr>
+<tr><td style="padding:9px;border:1px solid #cbd3e6">Segment 크기</td><td style="padding:9px;border:1px solid #cbd3e6">Retention 정밀도·file 수·recovery scan·throughput을 함께 측정한다. 실습의 1MiB를 production 정답으로 복사하지 않는다.</td><td style="padding:9px;border:1px solid #cbd3e6">Partition byte rate, segment roll rate/age, file count, recovery 시간</td></tr>
+<tr><td style="padding:9px;border:1px solid #cbd3e6">Index 간격</td><td style="padding:9px;border:1px solid #cbd3e6">기본 4KiB를 먼저 사용하고 실제 random seek 병목 증거가 있을 때만 변경한다.</td><td style="padding:9px;border:1px solid #cbd3e6">Index bytes, lookup latency, cold-read I/O, page faults</td></tr>
+<tr><td style="padding:9px;border:1px solid #cbd3e6">Compression</td><td style="padding:9px;border:1px solid #cbd3e6">Record 수가 아니라 pre/post compression bytes·CPU·P99를 workload로 비교한다.</td><td style="padding:9px;border:1px solid #cbd3e6">Compression ratio, producer/broker/consumer CPU, network/disk bytes</td></tr>
+<tr><td style="padding:9px;border:1px solid #cbd3e6">관측</td><td style="padding:9px;border:1px solid #cbd3e6">File listing은 학습·forensics에 쓰고 운영 자동화는 supported metric/API를 우선한다.</td><td style="padding:9px;border:1px solid #cbd3e6">Broker metrics, topic config, log-dir API와 표본 dump</td></tr>
+</table>
+<ul style="padding-left:22px"><li><strong>Anti-pattern:</strong> Active <code>.index</code>의 preallocated 크기를 실제 entry 사용량으로 해석한다.</li><li><strong>Anti-pattern:</strong> Segment를 작게 하면 retention이 record 단위로 정확해진다고 믿는다. 삭제는 closed segment eligibility·check interval·file delay에도 좌우된다.</li><li><strong>Edge case:</strong> 하나의 record batch가 roll 경계보다 크거나 가까우면 segment가 설정값을 정확히 맞추지 않을 수 있다. Batch atomicity와 progress가 우선된다.</li><li><strong>Version/engine:</strong> 오늘은 Apache Kafka 4.3 local log 기준이다. Tiered storage가 켜지면 local/remote retention과 remote index/cache 계층을 별도로 봐야 한다.</li></ul>
+
+<h2 style="margin:30px 0 12px;color:#9b352e">6. 장애 대응 표</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word;font-size:14px;line-height:1.5">
+<tr style="background:#ffe9e7"><th align="left" style="padding:7px;border:1px solid #e1c4c0">증상</th><th align="left" style="padding:7px;border:1px solid #e1c4c0">먼저 수집할 증거/지표</th><th align="left" style="padding:7px;border:1px solid #e1c4c0">가능한 가설</th><th align="left" style="padding:7px;border:1px solid #e1c4c0">안전한 첫 조치</th><th align="left" style="padding:7px;border:1px solid #e1c4c0">rollback/복구</th><th align="left" style="padding:7px;border:1px solid #e1c4c0">하지 말아야 할 조치</th></tr>
+<tr><td style="padding:7px;border:1px solid #e1c4c0">File 수·metadata I/O 급증</td><td style="padding:7px;border:1px solid #e1c4c0">Partition별 segment count/roll rate, config 변경, FD, disk latency</td><td style="padding:7px;border:1px solid #e1c4c0">너무 작은 segment/time roll, partition 과다, restart 반복</td><td style="padding:7px;border:1px solid #e1c4c0">영향 topic·partition을 특정하고 roll 원인을 분리</td><td style="padding:7px;border:1px solid #e1c4c0">최근 override를 이전 값으로 되돌리고 자연 roll 관찰</td><td style="padding:7px;border:1px solid #e1c4c0">Live segment 삭제, 전체 broker 동시 재시작</td></tr>
+<tr><td style="padding:7px;border:1px solid #e1c4c0">Offset 조회·cold read 지연</td><td style="padding:7px;border:1px solid #e1c4c0">Lookup offset/segment, page fault·disk read, index size/interval, request P99</td><td style="padding:7px;border:1px solid #e1c4c0">Page cache miss, sparse scan 증가, slow disk, oversized segment</td><td style="padding:7px;border:1px solid #e1c4c0">한 partition·offset 표본으로 index jump와 disk latency를 확인</td><td style="padding:7px;border:1px solid #e1c4c0">최근 index/segment 변경 rollback, hot data warm-up</td><td style="padding:7px;border:1px solid #e1c4c0">Index file 수동 편집, cache drop를 production에서 실행</td></tr>
+<tr><td style="padding:7px;border:1px solid #e1c4c0">Disk 증가가 예상보다 빠름</td><td style="padding:7px;border:1px solid #e1c4c0">Ingress raw/compressed bytes, codec, batch fill, replicas, retention eligibility</td><td style="padding:7px;border:1px solid #e1c4c0">압축률 저하, 작은 batch, traffic 증가, retention 지연</td><td style="padding:7px;border:1px solid #e1c4c0">Record count와 bytes를 분리하고 topic별 변화 시점 비교</td><td style="padding:7px;border:1px solid #e1c4c0">Codec/producer 설정 rollback, 안전한 보존 정책 조정</td><td style="padding:7px;border:1px solid #e1c4c0">원인 없이 retention 즉시 축소, log directory 직접 삭제</td></tr>
+</table>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">7. 40분 통합 랩</h2>
+<div style="padding:15px;background:#f7f9fc;border:1px solid #dbe3ef;border-radius:10px"><strong>사전 조건:</strong> 저장소 root, Docker Desktop, <code>apache/kafka:4.3.1</code>. Single broker라 replication durability는 측정하지 않는다.<br><strong>산출물:</strong> config → segment 파일 목록 → batch dump → end offset의 네 증거를 같은 topic에 연결한다.</div>
+<h3 style="margin:22px 0 8px;color:#273b8f">실행 전 예측</h3><ol style="padding-left:22px"><li>1MiB segment에 약 1.3MiB의 압축이 잘 안 되는 payload를 쓰면 <code>.log</code>는 몇 개 이상 생길까?</li><li><code>index.interval.bytes=1024</code>면 기본 4096보다 index entry가 대략 어느 방향으로 변할까?</li><li>Producer가 2,000 record를 보내도 dump의 batch 수가 반드시 2,000일까?</li></ol>
+<h3 style="margin:22px 0 8px;color:#273b8f">Step 1 · 관찰하기 쉬운 topic</h3>
+<pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word"><code>make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create \
+  --topic day13.storage --partitions 1 --replication-factor 1 \
+  --config segment.bytes=1048576 \
+  --config index.interval.bytes=1024 \
+  --config compression.type=producer
+docker compose exec broker /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 --entity-type topics \
+  --entity-name day13.storage --describe</code></pre>
+<p><strong>예상:</strong> 세 override가 보인다. Topic config는 KRaft metadata에 기록되고 broker log의 다음 판단에 적용된다.</p>
+<h3 style="margin:22px 0 8px;color:#273b8f">Step 2 · Batch를 만들며 약 1.3MiB 생산</h3>
+<pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word"><code>docker compose exec broker bash -lc \
+  "for i in \$(seq 1 2200); do \
+  printf '%s|%0600d\n' \"\$i\" \"\$i\"; done | \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day13.storage \
+  --producer-property batch.size=65536 \
+  --producer-property linger.ms=20 \
+  --producer-property compression.type=none"</code></pre>
+<p><strong>예상:</strong> Record별 호출이 batch로 합쳐지고 1MiB 경계 근처에서 새 segment가 열린다. Exact 개수는 header·batch 경계와 producer timing 때문에 계산치와 다를 수 있다.</p>
+<h3 style="margin:22px 0 8px;color:#273b8f">Step 3 · 물리 파일과 논리 offset 연결</h3>
+<pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word"><code>docker compose exec broker bash -lc \
+  "find /tmp/kraft-combined-logs/day13.storage-0 \
+  -maxdepth 1 -type f \
+  \( -name '*.log' -o -name '*.index' -o -name '*.timeindex' \) \
+  -exec ls -ln {} + | sort -k9"
+docker compose exec broker /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 \
+  --topic day13.storage --time -1</code></pre>
+<p><strong>관찰:</strong> 파일명의 20자리 숫자는 base offset이다. End offset은 “다음에 쓸 offset”이므로 마지막 record offset보다 1 크다. Active index의 preallocated size가 entry 수와 같다고 해석하지 않는다.</p>
+<h3 style="margin:22px 0 8px;color:#273b8f">Step 4 · Batch header와 index dump</h3>
+<pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word"><code>docker compose exec broker bash -lc \
+  "f=\$(find /tmp/kraft-combined-logs/day13.storage-0 \
+  -name '*.log' | sort | head -1); \
+  /opt/kafka/bin/kafka-dump-log.sh \
+  --files \"\$f\" --print-data-log=false | head -80"
+docker compose exec broker bash -lc \
+  "f=\$(find /tmp/kraft-combined-logs/day13.storage-0 \
+  -name '*.index' | sort | head -1); \
+  /opt/kafka/bin/kafka-dump-log.sh \
+  --files \"\$f\" | head -50"</code></pre>
+<p><strong>확인할 것:</strong> BaseOffset·lastOffset·count·compression·size와 index의 relative offset/position. Record count가 batch count보다 큰지, index position이 증가하는지 말로 설명한다. CLI 출력 field는 version별로 조금 다를 수 있다.</p>
+<h3 style="margin:22px 0 8px;color:#9b352e">Step 5 · 실패 주입: 과도한 flush의 비용</h3>
+<p>먼저 예측한다: <code>flush.messages=1</code>은 segment/batch 수를 직접 1:1로 만들까, 아니면 fsync 빈도를 바꿀까?</p>
+<pre style="margin:0;padding:14px;background:#2b1717;color:#ffe9e7;border-radius:8px;white-space:pre-wrap;word-break:break-word"><code>docker compose exec broker /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 --entity-type topics \
+  --entity-name day13.storage --alter \
+  --add-config flush.messages=1
+time docker compose exec broker bash -lc \
+  "seq 1 500 | /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day13.storage"
+docker compose exec broker /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 --entity-type topics \
+  --entity-name day13.storage --alter \
+  --delete-config flush.messages</code></pre>
+<p><strong>예상:</strong> 강제 fsync 빈도가 증가해 latency/throughput 비용이 생길 수 있지만 segment roll·record batch와 같은 개념은 아니다. Laptop cache·background I/O 때문에 한 번의 wall time만으로 일반화하지 말고 반복 측정한다.</p>
+<h3 style="margin:22px 0 8px;color:#273b8f">자주 나는 오류와 해결</h3>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word"><tr><td style="padding:8px;border:1px solid #d5ddeb">Topic exists</td><td style="padding:8px;border:1px solid #d5ddeb">이전 결과와 섞지 말고 cleanup 뒤 재생성한다.</td></tr><tr><td style="padding:8px;border:1px solid #d5ddeb">Segment 하나뿐</td><td style="padding:8px;border:1px solid #d5ddeb">실제 <code>.log</code> bytes가 1MiB를 넘었는지 확인하고 payload 수를 늘린다.</td></tr><tr><td style="padding:8px;border:1px solid #d5ddeb">Dump file missing</td><td style="padding:8px;border:1px solid #d5ddeb">Container log path와 topic-partition directory 이름을 다시 찾는다.</td></tr><tr><td style="padding:8px;border:1px solid #d5ddeb">Index 크기가 10MiB</td><td style="padding:8px;border:1px solid #d5ddeb">Active index preallocation일 수 있다. Closed segment 또는 dump entry를 본다.</td></tr><tr><td style="padding:8px;border:1px solid #d5ddeb">Permission denied</td><td style="padding:8px;border:1px solid #d5ddeb">Host volume을 직접 수정하지 말고 container 안에서 read-only 명령만 수행한다.</td></tr></table>
+<h3 style="margin:22px 0 8px;color:#273b8f">Cleanup</h3><pre style="margin:0;padding:14px;background:#101827;color:#e8edf7;border-radius:8px;white-space:pre-wrap;word-break:break-word"><code>docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --delete --topic day13.storage
+make down</code></pre><p><code>make down</code>은 named volume을 보존한다. Volume 삭제는 이 랩의 cleanup에 필요하지 않다.</p>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">8. 놓치기 쉬운 함정</h2>
+<ul style="padding-left:22px"><li>Topic offset은 file byte position이 아니다. Index가 둘 사이를 연결한다.</li><li><code>.index</code>와 <code>.timeindex</code>는 목적이 다르다. 후자는 timestamp→offset 근처 탐색이다.</li><li>File size 합계에 replicas와 partition 수를 곱하지 않으면 cluster capacity를 과소평가한다.</li><li>Compression ratio가 좋아진 뒤 segment 수가 줄어도 record 유입량이 줄었다는 뜻은 아니다.</li><li>Retention은 active segment 일부 record만 잘라 삭제하지 않는다. Segment roll 정책이 삭제 정밀도에 영향을 준다.</li><li>Dump tool은 forensic 증거다. Production hot path 전체 파일을 반복 dump하면 I/O와 CPU를 만든다.</li></ul>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">9. 대기업 기술 면접 질문 3개</h2>
+<div style="padding:15px;background:#f7f9fc;border:1px solid #dbe3ef;border-radius:10px;margin-bottom:10px"><strong>Q1. Kafka가 offset으로 빠르게 찾는 내부 경로를 설계 수준으로 설명하세요.</strong><br><strong>좋은 답변:</strong> 요구 offset→base offset으로 segment 선택→relative offset sparse index binary search→floor position→record batch scan→page cache/cold disk 비용→index interval trade-off까지 말한다.</div>
+<div style="padding:15px;background:#f7f9fc;border:1px solid #dbe3ef;border-radius:10px;margin-bottom:10px"><strong>Q2. Segment를 1GiB에서 64MiB로 줄이자는 제안을 어떻게 검토합니까?</strong><br><strong>좋은 답변:</strong> Partition byte rate·retention 정밀도·file/FD/roll rate·recovery·compaction·cold read 수치를 가정하고 실험, rollback, tiered storage 대안을 방어한다.</div>
+<div style="padding:15px;background:#f7f9fc;border:1px solid #dbe3ef;border-radius:10px"><strong>Q3. Record count는 그대로인데 disk 증가율이 두 배가 됐습니다. 진단 순서는?</strong><br><strong>좋은 답변:</strong> Raw/compressed bytes→batch fill·codec/schema/payload entropy→replica/partition 변화→retention lag→filesystem 증거를 보고 안전한 설정 rollback과 data loss 없는 대응을 제시한다.</div>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">10. 복습과 정답</h2>
+<h3 style="margin:18px 0 6px;color:#273b8f">어제 Day 12 회상 3문제</h3><ol style="padding-left:22px"><li>Bootstrap server는 왜 영구 proxy가 아닌가?<br><strong>정답:</strong> Metadata 획득용 seed이며 이후 client가 partition leader broker에 직접 연결한다.</li><li>Correlation ID의 역할은?<br><strong>정답:</strong> Connection의 미완료 request와 response를 연결한다. Record 전역 ID나 중복 제거 기능은 아니다.</li><li>Bootstrap은 되는데 produce가 실패하는 대표 원인은?<br><strong>정답:</strong> Metadata의 <code>advertised.listeners</code> endpoint가 client network에서 해석·접속 불가능한 경우다.</li></ol>
+<h3 style="margin:18px 0 6px;color:#273b8f">오늘 확인 3문제</h3><ol style="padding-left:22px"><li>Offset lookup이 index 하나로 exact record를 바로 반환하지 않는 이유는?<br><strong>정답:</strong> Sparse index는 floor entry만 제공해 그 position부터 log batch를 scan해야 한다.</li><li>Batch size와 segment size의 차이는?<br><strong>정답:</strong> 전자는 producer가 record를 묶는 memory/전송 단위 설정, 후자는 broker log file roll 기준이다.</li><li>왜 live index file을 직접 고치면 안 되는가?<br><strong>정답:</strong> Log의 offset·position 불변식을 깨고 corruption/recovery 위험을 만든다. Index는 broker가 log에서 재구성해야 한다.</li></ol>
+<p style="padding:12px;background:#fff7e6;border-left:4px solid #d59120"><strong>채점:</strong> 각 답에 상태 소유자, byte/offset 관계, state transition, 실패 창, 비용 trade-off 중 4개 이상을 연결하면 면접 방어 수준이다.</p>
+
+<h2 style="margin:30px 0 12px;color:#273b8f">11. 확인한 공식 자료</h2><ul style="padding-left:22px"><li><a href="https://kafka.apache.org/43/configuration/topic-configs/#topicconfigs_segment.bytes" style="color:#334fc2">Apache Kafka 4.3 Topic config · segment.bytes</a></li><li><a href="https://kafka.apache.org/43/configuration/topic-configs/#topicconfigs_index.interval.bytes" style="color:#334fc2">Apache Kafka 4.3 Topic config · index.interval.bytes</a></li><li><a href="https://kafka.apache.org/43/implementation/message-format/#record-batch" style="color:#334fc2">Apache Kafka 4.3 Record batch format</a></li><li><a href="https://kafka.apache.org/43/configuration/topic-configs/#topicconfigs_flush.messages" style="color:#334fc2">Apache Kafka 4.3 Topic config · flush.messages</a></li></ul>
+<div style="margin-top:28px;padding:18px;background:#101a33;color:#fff;border-radius:12px"><strong style="color:#9db0ff">내일 Day 14 · Week 2 회상</strong><br><strong>“디스크인데 왜 빠른가” 3분 설명</strong><br>그림 없이 locality·batching·page cache·sparse index·zero-copy의 경계와 장애 trade-off를 하나의 답변으로 압축한다.</div>
+</td></tr></table></td></tr></table></body></html>
