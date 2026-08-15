@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 14 · 회상: “디스크인데 왜 빠른가” 3분 설명</title>
+</head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7">
+    <tr><td align="center" style="padding:24px 10px">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#ffffff;border:1px solid #dbe3ef;border-radius:20px">
+        <tr><td style="padding:34px 30px;background:#102a43;color:#ffffff;border-radius:20px 20px 0 0">
+          <div style="color:#9fd3ff;font-size:12px;font-weight:800;letter-spacing:1.5px">APACHE KAFKA 4.3 · WEEK 2 / DAY 14 · RECALL &amp; TECH REVIEW</div>
+          <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">“디스크인데 왜 빠른가”<br>3분 설명</h1>
+          <p style="margin:0;color:#d4e8f8">성능을 마법이 아닌 비용 모델·hot/cold path·실패 창으로 방어하기 · 예상 회상 40분 + 실습 30분</p>
+        </td></tr>
+        <tr><td style="padding:30px">
+          <div style="padding:18px;background:#eaf6ff;border-left:5px solid #1976a8;border-radius:10px">
+            <strong>한 줄 요약</strong><br>
+            Kafka가 빠른 이유는 “디스크가 메모리보다 빨라서”가 아니라 <strong>partition-local sequential append, record batch로 비용 분할, OS page cache, sparse index, 재사용 가능한 binary batch와 효율적 network path</strong>가 작은 random I/O와 byte copy를 줄이기 때문이다.
+          </div>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">1. 선수 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr><td style="width:30%;padding:10px;border:1px solid #d5ddeb"><strong>Locality</strong></td><td style="padding:10px;border:1px solid #d5ddeb">가까운 주소를 연속 접근하는 성질. 디스크 seek, CPU cache miss, page fault를 줄이는 출발점이다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Sequential append</strong></td><td style="padding:10px;border:1px solid #d5ddeb">현재 active segment의 끝에 연속해서 쓰는 패턴. “Kafka의 모든 I/O가 항상 순차”라는 뜻은 아니다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Syscall</strong></td><td style="padding:10px;border:1px solid #d5ddeb">application이 kernel에 read·write·send 같은 작업을 요청하는 경계. 호출과 context 전환에도 고정 비용이 든다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Page cache</strong></td><td style="padding:10px;border:1px solid #d5ddeb">OS가 file의 page를 RAM에 보관하는 통합 cache. write가 먼저 cache에 반영될 수 있으므로 page cache 도착과 물리 매체 영속화는 다르다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Writeback / fsync</strong></td><td style="padding:10px;border:1px solid #d5ddeb">writeback은 dirty page를 저장장치로 내리는 과정, fsync는 application이 그 완료를 명시적으로 요구하는 syscall이다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Record batch</strong></td><td style="padding:10px;border:1px solid #d5ddeb">여러 record를 header 하나와 함께 묶는 protocol·append·compression 단위. Kafka 성능 설명의 실제 단위다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Amortization</strong></td><td style="padding:10px;border:1px solid #d5ddeb">요청·header·syscall 같은 고정 비용을 여러 record가 나눠 내는 것. batch가 커질수록 record당 비용은 낮아지지만 대기시간은 늘 수 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Sparse index</strong></td><td style="padding:10px;border:1px solid #d5ddeb">모든 record가 아니라 일정 byte 간격마다 offset→file position 표식을 두는 작은 색인. 근처로 점프한 뒤 batch를 순차 scan한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>mmap</strong></td><td style="padding:10px;border:1px solid #d5ddeb">file을 process 가상 주소 공간에 매핑해 OS page 단위로 접근하는 방식. index lookup이 일반 heap object tree일 필요를 줄인다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Zero-copy / sendfile</strong></td><td style="padding:10px;border:1px solid #d5ddeb">file page를 application user buffer로 다시 복사하지 않고 socket으로 보내는 최적화 경로. copy가 문자 그대로 0회라는 뜻은 아니다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Hot / cold path</strong></td><td style="padding:10px;border:1px solid #d5ddeb">hot은 필요한 page가 RAM cache에 있는 경로, cold는 storage read·page fault가 필요한 경로다. 평균 성능만 보면 cold tail을 놓친다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Throughput / p99</strong></td><td style="padding:10px;border:1px solid #d5ddeb">throughput은 단위시간 처리량, p99는 요청 99%가 그 이하에 끝나는 지연. 높은 처리량과 낮은 tail latency는 같은 목표가 아니다.</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">2. 왜 중요한가</h2>
+          <p>면접에서 “Kafka는 sequential I/O와 zero-copy를 써서 빠릅니다”만 말하면 키워드 암기다. 강한 답은 <strong>어떤 비용이 사라지고, 어느 상태가 RAM·kernel·disk·replica에 있으며, 성공 응답은 무엇을 보장하고, TLS·cold cache·작은 batch에서 왜 경로가 달라지는지</strong>까지 설명한다.</p>
+          <p>실무에서도 이 모델은 튜닝 순서를 바꾼다. 처리량이 낮다고 바로 disk를 교체하지 않고 batch fill ratio·request rate·compression ratio·network·page cache hit 가능성·partition skew를 먼저 본다. p99가 튀면 평균 throughput과 분리해 cold read, page reclaim, flush storm, TLS CPU, broker queue를 증거로 좁힌다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">3. Architecture: 한 batch의 빠른 경로</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:separate;border-spacing:0 8px">
+            <tr><td style="width:25%;padding:12px;background:#145a7d;color:#ffffff;border-radius:8px"><strong>1 · Producer</strong></td><td style="padding:12px;background:#eff7fb">같은 partition의 record를 accumulator에서 batch로 묶고 압축</td></tr>
+            <tr><td colspan="2" align="center" style="color:#1976a8;font-weight:800">↓ persistent TCP · ProduceRequest · partition leader로 직접 routing</td></tr>
+            <tr><td style="padding:12px;background:#145a7d;color:#ffffff;border-radius:8px"><strong>2 · Leader</strong></td><td style="padding:12px;background:#eff7fb">batch 검증 → active <code>.log</code> 끝에 append → partition offset 부여</td></tr>
+            <tr><td colspan="2" align="center" style="color:#1976a8;font-weight:800">↓ write syscall → kernel page cache의 dirty page</td></tr>
+            <tr><td style="padding:12px;background:#145a7d;color:#ffffff;border-radius:8px"><strong>3 · Replication</strong></td><td style="padding:12px;background:#eff7fb">follower fetch·append → 설정된 <code>acks</code>와 ISR 조건 만족</td></tr>
+            <tr><td colspan="2" align="center" style="color:#1976a8;font-weight:800">↓ ProduceResponse · ack와 개별 fsync 완료를 혼동하지 않기</td></tr>
+            <tr><td style="padding:12px;background:#145a7d;color:#ffffff;border-radius:8px"><strong>4 · Lookup</strong></td><td style="padding:12px;background:#eff7fb">sparse offset index로 target 근처 file position → batch scan</td></tr>
+            <tr><td colspan="2" align="center" style="color:#1976a8;font-weight:800">↓ caught-up consumer라면 page cache hit 가능</td></tr>
+            <tr><td style="padding:12px;background:#145a7d;color:#ffffff;border-radius:8px"><strong>5 · Fetch</strong></td><td style="padding:12px;background:#eff7fb">저장된 binary batch를 FetchResponse로 전송; 가능한 경로에서 sendfile 활용</td></tr>
+            <tr><td colspan="2" align="center" style="color:#c05a2c;font-weight:800">TLS·변환·cold cache·tiny batch → fast path 일부 이탈 → CPU·I/O·p99 비용 증가</td></tr>
+          </table>
+          <p><strong>요청·응답을 시간순으로 읽기:</strong> ① producer는 metadata로 leader를 찾고 batch를 보낸다. ② leader는 batch를 검증하고 partition log에 append한다. ③ follower가 leader를 pull하여 복제하고 ack 정책이 충족되면 client 성공이 확정된다. ④ consumer는 offset을 넣어 fetch하며 index가 근처로 안내한다. ⑤ broker는 log와 같은 batch format을 가능한 한 재사용해 전송하고 consumer가 압축을 해제한다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">4. CS 내부 동작: 3분 답변의 여섯 문장</h2>
+          <ol style="padding-left:22px">
+            <li><strong>Locality:</strong> partition leader는 active segment 끝에 append하여 random overwrite와 tree update를 피한다.</li>
+            <li><strong>Amortization:</strong> producer가 record를 batch로 묶어 request round trip, header, checksum, syscall 비용을 여러 record에 분산한다.</li>
+            <li><strong>Compression:</strong> 비슷한 record를 함께 압축하면 network·disk byte가 감소하며 compressed batch는 log와 fetch 경로에서 유지될 수 있다.</li>
+            <li><strong>OS cache:</strong> broker heap에 record object cache를 복제하기보다 filesystem과 page cache를 사용해 RAM을 cache로 활용하고 GC 부담을 피한다.</li>
+            <li><strong>Index:</strong> sparse index가 offset 근처로 점프하게 하고, 마지막 구간은 sequential batch scan으로 확정해 index 크기와 lookup 비용을 trade-off한다.</li>
+            <li><strong>Network:</strong> persistent TCP와 큰 fetch, 공통 binary batch format, 가능한 plaintext 경로의 sendfile이 connection·copy 비용을 줄인다.</li>
+          </ol>
+
+          <h3 style="margin:24px 0 8px;color:#145a7d">비용 모델: 무엇을 줄였는가</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#dff2fb"><th align="left" style="padding:10px;border:1px solid #c7dce7">설계</th><th align="left" style="padding:10px;border:1px solid #c7dce7">줄이는 비용</th><th align="left" style="padding:10px;border:1px solid #c7dce7">새 비용·경계</th></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Sequential append</td><td style="padding:10px;border:1px solid #c7dce7">seek, random write, 복잡한 in-place update</td><td style="padding:10px;border:1px solid #c7dce7">segment roll·retention·recovery 관리</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Batch</td><td style="padding:10px;border:1px solid #c7dce7">record당 request·header·syscall</td><td style="padding:10px;border:1px solid #c7dce7">linger·buffer memory·큰 request tail</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Compression</td><td style="padding:10px;border:1px solid #c7dce7">network와 storage bytes</td><td style="padding:10px;border:1px solid #c7dce7">producer/consumer CPU, codec·데이터 엔트로피</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Page cache</td><td style="padding:10px;border:1px solid #c7dce7">반복 physical read, JVM object cache·GC</td><td style="padding:10px;border:1px solid #c7dce7">memory pressure, cold start, dirty writeback</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Sparse index</td><td style="padding:10px;border:1px solid #c7dce7">index RAM·disk footprint</td><td style="padding:10px;border:1px solid #c7dce7">표식 사이 batch scan</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">sendfile 가능 경로</td><td style="padding:10px;border:1px solid #c7dce7">kernel→user→kernel 재복사</td><td style="padding:10px;border:1px solid #c7dce7">TLS면 Kafka에서 미사용, NIC copy는 남음</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#145a7d">상태 소유자·불변식·성공 시점</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#dff2fb"><th align="left" style="padding:10px;border:1px solid #c7dce7">상태</th><th align="left" style="padding:10px;border:1px solid #c7dce7">소유자</th><th align="left" style="padding:10px;border:1px solid #c7dce7">불변식·완료 의미</th></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Accumulator batch</td><td style="padding:10px;border:1px solid #c7dce7">producer process</td><td style="padding:10px;border:1px solid #c7dce7">partition별로 묶이며 client crash 전에는 broker durable state가 아니다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Log bytes·offset</td><td style="padding:10px;border:1px solid #c7dce7">partition leader</td><td style="padding:10px;border:1px solid #c7dce7">append 순서와 offset은 partition-local이다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Dirty page</td><td style="padding:10px;border:1px solid #c7dce7">OS kernel</td><td style="padding:10px;border:1px solid #c7dce7">RAM 반영과 storage 영속화는 다른 state transition이다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Replica progress</td><td style="padding:10px;border:1px solid #c7dce7">leader/follower replica</td><td style="padding:10px;border:1px solid #c7dce7">acks와 ISR 조건이 client 성공 범위를 정한다. 내일 더 깊게 다룬다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">Fetched bytes</td><td style="padding:10px;border:1px solid #c7dce7">consumer</td><td style="padding:10px;border:1px solid #c7dce7">network 수신은 deserialize·업무 처리·offset commit 완료가 아니다.</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#145a7d">Hot path와 cold path</h3>
+          <p><strong>Hot:</strong> producer batch가 충분히 차고, leader queue가 짧고, consumer가 head 근처를 읽어 page cache가 warm하며, 큰 fetch와 reusable batch가 작동한다. <strong>Cold:</strong> 오래된 replay, broker restart 뒤 cache miss, memory reclaim, tiny batch, 작은 fetch, TLS CPU, 압축 해제나 protocol 변환이 겹치면 storage read와 copy·CPU 비용이 p99에 나타난다. 따라서 “평소 디스크 read가 0”인 cluster도 replay 때는 전혀 다른 시스템처럼 보일 수 있다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">5. 실무 설계 판단</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#dff2fb"><th align="left" style="padding:10px;border:1px solid #c7dce7">상황</th><th align="left" style="padding:10px;border:1px solid #c7dce7">판단</th><th align="left" style="padding:10px;border:1px solid #c7dce7">이유·측정</th></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">작은 event, 높은 QPS</td><td style="padding:10px;border:1px solid #c7dce7">latency SLO 안에서 <code>linger.ms</code>·<code>batch.size</code> 조정</td><td style="padding:10px;border:1px solid #c7dce7">batch-size-avg, records-per-request-avg, request latency를 함께 본다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">network 포화</td><td style="padding:10px;border:1px solid #c7dce7">대표 payload로 lz4/zstd 비교</td><td style="padding:10px;border:1px solid #c7dce7">compression ratio만 아니라 producer·consumer CPU와 p99를 비교한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">대규모 replay</td><td style="padding:10px;border:1px solid #c7dce7">rate limit·시간대·별도 capacity 계획</td><td style="padding:10px;border:1px solid #c7dce7">cold reads가 live traffic의 page cache와 disk queue를 오염시킬 수 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">TLS 필수</td><td style="padding:10px;border:1px solid #c7dce7">보안을 유지하고 CPU·connection 비용을 capacity에 반영</td><td style="padding:10px;border:1px solid #c7dce7">Kafka 공식 문서상 SSL에서는 sendfile을 사용하지 않는다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c7dce7">offset lookup 많음</td><td style="padding:10px;border:1px solid #c7dce7"><code>index.interval.bytes</code>를 문제 증거가 있을 때만 조정</td><td style="padding:10px;border:1px solid #c7dce7">더 촘촘한 index는 scan을 줄이지만 index footprint와 mmap page를 늘린다.</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#145a7d">Best Practice</h3>
+          <ul style="padding-left:22px">
+            <li>성능 목표를 MB/s, records/s, p50/p99, durability, replay RTO로 분리하고 한 설정으로 모두 좋아진다고 가정하지 않는다.</li>
+            <li>평균 cluster 지표보다 partition별 bytes in/out, request queue, disk latency, CPU, page cache pressure와 batch 지표를 같은 시간축으로 본다.</li>
+            <li>batch·compression 변경은 실제 message size와 key skew를 재현한 canary에서 검증하고 이전 값을 rollback 기준으로 남긴다.</li>
+            <li>live consume와 historical replay capacity를 따로 산정하고 replay rate limit·중단 조건·복구 순서를 runbook에 둔다.</li>
+            <li>application ack, replica ack, OS writeback, consumer 처리 완료를 로그와 dashboard에서 서로 다른 상태로 표시한다.</li>
+          </ul>
+
+          <h3 style="margin:24px 0 8px;color:#145a7d">Anti-pattern·edge case·version 경계</h3>
+          <ul style="padding-left:22px">
+            <li><strong>Anti-pattern:</strong> “디스크가 메모리보다 빠르다.” 정확한 말은 Kafka가 큰 linear I/O와 cache를 활용해 random I/O 비용을 피한다는 것이다.</li>
+            <li><strong>Anti-pattern:</strong> <code>flush.messages=1</code>을 durability 만능 설정으로 일괄 적용한다. replica 기반 내구성과 latency·throughput 비용을 함께 설계해야 한다.</li>
+            <li><strong>Edge case:</strong> batch가 잘 안 차는 저유량 partition은 설정상 batch.size가 커도 실제 amortization 이익이 작다.</li>
+            <li><strong>Edge case:</strong> highly compressed batch는 network를 절약하지만 decompression CPU와 큰 uncompressed working set을 만든다.</li>
+            <li><strong>Edge case:</strong> caught-up consumer의 hot read와 오래된 offset replay의 cold read를 같은 benchmark로 일반화하면 안 된다.</li>
+            <li><strong>Version:</strong> 이 자료는 Kafka 4.3 문서를 기준으로 한다. sendfile·TLS 경계와 codec·config의 실제 동작은 배포 버전 공식 문서로 재검증한다.</li>
+          </ul>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">6. 장애 대응: 증거부터 안전 조치까지</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse;font-size:13px">
+            <tr style="background:#ffe9e7"><th align="left" style="padding:8px;border:1px solid #e1c4c0">증상</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">먼저 수집할 증거/지표</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">가능한 가설</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">안전한 첫 조치</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">rollback/복구</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">하지 말아야 할 조치</th></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">produce p99 급등</td><td style="padding:8px;border:1px solid #e1c4c0">partition별 request latency·queue, batch-size-avg, records/request, CPU, disk await, ISR</td><td style="padding:8px;border:1px solid #e1c4c0">tiny batch, broker queue, writeback burst, replica 지연</td><td style="padding:8px;border:1px solid #e1c4c0">영향 partition과 변경 시점을 격리하고 유입을 제한</td><td style="padding:8px;border:1px solid #e1c4c0">최근 batch·flush 설정 rollback, broker·replica 회복</td><td style="padding:8px;border:1px solid #e1c4c0">timeout·retry를 동시에 크게 늘려 증폭</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">replay 중 live lag 증가</td><td style="padding:8px;border:1px solid #e1c4c0">replay/live bytes out, disk read, page faults, cache pressure, partition lag slope</td><td style="padding:8px;border:1px solid #e1c4c0">cold scan이 disk·page cache·network를 경쟁</td><td style="padding:8px;border:1px solid #e1c4c0">replay rate를 낮추고 live SLO 회복 확인</td><td style="padding:8px;border:1px solid #e1c4c0">checkpoint 보존 후 안전 시간대로 재개</td><td style="padding:8px;border:1px solid #e1c4c0">live consumer까지 재시작해 warm cache 소실</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">network는 낮은데 broker CPU 포화</td><td style="padding:8px;border:1px solid #e1c4c0">TLS handshake, connection count, codec CPU, request type, GC, bytes/request</td><td style="padding:8px;border:1px solid #e1c4c0">TLS copy/encryption, 압축 검증, 작은 request 폭증</td><td style="padding:8px;border:1px solid #e1c4c0">원인 request·client를 특정하고 quota/canary 적용</td><td style="padding:8px;border:1px solid #e1c4c0">최근 codec·connection 설정 복원</td><td style="padding:8px;border:1px solid #e1c4c0">보안 요구를 무시하고 TLS 즉시 해제</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">7. 30분 실습: batch와 per-message flush 비용 비교</h2>
+          <p><strong>사전 조건:</strong> 저장소 루트, Docker, 약 300MB 여유 공간. 이 실습은 단일 broker 개발 환경의 상대 비교이며 production benchmark가 아니다.</p>
+          <p><strong>실행 전 예측:</strong> 같은 3,000 records라도 batch를 허용한 topic과 매 message flush topic 중 어느 쪽의 elapsed time이 더 길까? 두 topic 모두 record는 남지만 syscall·storage completion 경로에서 어떤 비용 차이가 날까?</p>
+
+          <h3 style="margin:18px 0 8px;color:#145a7d">1단계 · 두 조건 만들기</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#102a43;color:#e8f5ff;padding:16px;border-radius:10px;font-size:13px"><code>make up
+
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create \
+  --topic day14-fast --partitions 1 --replication-factor 1
+
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create \
+  --topic day14-flush --partitions 1 --replication-factor 1 \
+  --config flush.messages=1</code></pre>
+
+          <h3 style="margin:18px 0 8px;color:#145a7d">2단계 · 같은 입력을 보내고 시간 기록</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#102a43;color:#e8f5ff;padding:16px;border-radius:10px;font-size:13px"><code>time seq 1 3000 | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day14-fast \
+  --producer-property batch.size=65536 \
+  --producer-property linger.ms=20 \
+  --producer-property compression.type=lz4
+
+time seq 1 3000 | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day14-flush \
+  --producer-property batch.size=65536 \
+  --producer-property linger.ms=20 \
+  --producer-property compression.type=lz4</code></pre>
+          <p><strong>예상 관찰:</strong> <code>day14-flush</code>는 message마다 log flush를 요구해 일반적으로 더 느리다. 단, Docker Desktop cache·storage·background load 때문에 한 번의 숫자는 흔들릴 수 있다. 3회 반복 중앙값과 broker disk 지표가 있어야 주장 강도가 올라간다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#145a7d">3단계 · batch 증거와 실패 주입 확인</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#102a43;color:#e8f5ff;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec broker bash -lc \
+  'find /tmp/kraft-combined-logs -path "*day14-fast-0*.log" -print'
+
+docker compose exec broker bash -lc \
+  'LOG=$(find /tmp/kraft-combined-logs -path "*day14-fast-0*.log" | head -1); \
+  /opt/kafka/bin/kafka-dump-log.sh --files "$LOG" --print-data-log | head -35'
+
+docker compose exec broker /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 --entity-type topics \
+  --entity-name day14-flush --describe</code></pre>
+          <p><strong>관찰 포인트:</strong> dump에서 여러 record가 같은 batch base offset 아래 묶이는지 보고, flush topic 설정이 실제로 적용됐는지 확인한다. “3,000 write syscall”처럼 command 출력이 증명하지 않은 숫자는 단정하지 않는다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#145a7d">자주 나는 오류와 해결</h3>
+          <ul style="padding-left:22px">
+            <li><code>TopicExistsException</code>: 이전 실습 topic을 cleanup하거나 다른 이름을 사용한다.</li>
+            <li><code>find</code> 결과 없음: image의 <code>log.dirs</code>를 <code>kafka-configs.sh --describe --entity-type brokers</code>로 확인한다.</li>
+            <li>두 시간이 비슷함: 3,000건이 너무 작거나 host cache가 지배할 수 있다. 입력을 무한히 키우지 말고 3회 중앙값과 broker 지표를 함께 본다.</li>
+            <li><code>Broken pipe</code>: <code>head</code>가 dump 출력을 먼저 닫아 생길 수 있으며 broker data 손상은 아니다.</li>
+            <li>flush topic이 더 빠름: 단일 noisy run으로 결론 내리지 말고 config, record count, 반복, background load를 재검증한다.</li>
+          </ul>
+
+          <h3 style="margin:18px 0 8px;color:#145a7d">Cleanup</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#102a43;color:#e8f5ff;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete \
+  --topic day14-fast
+
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete \
+  --topic day14-flush</code></pre>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">8. 놓치기 쉬운 함정</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#fff4df"><th align="left" style="padding:10px;border:1px solid #dfd0ad">위험한 설명</th><th align="left" style="padding:10px;border:1px solid #dfd0ad">정확한 경계</th></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">Kafka는 모두 sequential I/O다.</td><td style="padding:10px;border:1px solid #dfd0ad">data append는 sequential locality를 얻지만 index lookup, segment recovery, cold replay, compaction 등 다른 패턴도 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">ack가 오면 fsync 완료다.</td><td style="padding:10px;border:1px solid #dfd0ad">Kafka write 성공은 acks·replica 조건이고 per-message physical flush와 같은 개념이 아니다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">zero-copy라 copy와 CPU가 0이다.</td><td style="padding:10px;border:1px solid #dfd0ad">user-space 재복사를 줄이는 경로이며 NIC copy·protocol·TLS·checksum 비용은 남을 수 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">index에 모든 offset이 있다.</td><td style="padding:10px;border:1px solid #dfd0ad">sparse entry로 근처에 간 뒤 record batch를 scan한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">compression은 항상 CPU도 줄인다.</td><td style="padding:10px;border:1px solid #dfd0ad">bytes는 줄 수 있지만 codec·data entropy에 따라 producer와 consumer CPU를 더 쓴다.</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">9. 대기업 기술 면접 질문</h2>
+          <ol style="padding-left:22px">
+            <li><strong>“Kafka는 디스크 기반인데 왜 빠른가?”를 3분 안에 설명하라.</strong><br>좋은 답은 요구사항을 high throughput·bounded latency·durability로 나눈 뒤 sequential append, batching·compression, page cache, sparse index, persistent TCP·sendfile 경로를 data path 순서로 연결한다. 마지막에 ack≠fsync, TLS·cold cache·tiny batch 경계와 측정 지표를 말한다.</li>
+            <li><strong>처리량은 같은데 produce p99가 두 배가 됐다. 어떻게 진단할 것인가?</strong><br>변경 시점과 partition별 latency를 고정하고 batch fill·request queue·ISR·disk await·CPU/TLS·GC를 같은 시간축으로 수집한다. tiny batch, writeback, replica 지연 가설을 구분하고 traffic shaping·config rollback처럼 안전한 첫 조치를 제시한다.</li>
+            <li><strong>초당 20만 records, 평균 500B, p99 50ms인 pipeline의 batch·compression·replay 정책을 설계하라.</strong><br>원시 100MB/s와 replication·consumer fan-out을 계산하고 key skew·partition ceiling을 가정한다. linger를 SLO 일부로 배정하고 실제 payload codec benchmark, peak·replay 동시 capacity, TLS CPU, rollback 값을 제시한다. 숫자 없는 “크게 설정”은 불충분하다.</li>
+          </ol>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">10. 복습과 정답</h2>
+          <h3 style="margin:18px 0 8px;color:#145a7d">어제 내용 회상 3문제</h3>
+          <ol style="padding-left:22px">
+            <li>segment의 base offset과 record batch의 base offset은 각각 무엇을 찾는 기준인가?</li>
+            <li><code>index.interval.bytes</code>를 작게 하면 lookup과 index footprint가 어떻게 바뀌는가?</li>
+            <li>active segment roll과 OS flush는 왜 같은 state transition이 아닌가?</li>
+          </ol>
+          <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>채점 기준:</strong> ① segment 선택용 파일 범위와 batch 내부 offset 기준을 분리, ② 더 촘촘한 entry로 scan은 줄고 index·mmap footprint는 증가, ③ roll은 append target 교체이고 flush는 dirty page 영속화임을 말하면 통과.</p>
+
+          <h3 style="margin:18px 0 8px;color:#145a7d">오늘 내용 확인 3문제</h3>
+          <ol style="padding-left:22px">
+            <li>batching이 network, syscall, compression 세 경로의 비용을 어떻게 줄이는가?</li>
+            <li>producer ack, page cache write, storage flush, follower replication을 시간순으로 구분하라.</li>
+            <li>hot consumer에서는 빠르던 fetch가 오래된 replay에서 느려지는 이유와 첫 조치는?</li>
+          </ol>
+          <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>짧은 정답:</strong> ① round trip·header·syscall 고정비를 나누고 record 간 중복을 함께 압축한다. ② ack는 설정된 broker/replica 성공 조건이며 cache 반영·물리 flush는 별도 OS 상태다. ③ cold page fault와 disk/cache/network 경쟁 때문이므로 live SLO를 확인하며 replay rate를 먼저 낮춘다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#145a7d">11. 공식 자료</h2>
+          <ul style="padding-left:22px">
+            <li><a href="https://kafka.apache.org/43/design/design/#efficiency" style="color:#126a96">Apache Kafka 4.3 · Persistence &amp; Efficiency</a></li>
+            <li><a href="https://kafka.apache.org/43/configuration/topic-configs/#topicconfigs_index.interval.bytes" style="color:#126a96">Apache Kafka 4.3 · Topic config: index.interval.bytes</a></li>
+            <li><a href="https://kafka.apache.org/43/implementation/message-format/#record-batch" style="color:#126a96">Apache Kafka 4.3 · Record Batch format</a></li>
+            <li><a href="https://kafka.apache.org/43/design/protocol/#network" style="color:#126a96">Apache Kafka 4.3 · Protocol &amp; Network</a></li>
+          </ul>
+
+          <div style="margin-top:28px;padding:18px;background:#102a43;color:#ffffff;border-radius:10px">
+            <strong style="color:#9fd3ff">내일 예고 · Week 3 / Day 15</strong><br>
+            <code style="color:#ffffff">acks</code>, retry, timeout의 상호작용을 “client가 성공을 모를 수 있는 실패 창”과 idempotence 관점에서 분석합니다.
+          </div>
+        </td></tr>
+        <tr><td style="padding:18px 30px;background:#f3f5f9;color:#637087;font-size:12px;border-radius:0 0 20px 20px">Kafka 9주 63일 심화 커리큘럼 · Day 14 회상·기술 리뷰 · Apache Kafka 4.3 공식 문서 확인: 2026-08-15</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

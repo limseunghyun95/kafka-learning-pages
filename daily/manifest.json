@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-14T09:00:11+09:00",
+  "updatedAt": "2026-08-15T09:19:47+09:00",
   "lessons": [
     {
       "day": 1,
@@ -122,6 +122,15 @@
       "path": "day-13.html",
       "kind": "lab",
       "publishedAt": "2026-08-14T09:00:11+09:00"
+    },
+    {
+      "day": 14,
+      "week": 2,
+      "title": "회상: “디스크인데 왜 빠른가” 3분 설명",
+      "summary": "Sequential append·batching·page cache·sparse index·persistent TCP·zero-copy 경계를 3분 답변과 hot/cold·failure path 진단으로 압축합니다.",
+      "path": "day-14.html",
+      "kind": "review",
+      "publishedAt": "2026-08-15T09:19:47+09:00"
     }
   ]
 }
