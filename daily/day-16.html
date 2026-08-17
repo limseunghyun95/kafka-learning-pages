@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 16 · idempotent producer와 sequence number</title>
+</head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7">
+    <tr><td align="center" style="padding:24px 10px">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#ffffff;border:1px solid #dbe3ef;border-radius:20px">
+        <tr><td style="padding:34px 30px;background:#173b35;color:#ffffff;border-radius:20px 20px 0 0">
+          <div style="color:#a6e8d8;font-size:12px;font-weight:800;letter-spacing:1.5px">APACHE KAFKA 4.3 · WEEK 3 / DAY 16 · IDEMPOTENT PRODUCER</div>
+          <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">idempotent producer와<br>sequence number</h1>
+          <p style="margin:0;color:#d6f5ed">응답 유실 뒤 같은 batch를 다시 보내도 한 번만 append되는 상태 기계 · 예상 이론 50분 + 실습 35분</p>
+        </td></tr>
+        <tr><td style="padding:30px">
+          <div style="padding:18px;background:#eaf8f4;border-left:5px solid #23806f;border-radius:10px">
+            <strong>한 줄 요약</strong><br>
+            Idempotent producer는 record batch에 <strong>producer ID(PID)·producer epoch·partition별 sequence number</strong>를 넣고, broker가 마지막으로 수락한 순서를 기억하게 한다. 같은 identity와 sequence의 retry는 중복으로 알아보고 다시 append하지 않지만, 이 보장은 <strong>producer session·Kafka log 범위</strong>이지 업무 event나 외부 DB까지의 exactly-once가 아니다.
+          </div>
+
+          <h2 style="margin:30px 0 12px;color:#176658">1. 선수 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr><td style="width:30%;padding:10px;border:1px solid #d5ddeb"><strong>Idempotent</strong></td><td style="padding:10px;border:1px solid #d5ddeb">같은 연산을 여러 번 적용해도 최종 효과가 한 번 적용한 것과 같은 성질. “요청이 한 번만 전송된다”가 아니라 “중복 적용을 알아본다”에 가깝다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Producer ID (PID)</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Kafka가 producer instance를 구별하기 위해 발급하는 내부 identity. business user ID나 <code>client.id</code>가 아니다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Producer epoch</strong></td><td style="padding:10px;border:1px solid #d5ddeb">같은 PID 계열에서 더 새로운 producer incarnation을 나타내는 세대 번호. 오래된 epoch의 write를 차단하는 fencing에 쓰인다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Sequence number</strong></td><td style="padding:10px;border:1px solid #d5ddeb">한 PID·epoch가 특정 topic-partition으로 보내는 record 순번. 전역 번호가 아니라 partition마다 0부터 독립적으로 증가한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Record batch</strong></td><td style="padding:10px;border:1px solid #d5ddeb">여러 record를 묶은 protocol·compression·append 단위. PID·epoch·base sequence는 record마다가 아니라 batch header에 있어 비용을 나눠 낸다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Base sequence</strong></td><td style="padding:10px;border:1px solid #d5ddeb">batch 첫 record의 sequence. 각 record의 offset delta를 더해 batch의 마지막 sequence와 다음 expected sequence를 계산한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>In-flight request</strong></td><td style="padding:10px;border:1px solid #d5ddeb">network로 보냈지만 아직 response를 받지 않은 request. 여러 개를 허용하면 throughput은 늘지만 retry ordering 상태가 복잡해진다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Deduplication</strong></td><td style="padding:10px;border:1px solid #d5ddeb">이미 처리한 identity를 기억해 같은 효과를 다시 적용하지 않는 것. 여기서는 broker의 PID·epoch·sequence 기반 중복 억제다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Fencing</strong></td><td style="padding:10px;border:1px solid #d5ddeb">동일 logical owner의 오래된 instance가 계속 쓰지 못하게 막는 것. epoch가 lease token처럼 오래된 writer를 구분한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Out-of-order</strong></td><td style="padding:10px;border:1px solid #d5ddeb">broker가 기대한 다음 sequence보다 큰 값을 받는 gap. 중간 batch가 사라졌거나 순서 상태가 깨졌음을 뜻한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Producer session</strong></td><td style="padding:10px;border:1px solid #d5ddeb">PID와 sequence 상태가 이어지는 producer instance의 생명주기. process 재시작·새 producer 생성은 다른 session이 될 수 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Business event ID</strong></td><td style="padding:10px;border:1px solid #d5ddeb">주문 생성처럼 업무 사건을 재시도·재처리 사이에도 동일하게 식별하는 application key. PID를 대신할 수 없고 PID도 이를 대신하지 않는다.</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#176658">2. 왜 중요한가</h2>
+          <p>어제 본 가장 위험한 failure window는 <strong>broker append 성공 → ProduceResponse 유실</strong>이었다. client는 timeout 뒤 retry해야 실제 미기록을 복구할 수 있지만, 첫 요청이 이미 기록됐다면 같은 batch가 두 번 append될 수 있다. Idempotence는 이 모순을 “다시 보내되 broker가 같은 시도를 알아본다”로 해결한다.</p>
+          <p>면접에서 “<code>enable.idempotence=true</code>면 exactly-once입니다”라고 답하면 범위가 빠졌다. 강한 답은 PID·epoch·partition-local sequence의 owner와 broker 검증 state transition을 설명하고, 왜 <code>acks=all</code>·<code>retries&gt;0</code>·<code>max.in.flight≤5</code>가 묶이는지, process 재시작·새 event ID·외부 DB에서는 무엇이 남는지까지 방어한다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#176658">3. Architecture: retry를 한 번의 append로 접는 흐름</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:separate;border-spacing:0 8px">
+            <tr><td style="width:25%;padding:12px;background:#176658;color:#ffffff;border-radius:8px"><strong>1 · Identity</strong></td><td style="padding:12px;background:#eff9f6">producer가 InitProducerId protocol로 PID·epoch 획득</td></tr>
+            <tr><td colspan="2" align="center" style="color:#23806f;font-weight:800">↓ partition별 next sequence state 생성</td></tr>
+            <tr><td style="padding:12px;background:#176658;color:#ffffff;border-radius:8px"><strong>2 · Batch</strong></td><td style="padding:12px;background:#eff9f6">Topic-A/P0 batch에 PID=41, epoch=2, baseSeq=10 기록</td></tr>
+            <tr><td colspan="2" align="center" style="color:#23806f;font-weight:800">↓ ProduceRequest → partition leader</td></tr>
+            <tr><td style="padding:12px;background:#176658;color:#ffffff;border-radius:8px"><strong>3 · Verify</strong></td><td style="padding:12px;background:#eff9f6">broker의 expectedSeq=10과 비교</td></tr>
+            <tr><td colspan="2" align="center" style="color:#23806f;font-weight:800">↓ 같음: append·state 전진 · 낮음: duplicate · 높음: gap/error</td></tr>
+            <tr><td style="padding:12px;background:#176658;color:#ffffff;border-radius:8px"><strong>4 · Lost ack</strong></td><td style="padding:12px;background:#fff4e8">append는 성공했지만 response가 유실되어 client가 같은 batch retry</td></tr>
+            <tr><td colspan="2" align="center" style="color:#c05a2c;font-weight:800">↓ PID=41, epoch=2, baseSeq=10 그대로</td></tr>
+            <tr><td style="padding:12px;background:#176658;color:#ffffff;border-radius:8px"><strong>5 · Dedup</strong></td><td style="padding:12px;background:#eff9f6">broker가 이미 수락한 sequence임을 확인 → 새 append 없이 이전 결과 반환</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#176658">각 번호에서 누가 무엇을 기억하는가</h3>
+          <ol style="padding-left:22px">
+            <li><strong>Producer identity:</strong> client가 내부 PID·epoch를 얻는다. 사용자가 PID를 business ID처럼 직접 배정하지 않는다.</li>
+            <li><strong>Sequence assignment:</strong> producer는 topic-partition별 next sequence를 관리하고 batch 생성 시 그 범위를 영구 배정한다.</li>
+            <li><strong>Leader validation:</strong> broker는 PID·epoch·partition마다 최근 수락한 sequence와 batch metadata를 기억한다.</li>
+            <li><strong>Retry:</strong> response 유실 뒤 새 record를 만드는 게 아니라 동일 batch identity로 다시 보낸다.</li>
+            <li><strong>Dedup result:</strong> 낮은 sequence의 알려진 batch는 중복으로 처리해 log를 늘리지 않는다. 기대값보다 큰 gap은 데이터 유실 가능성을 알리는 오류다.</li>
+          </ol>
+
+          <h2 style="margin:30px 0 12px;color:#176658">4. CS 내부 동작</h2>
+          <h3 style="margin:18px 0 8px;color:#176658">Broker sequence 상태 기계</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#ddf3ed"><th align="left" style="padding:10px;border:1px solid #c4ded7">입력</th><th align="left" style="padding:10px;border:1px solid #c4ded7">비교</th><th align="left" style="padding:10px;border:1px solid #c4ded7">상태 전이·결과</th></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">expected와 같은 base sequence</td><td style="padding:10px;border:1px solid #c4ded7"><code>incoming == expected</code></td><td style="padding:10px;border:1px solid #c4ded7">batch append, 마지막 sequence·offset 갱신, 다음 expected 전진</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">이미 수락한 batch retry</td><td style="padding:10px;border:1px solid #c4ded7"><code>incoming &lt; expected</code>이며 최근 batch와 일치</td><td style="padding:10px;border:1px solid #c4ded7">duplicate로 식별, 새 append 없이 기존 결과 재사용</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">중간 sequence가 빠진 batch</td><td style="padding:10px;border:1px solid #c4ded7"><code>incoming &gt; expected</code></td><td style="padding:10px;border:1px solid #c4ded7">out-of-order error. silent gap을 허용하지 않는다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">더 오래된 epoch</td><td style="padding:10px;border:1px solid #c4ded7"><code>incomingEpoch &lt; currentEpoch</code></td><td style="padding:10px;border:1px solid #c4ded7">stale writer를 fence. 최신 instance의 순서를 보호한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">broker producer state 없음</td><td style="padding:10px;border:1px solid #c4ded7">unknown PID state</td><td style="padding:10px;border:1px solid #c4ded7">안전한 epoch 전진·재초기화 경로가 필요하며 단순 sequence=0 reset은 위험하다.</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#176658">Sequence는 왜 partition별인가</h3>
+          <p>Kafka의 ordering 단위가 partition이기 때문이다. P0과 P1은 서로 다른 leader·log·network queue를 가질 수 있어 하나의 전역 sequence를 강제하면 독립 partition까지 직렬화된다. 대신 상태 key는 개념적으로 <code>(PID, epoch, topic, partition)</code>이고 각 partition에서만 단조 증가한다. 이 선택이 병렬성과 ordering scope를 동시에 만든다.</p>
+
+          <h3 style="margin:24px 0 8px;color:#176658">Batch header와 공간 비용</h3>
+          <p>Record batch에는 producerId, producerEpoch, baseSequence가 한 번 들어가고 각 record는 relative offset을 사용한다. identity를 record마다 반복하지 않으므로 metadata 비용이 batch에 amortize된다. Broker는 batch의 last offset delta로 마지막 sequence와 다음 expected sequence를 계산할 수 있어 압축된 record를 모두 풀지 않고도 순서 범위를 판단한다.</p>
+
+          <h3 style="margin:24px 0 8px;color:#176658">상태 소유자·불변식·성공 확정</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#ddf3ed"><th align="left" style="padding:10px;border:1px solid #c4ded7">상태</th><th align="left" style="padding:10px;border:1px solid #c4ded7">소유자</th><th align="left" style="padding:10px;border:1px solid #c4ded7">불변식·성공 의미</th></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">PID·epoch</td><td style="padding:10px;border:1px solid #c4ded7">Kafka protocol + producer client</td><td style="padding:10px;border:1px solid #c4ded7">더 오래된 incarnation은 최신 epoch를 앞지를 수 없다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">Next sequence</td><td style="padding:10px;border:1px solid #c4ded7">producer의 partition별 state</td><td style="padding:10px;border:1px solid #c4ded7">batch에 배정된 sequence는 retry 때문에 새 번호로 바뀌지 않는다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">Accepted sequence</td><td style="padding:10px;border:1px solid #c4ded7">partition leader의 producer state</td><td style="padding:10px;border:1px solid #c4ded7">새 batch는 expected에 이어져야 하며 알려진 retry는 log를 늘리지 않는다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">Produce ack</td><td style="padding:10px;border:1px solid #c4ded7">leader·ISR 조건</td><td style="padding:10px;border:1px solid #c4ded7">client가 Kafka append 결과를 관측했다. consumer 처리·DB commit 성공은 아니다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">Business uniqueness</td><td style="padding:10px;border:1px solid #c4ded7">application·sink</td><td style="padding:10px;border:1px solid #c4ded7">stable event ID·unique constraint·upsert가 session 밖 중복을 막는다.</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#176658">왜 max.in.flight ≤ 5인가</h3>
+          <p>Kafka 4.3 Java producer에서 idempotence는 <code>acks=all</code>, <code>retries&gt;0</code>, <code>max.in.flight.requests.per.connection≤5</code>를 요구한다. Broker가 producer마다 최근 batch를 최대 5개까지 보존해 retry 결과와 ordering을 판정하는 경계와 맞추기 때문이다. 값 5는 “동시에 record 다섯 개”가 아니라 connection당 미응답 request 다섯 개이며, request 하나에는 여러 batch가 들어갈 수 있다.</p>
+
+          <h3 style="margin:24px 0 8px;color:#176658">보장 범위 표</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#fff4df"><th align="left" style="padding:10px;border:1px solid #dfd0ad">상황</th><th align="left" style="padding:10px;border:1px solid #dfd0ad">idempotent producer만으로?</th><th align="left" style="padding:10px;border:1px solid #dfd0ad">추가 수단</th></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">같은 session의 response 유실 retry</td><td style="padding:10px;border:1px solid #dfd0ad">중복 append 억제</td><td style="padding:10px;border:1px solid #dfd0ad">bounded delivery timeout·관측</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">process 재시작 후 같은 업무 event 재생성</td><td style="padding:10px;border:1px solid #dfd0ad">자동 보장 아님</td><td style="padding:10px;border:1px solid #dfd0ad">stable event ID·outbox·sink dedup</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">여러 partition을 원자적으로 commit</td><td style="padding:10px;border:1px solid #dfd0ad">자동 보장 아님</td><td style="padding:10px;border:1px solid #dfd0ad">transactional producer</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">Kafka consume→process→produce의 offset+output 원자성</td><td style="padding:10px;border:1px solid #dfd0ad">자동 보장 아님</td><td style="padding:10px;border:1px solid #dfd0ad">Kafka transaction·read_committed</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">외부 DB·결제 API exactly-once</td><td style="padding:10px;border:1px solid #dfd0ad">보장하지 않음</td><td style="padding:10px;border:1px solid #dfd0ad">idempotency key·unique constraint·saga/outbox</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#176658">5. 실무 설계 판단</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#ddf3ed"><th align="left" style="padding:10px;border:1px solid #c4ded7">판단</th><th align="left" style="padding:10px;border:1px solid #c4ded7">권장</th><th align="left" style="padding:10px;border:1px solid #c4ded7">이유</th></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">기본 producer 설정</td><td style="padding:10px;border:1px solid #c4ded7">idempotence를 명시하고 필수 config도 함께 ADR에 기록</td><td style="padding:10px;border:1px solid #c4ded7">충돌 설정이 암묵적으로 idempotence를 꺼버리는 upgrade·client 차이를 방지한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">업무 중복 비용 높음</td><td style="padding:10px;border:1px solid #c4ded7">Kafka idempotence + event ID + sink unique key</td><td style="padding:10px;border:1px solid #c4ded7">producer session 내부와 외부 side effect 두 범위를 모두 닫는다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">여러 topic 원자 write</td><td style="padding:10px;border:1px solid #c4ded7"><code>transactional.id</code>와 transaction protocol 검토</td><td style="padding:10px;border:1px solid #c4ded7">idempotence만으로 partial success를 숨길 수 없다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #c4ded7">fatal sequence error</td><td style="padding:10px;border:1px solid #c4ded7">영향 partition 격리, producer 재생성 전 결과·event ID 확인</td><td style="padding:10px;border:1px solid #c4ded7">무조건 continue하면 ordering·duplication 위험이 남을 수 있다.</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#176658">Best Practice</h3>
+          <ul style="padding-left:22px">
+            <li><code>enable.idempotence=true</code>를 명시하고 <code>acks=all</code>, <code>retries</code>, <code>max.in.flight</code>, delivery timeout을 config test로 함께 검증한다.</li>
+            <li>producer는 application lifecycle 동안 재사용한다. record마다 새 producer를 만들면 connection·batch·PID session 이점을 모두 잃는다.</li>
+            <li>callback에는 event ID, topic·partition, offset 또는 exception class, elapsed time을 남기고 payload·개인정보는 기록하지 않는다.</li>
+            <li>timeout 뒤 application retry는 동일 business event ID를 사용하고, sink에 unique constraint 또는 atomic upsert를 둔다.</li>
+            <li>client library·broker upgrade 때 idempotence 기본값과 conflict validation을 공식 문서·integration test로 확인한다.</li>
+          </ul>
+
+          <h3 style="margin:24px 0 8px;color:#176658">Anti-pattern·edge case·version 경계</h3>
+          <ul style="padding-left:22px">
+            <li><strong>Anti-pattern:</strong> <code>client.id</code>를 PID로 설명한다. client.id는 관측용 문자열이고 PID는 dedup protocol identity다.</li>
+            <li><strong>Anti-pattern:</strong> callback failure 뒤 새 UUID로 record를 다시 만든다. session-level dedup을 우회해 업무 중복을 만든다.</li>
+            <li><strong>Anti-pattern:</strong> idempotence만 켜고 외부 DB exactly-once를 선언한다. transaction domain이 다르다.</li>
+            <li><strong>Edge case:</strong> log retention·DeleteRecords·leader change 과정에서 broker producer state가 없는 UNKNOWN_PRODUCER_ID 경로가 생길 수 있다. sequence를 임의로 0으로 되돌리는 것은 안전하지 않다.</li>
+            <li><strong>Edge case:</strong> fatal batch 뒤 후속 sequence가 이미 배정됐다면 일부만 계속 보내 ordering을 복구했다고 단정할 수 없다.</li>
+            <li><strong>Version:</strong> Kafka 4.3 Java producer는 충돌 설정이 없으면 idempotence 기본값이 true다. 다른 언어 client·구버전은 기능과 기본값이 다를 수 있어 각 공식 client 문서를 확인한다.</li>
+          </ul>
+
+          <h2 style="margin:30px 0 12px;color:#176658">6. 장애 대응: 증거부터 안전 조치까지</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse;font-size:13px">
+            <tr style="background:#ffe9e7"><th align="left" style="padding:8px;border:1px solid #e1c4c0">증상</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">먼저 수집할 증거/지표</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">가능한 가설</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">안전한 첫 조치</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">rollback/복구</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">하지 말아야 할 조치</th></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">OutOfOrderSequence 계열 오류</td><td style="padding:8px;border:1px solid #e1c4c0">exception·client version, topic/partition, preceding timeout·leader change, max.in.flight, callback 순서</td><td style="padding:8px;border:1px solid #e1c4c0">sequence gap, producer state reset, conflict config, fatal prior batch</td><td style="padding:8px;border:1px solid #e1c4c0">영향 partition 신규 send 중지·증거 보존</td><td style="padding:8px;border:1px solid #e1c4c0">event ID로 log 확인 후 승인된 producer 재생성·replay</td><td style="padding:8px;border:1px solid #e1c4c0">exception 무시하고 같은 stream 계속 전송</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">timeout 뒤 업무 중복</td><td style="padding:8px;border:1px solid #e1c4c0">event ID, producer restart 시각, topic/partition/offset, HTTP retry, sink unique key</td><td style="padding:8px;border:1px solid #e1c4c0">새 session 재생성, 새 UUID, 비멱등 sink, idempotence conflict</td><td style="padding:8px;border:1px solid #e1c4c0">해당 business key side effect 격리</td><td style="padding:8px;border:1px solid #e1c4c0">dedup/upsert·보상 처리 후 동일 ID replay</td><td style="padding:8px;border:1px solid #e1c4c0">Kafka record 임의 삭제·offset latest 이동</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">idempotence ConfigException</td><td style="padding:8px;border:1px solid #e1c4c0">effective config, acks, retries, max.in.flight, client version·배포 diff</td><td style="padding:8px;border:1px solid #e1c4c0">acks≠all, retries=0, max.in.flight&gt;5</td><td style="padding:8px;border:1px solid #e1c4c0">새 배포를 중지하고 conflict config 특정</td><td style="padding:8px;border:1px solid #e1c4c0">검증된 config bundle로 rollback·canary</td><td style="padding:8px;border:1px solid #e1c4c0">idempotence=false로 우회 배포</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#176658">7. 35분 실습: batch header와 retry 후 중복 억제 관찰</h2>
+          <p><strong>사전 조건:</strong> 저장소 루트, Docker, terminal 두 개. 공식 <code>apache/kafka:4.3.1</code> image와 Compose network를 사용한다. 단일 broker라 replication 내구성은 검증하지 않는다.</p>
+          <p><strong>실행 전 예측:</strong> 같은 producer process가 broker pause 동안 retry하면 consumer에는 logical record가 몇 개 보일까? Idempotence가 유지되고 delivery deadline 전에 복구되면 각 입력은 한 번이어야 한다. 단, pause timing이 response 유실 창을 정확히 만들지는 않으므로 retry log도 함께 본다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#176658">1단계 · topic 생성</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#173b35;color:#e7fff9;padding:16px;border-radius:10px;font-size:13px"><code>make up
+
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create \
+  --topic day16-idempotent --partitions 1 --replication-factor 1</code></pre>
+
+          <h3 style="margin:18px 0 8px;color:#176658">2단계 · Terminal A에서 한 producer session 유지</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#173b35;color:#e7fff9;padding:16px;border-radius:10px;font-size:13px"><code>{ printf 'event-01\n'; sleep 2; printf 'event-02\n'; \
+  sleep 6; printf 'event-03\n'; } | \
+docker run -i --rm --network kafka-learning_default \
+  apache/kafka:4.3.1 \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server broker:9092 --topic day16-idempotent \
+  --producer-property enable.idempotence=true \
+  --producer-property acks=all \
+  --producer-property retries=2147483647 \
+  --producer-property max.in.flight.requests.per.connection=5 \
+  --producer-property request.timeout.ms=1000 \
+  --producer-property delivery.timeout.ms=15000 \
+  --producer-property retry.backoff.ms=200</code></pre>
+
+          <h3 style="margin:18px 0 8px;color:#176658">3단계 · Terminal B에서 failure injection</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#173b35;color:#e7fff9;padding:16px;border-radius:10px;font-size:13px"><code>sleep 1
+docker pause kafka-learning-broker
+sleep 4
+docker unpause kafka-learning-broker</code></pre>
+          <p><strong>예상 관찰:</strong> producer에 disconnect·timeout·retry log가 보일 수 있지만 15초 delivery deadline 안에 broker가 돌아오면 session은 계속될 수 있다. 실패가 전혀 보이지 않으면 timing이 retry window를 비껴간 것이므로 같은 실행에서 무리하게 반복하지 말고 다음 dump 증거를 확인한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#176658">4단계 · consumer count와 batch identity 확인</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#173b35;color:#e7fff9;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec broker \
+  /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic day16-idempotent --from-beginning \
+  --timeout-ms 5000 --property print.offset=true
+
+docker compose exec broker bash -lc \
+  'LOG=$(find /tmp/kraft-combined-logs \
+  -path "*day16-idempotent-0*.log" | head -1); \
+  /opt/kafka/bin/kafka-dump-log.sh \
+  --files "$LOG" --print-data-log | head -45'</code></pre>
+          <p><strong>예상 관찰:</strong> input 세 개는 offset 세 개로 보이고, dump의 batch metadata에서 <code>producerId</code>, <code>producerEpoch</code>, <code>baseSequence</code>를 찾을 수 있다. 여러 record가 한 batch면 sequence 범위는 batch 안에서 연속이다. 출력 형식은 Kafka 버전에 따라 이름이 달라질 수 있다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#176658">자주 나는 오류와 해결</h3>
+          <ul style="padding-left:22px">
+            <li><code>network kafka-learning_default not found</code>: <code>make up</code> 뒤 <code>docker network ls</code>에서 실제 Compose network 이름을 확인한다.</li>
+            <li><code>ConfigException</code>: acks=all, retries&gt;0, max.in.flight≤5 조합인지 확인한다.</li>
+            <li>세 record가 한 batch가 아님: sleep 때문에 batch가 나뉠 수 있다. PID·epoch가 같고 base sequence가 전진하는지를 본다.</li>
+            <li><code>Broken pipe</code>: <code>head</code>가 dump 출력을 먼저 닫은 결과일 수 있으며 broker log 손상은 아니다.</li>
+            <li>duplicate가 보임: producer process가 재시작됐는지, console input이 두 번 실행됐는지, effective idempotence config를 확인한다.</li>
+            <li>broker가 계속 paused: 즉시 <code>docker unpause kafka-learning-broker</code> 후 health를 확인한다.</li>
+          </ul>
+
+          <h3 style="margin:18px 0 8px;color:#176658">Cleanup</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#173b35;color:#e7fff9;padding:16px;border-radius:10px;font-size:13px"><code>docker unpause kafka-learning-broker
+
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete \
+  --topic day16-idempotent</code></pre>
+
+          <h2 style="margin:30px 0 12px;color:#176658">8. 놓치기 쉬운 함정</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#fff4df"><th align="left" style="padding:10px;border:1px solid #dfd0ad">위험한 설명</th><th align="left" style="padding:10px;border:1px solid #dfd0ad">정확한 경계</th></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">PID는 client.id다.</td><td style="padding:10px;border:1px solid #dfd0ad">client.id는 관측 문자열, PID는 Kafka가 발급한 protocol identity다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">sequence는 topic 전체에서 증가한다.</td><td style="padding:10px;border:1px solid #dfd0ad">PID·epoch·topic-partition별로 독립 증가한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">retry를 전송하지 않는다.</td><td style="padding:10px;border:1px solid #dfd0ad">retry는 실제 재전송된다. broker가 같은 batch identity를 알아보고 중복 append를 억제한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">process 재시작 뒤도 같은 PID라 안전하다.</td><td style="padding:10px;border:1px solid #dfd0ad">일반 idempotent producer의 보장은 한 producer session 범위다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #dfd0ad">idempotence=true면 외부 DB도 exactly-once다.</td><td style="padding:10px;border:1px solid #dfd0ad">Kafka append retry 중복 억제이며 외부 transaction domain에는 자동 확장되지 않는다.</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#176658">9. 대기업 기술 면접 질문</h2>
+          <ol style="padding-left:22px">
+            <li><strong>Idempotent producer가 response 유실 뒤 중복을 막는 과정을 설명하라.</strong><br>좋은 답은 append→response 유실→동일 batch retry timeline을 먼저 그린다. PID·epoch·partition별 base sequence, broker expected sequence 비교와 accept/duplicate/gap state transition, acks·retry·deadline을 연결하고 session 밖 event ID 대안을 말한다.</li>
+            <li><strong>왜 idempotence에서 <code>max.in.flight.requests.per.connection≤5</code>가 필요한가?</strong><br>throughput을 위한 동시 미응답 request와 retry ordering 문제를 설명한다. Broker가 producer별 최근 batch를 최대 5개 유지하는 dedup window, Kafka 4.3의 default 5, idempotence off일 때 앞 batch retry가 뒷 batch 뒤에 append될 위험을 비교한다.</li>
+            <li><strong>“exactly-once 주문 처리” 요구를 idempotent producer만으로 만족시킬 수 있는가?</strong><br>Kafka log append, multi-partition atomicity, consume-process-produce, 외부 DB·결제 API의 transaction domain을 분리한다. stable event ID, outbox, sink unique constraint, Kafka transaction·read_committed, 보상 transaction의 적용 범위와 비용을 제시한다.</li>
+          </ol>
+
+          <h2 style="margin:30px 0 12px;color:#176658">10. 복습과 정답</h2>
+          <h3 style="margin:18px 0 8px;color:#176658">어제 내용 회상 3문제</h3>
+          <ol style="padding-left:22px">
+            <li>Produce timeout이 record 미기록을 증명하지 못하는 failure window는?</li>
+            <li><code>request.timeout.ms</code>와 <code>delivery.timeout.ms</code>의 범위 차이는?</li>
+            <li>retry storm을 줄이려면 retry 횟수 외에 어떤 제어가 필요한가?</li>
+          </ol>
+          <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>채점 기준:</strong> ① append 후 response 유실, ② 한 request 응답 대 batch queue·ack·retry 전체 deadline, ③ exponential backoff+jitter·bounded deadline·rate limit/circuit breaker를 말하면 통과.</p>
+
+          <h3 style="margin:18px 0 8px;color:#176658">오늘 내용 확인 3문제</h3>
+          <ol style="padding-left:22px">
+            <li>PID, epoch, sequence number의 역할과 상태 owner를 각각 설명하라.</li>
+            <li>broker expected sequence가 20일 때 incoming 20, 18, 22는 각각 어떤 의미인가?</li>
+            <li>idempotent producer만으로 process 재시작 뒤 업무 중복과 외부 DB 중복을 막지 못하는 이유는?</li>
+          </ol>
+          <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>짧은 정답:</strong> ① PID는 session identity, epoch는 incarnation fencing, sequence는 partition별 순서다. ② 20은 정상 append, 알려진 18은 duplicate 후보, 22는 gap/out-of-order다. ③ 새 session·새 logical record와 외부 side effect는 PID sequence state 밖이므로 stable event ID와 sink 멱등성이 필요하다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#176658">11. 공식 자료</h2>
+          <ul style="padding-left:22px">
+            <li><a href="https://kafka.apache.org/43/configuration/producer-configs/#producerconfigs_enable.idempotence" style="color:#197564">Apache Kafka 4.3 · Producer config: enable.idempotence</a></li>
+            <li><a href="https://kafka.apache.org/43/design/design/#message_delivery_semantics" style="color:#197564">Apache Kafka 4.3 · Message Delivery Semantics</a></li>
+            <li><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging" style="color:#197564">KIP-98 · Idempotent Producer and Transactions</a></li>
+            <li><a href="https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=89068820" style="color:#197564">KIP-360 · Idempotent/Transactional Producer Reliability</a></li>
+          </ul>
+
+          <div style="margin-top:28px;padding:18px;background:#173b35;color:#ffffff;border-radius:10px">
+            <strong style="color:#a6e8d8">내일 예고 · Week 3 / Day 17</strong><br>
+            여러 in-flight request가 throughput을 높이면서도 retry 때 ordering을 깨뜨릴 수 있는 이유를 timeline과 <code>max.in.flight.requests.per.connection</code> 조건으로 분석합니다.
+          </div>
+        </td></tr>
+        <tr><td style="padding:18px 30px;background:#f3f5f9;color:#637087;font-size:12px;border-radius:0 0 20px 20px">Kafka 9주 63일 심화 커리큘럼 · Day 16 · Apache Kafka 4.3 공식 문서 확인: 2026-08-17</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

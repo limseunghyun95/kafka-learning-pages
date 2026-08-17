@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-16T09:07:54+09:00",
+  "updatedAt": "2026-08-17T09:03:17+09:00",
   "lessons": [
     {
       "day": 1,
@@ -140,6 +140,15 @@
       "path": "day-15.html",
       "kind": "lesson",
       "publishedAt": "2026-08-16T09:07:54+09:00"
+    },
+    {
+      "day": 16,
+      "week": 3,
+      "title": "idempotent producer와 sequence number",
+      "summary": "PID·producer epoch·partition별 sequence number와 broker dedup state machine을 따라 retry 중복·ordering 보호·producer session 밖의 exactly-once 경계를 분석합니다.",
+      "path": "day-16.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-17T09:03:17+09:00"
     }
   ]
 }
