@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-18T09:09:36+09:00",
+  "updatedAt": "2026-08-11T09:14:09+09:00",
   "lessons": [
     {
       "day": 1,
@@ -104,60 +104,6 @@
       "path": "day-11.html",
       "kind": "lesson",
       "publishedAt": "2026-08-11T09:14:09+09:00"
-    },
-    {
-      "day": 12,
-      "week": 2,
-      "title": "Kafka protocol, metadata request, TCP connection",
-      "summary": "Bootstrap부터 ApiVersions·Metadata·partition leader routing까지의 binary protocol과 persistent TCP connection, stale metadata·advertised listener 실패 창을 분석합니다.",
-      "path": "day-12.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-12T09:10:53+09:00"
-    },
-    {
-      "day": 13,
-      "week": 2,
-      "title": "랩: segment·index·batch 크기 관찰",
-      "summary": "작은 segment와 촘촘한 sparse index를 구성해 record batch append, segment roll, offset→file position lookup과 flush 비용을 실제 파일·dump로 연결합니다.",
-      "path": "day-13.html",
-      "kind": "lab",
-      "publishedAt": "2026-08-14T09:00:11+09:00"
-    },
-    {
-      "day": 14,
-      "week": 2,
-      "title": "회상: “디스크인데 왜 빠른가” 3분 설명",
-      "summary": "Sequential append·batching·page cache·sparse index·persistent TCP·zero-copy 경계를 3분 답변과 hot/cold·failure path 진단으로 압축합니다.",
-      "path": "day-14.html",
-      "kind": "review",
-      "publishedAt": "2026-08-15T09:19:47+09:00"
-    },
-    {
-      "day": 15,
-      "week": 3,
-      "title": "acks, retry, timeout의 상호작용",
-      "summary": "Producer ack 조건과 request·delivery·block timeout, retriable failure·backoff·response 유실의 ambiguous outcome을 하나의 deadline·state transition 모델로 연결합니다.",
-      "path": "day-15.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-16T09:07:54+09:00"
-    },
-    {
-      "day": 16,
-      "week": 3,
-      "title": "idempotent producer와 sequence number",
-      "summary": "PID·producer epoch·partition별 sequence number와 broker dedup state machine을 따라 retry 중복·ordering 보호·producer session 밖의 exactly-once 경계를 분석합니다.",
-      "path": "day-16.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-17T09:03:17+09:00"
-    },
-    {
-      "day": 17,
-      "week": 3,
-      "title": "in-flight request와 ordering 조건",
-      "summary": "connection별 in-flight ProduceRequest를 pipeline으로 겹치는 성능 이득과 non-idempotent retry의 순서 역전 failure window를 sequence·Little's Law·실무 튜닝 관점으로 분석합니다.",
-      "path": "day-17.html",
-      "kind": "lesson",
-      "publishedAt": "2026-08-18T09:09:36+09:00"
     }
   ]
 }

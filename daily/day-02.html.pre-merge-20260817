@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 02 · queue·pub/sub·log의 소비 의미 비교</title>
+</head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7">
+    <tr>
+      <td align="center" style="padding:24px 10px">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#ffffff;border:1px solid #dbe3ef;border-radius:20px">
+          <tr>
+            <td style="padding:34px 30px;background:#101a33;color:#ffffff;border-radius:20px 20px 0 0">
+              <div style="color:#9db0ff;font-size:12px;font-weight:800;letter-spacing:1.5px">APACHE KAFKA 4.3 · WEEK 1 / DAY 02</div>
+              <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">queue·pub/sub·log의<br>소비 의미 비교</h1>
+              <p style="margin:0;color:#cbd5f5">“누가 읽는가”보다 “읽은 뒤 데이터와 위치가 어떻게 되는가” · 예상 35분 + 실습 30분</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:30px">
+              <div style="padding:18px;background:#eef0ff;border-left:5px solid #5865d8;border-radius:10px">
+                <strong>한 줄 요약</strong><br>
+                전통적인 queue는 작업 하나를 경쟁 소비자 중 하나에게 전달하고 완료 여부를 중심으로 관리하지만,
+                Kafka의 핵심은 record를 partition log에 보존한 채 각 consumer group이 자기 위치를 독립적으로
+                추적하는 것이다. 그래서 fan-out, replay, 느린 소비자 격리가 가능하지만 보존 기간·offset·부작용의 책임이 생긴다.
+              </div>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">1. 선수 용어 사전</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+                <tr><td style="width:30%;padding:10px;border:1px solid #d5ddeb"><strong>Queue</strong></td><td style="padding:10px;border:1px solid #d5ddeb">생산자가 넣은 작업을 경쟁 소비자 중 보통 하나가 가져가 처리하는 구조. “처리 대기 작업” mental model이 중심이다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Publish/Subscribe</strong></td><td style="padding:10px;border:1px solid #d5ddeb">발행자가 구독자를 직접 몰라도 여러 독립 구독자가 같은 사건을 받는 통신 모델. 줄여서 pub/sub라 한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Log</strong></td><td style="padding:10px;border:1px solid #d5ddeb">순서대로 append되는 record의 지속 가능한 sequence. Kafka에서는 topic partition이 log 단위다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Consumer group</strong></td><td style="padding:10px;border:1px solid #d5ddeb">같은 group.id를 공유하며 partition을 나눠 읽는 논리적 구독자. 서로 다른 group은 같은 record를 독립적으로 읽는다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Offset</strong></td><td style="padding:10px;border:1px solid #d5ddeb">partition 안의 record 위치. group이 commit한 offset은 “다음에 어디서 재개할지”에 대한 checkpoint이지 전역 메시지 ID나 처리 완료 증명서가 아니다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Retention</strong></td><td style="padding:10px;border:1px solid #d5ddeb">record를 보관하는 시간·용량 정책. 소비했다고 즉시 삭제하는 것이 아니라 broker 정책에 따라 segment 단위로 제거된다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Replay</strong></td><td style="padding:10px;border:1px solid #d5ddeb">offset을 이전 위치로 옮기거나 새 group을 사용해 보존된 record를 다시 읽는 것.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Acknowledge</strong></td><td style="padding:10px;border:1px solid #d5ddeb">수신한 작업의 성공·실패를 broker에 알리는 확인 신호. Kafka consumer group의 offset commit과 정확히 같은 뜻은 아니다.</td></tr>
+              </table>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">2. 왜 중요한가</h2>
+              <p>“Kafka는 queue인가 pub/sub인가?”라는 질문에 단어 하나로 답하면 설계가 틀어지기 쉽다.
+                같은 consumer group 안에서는 partition을 나눠 경쟁 소비하므로 queue처럼 보이고, group을 여러 개 만들면
+                같은 event가 각 group에 전달되어 pub/sub처럼 보인다. 그러나 기반 상태는 <strong>지워지는 작업함이 아니라
+                보존되는 partition log + group별 위치</strong>다.</p>
+              <p>이 차이는 장애 때 드러난다. 처리 코드가 망가져도 record가 retention 안에 남아 있으면 고친 뒤 replay할 수 있다.
+                반대로 offset을 처리보다 먼저 commit하거나, replay가 외부 결제를 다시 실행하게 만들면 log의 장점이 곧 중복 부작용이 된다.</p>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">3. Architecture: 동일 record를 세 관점으로 보기</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:separate;border-spacing:0 8px">
+                <tr>
+                  <td style="width:24%;padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>Producer</strong></td>
+                  <td style="padding:12px;background:#f1f4fa">order-created record를 topic의 partition log에 append</td>
+                </tr>
+                <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ broker는 record와 offset을 retention 동안 보존</td></tr>
+                <tr>
+                  <td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>Group A</strong></td>
+                  <td style="padding:12px;background:#f1f4fa">billing-1과 billing-2가 partition을 나눠 읽음 → group 안에서는 경쟁 소비</td>
+                </tr>
+                <tr>
+                  <td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>Group B</strong></td>
+                  <td style="padding:12px;background:#f1f4fa">analytics가 같은 record를 독립 offset으로 읽음 → group 사이에서는 fan-out</td>
+                </tr>
+                <tr>
+                  <td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>Group C</strong></td>
+                  <td style="padding:12px;background:#f1f4fa">backfill-v2가 earliest부터 다시 읽음 → 보존 범위 안에서 replay</td>
+                </tr>
+              </table>
+
+              <h3 style="margin:24px 0 10px;color:#273b8f">요청·응답·상태 변화</h3>
+              <ol style="padding-left:22px">
+                <li><strong>Produce:</strong> producer가 record를 partition leader에 보낸다. 성공 응답의 의미는 producer의 <code>acks</code>와 replica 상태에 따라 달라지며, 오늘은 “log에 append할 입력이 생겼다”까지만 본다.</li>
+                <li><strong>Fetch:</strong> 각 group의 consumer가 자신에게 할당된 partition의 특정 offset부터 batch를 요청한다. broker가 consumer에게 record를 밀어 넣는 것이 아니라 consumer가 pull한다.</li>
+                <li><strong>Process:</strong> application이 record를 deserialize하고 DB/API 같은 side effect를 수행한다. broker는 application business transaction의 성공을 자동으로 알지 못한다.</li>
+                <li><strong>Commit:</strong> consumer가 group별 재개 위치를 coordinator에 commit한다. Kafka 4.3 문서 기준 committed offset은 group coordinator가 관리하고 <code>__consumer_offsets</code>에 기록된다.</li>
+                <li><strong>Retention:</strong> record 본문은 group의 commit과 독립적으로 남는다. log segment가 retention 조건을 만족해야 삭제 대상이 된다.</li>
+              </ol>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">4. Queue·pub/sub·Kafka log 비교</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse;font-size:14px">
+                <tr style="background:#e7ebff">
+                  <th align="left" style="padding:9px;border:1px solid #cbd3e6">질문</th>
+                  <th align="left" style="padding:9px;border:1px solid #cbd3e6">작업 Queue mental model</th>
+                  <th align="left" style="padding:9px;border:1px solid #cbd3e6">Pub/Sub mental model</th>
+                  <th align="left" style="padding:9px;border:1px solid #cbd3e6">Kafka consumer group + log</th>
+                </tr>
+                <tr><td style="padding:9px;border:1px solid #cbd3e6">누가 받나</td><td style="padding:9px;border:1px solid #cbd3e6">경쟁 worker 중 하나</td><td style="padding:9px;border:1px solid #cbd3e6">각 subscription</td><td style="padding:9px;border:1px solid #cbd3e6">group마다 한 번, group 내부 partition owner</td></tr>
+                <tr><td style="padding:9px;border:1px solid #cbd3e6">소비 후 본문</td><td style="padding:9px;border:1px solid #cbd3e6">ack 후 제거/완료가 흔함</td><td style="padding:9px;border:1px solid #cbd3e6">제품별 durable/ephemeral</td><td style="padding:9px;border:1px solid #cbd3e6">commit과 무관하게 retention까지 보존</td></tr>
+                <tr><td style="padding:9px;border:1px solid #cbd3e6">진행 상태</td><td style="padding:9px;border:1px solid #cbd3e6">작업별 ack/visibility</td><td style="padding:9px;border:1px solid #cbd3e6">subscription별 cursor/ack</td><td style="padding:9px;border:1px solid #cbd3e6">group·partition별 committed offset</td></tr>
+                <tr><td style="padding:9px;border:1px solid #cbd3e6">병렬성</td><td style="padding:9px;border:1px solid #cbd3e6">작업 단위 분배</td><td style="padding:9px;border:1px solid #cbd3e6">subscription과 제품 의미에 따름</td><td style="padding:9px;border:1px solid #cbd3e6">일반 consumer group은 partition 수가 상한</td></tr>
+                <tr><td style="padding:9px;border:1px solid #cbd3e6">재처리</td><td style="padding:9px;border:1px solid #cbd3e6">DLQ/redrive 등 별도 기능</td><td style="padding:9px;border:1px solid #cbd3e6">보존 정책에 따름</td><td style="padding:9px;border:1px solid #cbd3e6">retention 안에서 seek/reset/new group</td></tr>
+                <tr><td style="padding:9px;border:1px solid #cbd3e6">Ordering</td><td style="padding:9px;border:1px solid #cbd3e6">제품·queue 설정에 따름</td><td style="padding:9px;border:1px solid #cbd3e6">제품별 상이</td><td style="padding:9px;border:1px solid #cbd3e6">partition 안에서 offset 순서</td></tr>
+              </table>
+              <p style="font-size:14px;color:#4b5568"><strong>주의:</strong> queue와 pub/sub는 단일 표준 구현이 아니라 메시징 패턴이다. 제품마다 ack, visibility timeout, ordering, durability가 다르므로 이름만으로 보장을 추론하지 않는다.</p>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">5. CS 내부 동작: 상태의 소유자와 불변식</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+                <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">상태</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">소유자</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">핵심 불변식·성공 시점</th></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Record log</td><td style="padding:10px;border:1px solid #cbd3e6">partition leader와 replicas</td><td style="padding:10px;border:1px solid #cbd3e6">offset은 partition 안에서 증가한다. 보존 여부는 consumer commit이 아니라 log 정책이 결정한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Assignment</td><td style="padding:10px;border:1px solid #cbd3e6">group coordinator와 members</td><td style="padding:10px;border:1px solid #cbd3e6">일반 consumer group에서 한 partition은 안정된 generation 동안 한 member에 할당된다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Fetch position</td><td style="padding:10px;border:1px solid #cbd3e6">consumer process memory</td><td style="padding:10px;border:1px solid #cbd3e6"><code>poll()</code> 후 로컬 위치가 움직여도 아직 durable checkpoint가 아닐 수 있다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Committed offset</td><td style="padding:10px;border:1px solid #cbd3e6">group coordinator</td><td style="padding:10px;border:1px solid #cbd3e6">commit 성공 응답이 와야 group 재시작 위치가 갱신됐다고 본다. application side effect의 원자성은 별도 문제다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Business result</td><td style="padding:10px;border:1px solid #cbd3e6">DB/API/object store</td><td style="padding:10px;border:1px solid #cbd3e6">sink가 정의한 transaction/idempotency가 성공을 결정한다. Kafka offset만으로 외부 시스템 완료를 증명할 수 없다.</td></tr>
+              </table>
+
+              <h3 style="margin:24px 0 10px;color:#273b8f">시간 결합을 끊는 대신 생기는 비용</h3>
+              <p>producer와 consumer가 동시에 살아 있을 필요가 없다는 것이 log의 힘이다. 그러나 backlog가 늘면
+                <code>남은 records ÷ 순처리량</code>만큼 catch-up 시간이 필요하고, retention이 catch-up 시간보다 짧으면
+                아직 읽지 못한 offset이 삭제될 수 있다. 즉 replay 가능성은 무한한 속성이 아니라 storage budget과
+                retention SLO로 구매하는 능력이다.</p>
+
+              <h3 style="margin:24px 0 10px;color:#273b8f">Kafka 4.3의 Share Group은 무엇이 다른가</h3>
+              <p>Kafka 4.3에는 <code>KafkaShareConsumer</code>와 share group이 있다. 일반 consumer group은 partition을
+                member에게 배타적으로 할당하지만, share group은 같은 partition을 여러 member가 공유해 record 단위
+                경쟁 소비와 acknowledgement를 지원한다. queue에 가까운 workload에서 partition 수를 넘는 병렬성을 얻는 대신
+                일반 consumer group의 partition 순서 보장과 동일하게 생각하면 안 된다. broker/client version과 feature 지원을
+                확인하고 별도 운영 모델로 평가한다.</p>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">6. 실무 설계 판단</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+                <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">요구사항</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">판단</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">이유</th></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">billing·analytics·fraud가 같은 event 필요</td><td style="padding:10px;border:1px solid #cbd3e6">독립 group.id</td><td style="padding:10px;border:1px solid #cbd3e6">각 pipeline의 속도·배포·offset·장애를 격리한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">순수 작업 queue, record 단위 retry·ack 필요</td><td style="padding:10px;border:1px solid #cbd3e6">전용 queue 또는 Kafka share group 비교</td><td style="padding:10px;border:1px solid #cbd3e6">일반 consumer group은 partition 단위 병렬성과 ordered log 의미가 중심이다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">정책 변경 후 30일 재계산</td><td style="padding:10px;border:1px solid #cbd3e6">retention ≥ 재처리 창 + 안전 여유</td><td style="padding:10px;border:1px solid #cbd3e6">record가 삭제된 뒤 offset만 되돌려도 복구할 수 없다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">외부 결제 API 호출</td><td style="padding:10px;border:1px solid #cbd3e6">idempotency key + 처리 ledger</td><td style="padding:10px;border:1px solid #cbd3e6">처리 성공 후 commit 전 crash는 재전달을 만들 수 있다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">대규모 replay</td><td style="padding:10px;border:1px solid #cbd3e6">새 group, sink 격리, quota/rate limit</td><td style="padding:10px;border:1px solid #cbd3e6">production group offset을 덮거나 downstream을 재부하하지 않는다.</td></tr>
+              </table>
+
+              <h3 style="margin:24px 0 10px;color:#273b8f">Best Practice</h3>
+              <ul style="padding-left:22px">
+                <li>group.id를 애플리케이션 역할·환경·데이터 계약에 맞춰 안정적으로 정하고 임시 hostname을 섞지 않는다.</li>
+                <li>“읽음”을 fetch, business 처리, sink commit, offset commit의 네 단계로 나눠 지표와 로그를 남긴다.</li>
+                <li>replay 전에 대상 offset·예상 record 수·처리 시간·sink idempotency·rollback을 계산하고 dry run한다.</li>
+                <li>retention 변경은 disk headroom, segment roll, peak ingress, 가장 느린 group의 recovery SLO를 함께 본다.</li>
+              </ul>
+
+              <h3 style="margin:24px 0 10px;color:#273b8f">Anti-pattern</h3>
+              <ul style="padding-left:22px">
+                <li>consumer lag 0을 end-to-end 성공으로 해석한다. 잘못된 deserializer가 record를 버려도 lag는 줄 수 있다.</li>
+                <li>offset을 메시지의 전역 ID로 사용한다. offset 42는 partition이 다르면 전혀 다른 record다.</li>
+                <li>다른 업무가 같은 group.id를 공유한다. 서로 partition을 빼앗아 일부 event만 받게 된다.</li>
+                <li>offset reset을 실행 중인 group에 즉시 적용한다. active member가 다시 commit해 reset을 덮거나 세대가 충돌할 수 있다.</li>
+              </ul>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">7. 장애 대응: 증거부터 안전 조치까지</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse;font-size:13px">
+                <tr style="background:#ffe9e7">
+                  <th align="left" style="padding:8px;border:1px solid #e1c4c0">증상</th>
+                  <th align="left" style="padding:8px;border:1px solid #e1c4c0">먼저 수집할 증거/지표</th>
+                  <th align="left" style="padding:8px;border:1px solid #e1c4c0">가능한 가설</th>
+                  <th align="left" style="padding:8px;border:1px solid #e1c4c0">안전한 첫 조치</th>
+                  <th align="left" style="padding:8px;border:1px solid #e1c4c0">rollback/복구</th>
+                  <th align="left" style="padding:8px;border:1px solid #e1c4c0">하지 말아야 할 조치</th>
+                </tr>
+                <tr>
+                  <td style="padding:8px;border:1px solid #e1c4c0">lag 증가</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">partition별 current/log-end offset, ingress, processing latency, error rate, assignment</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">유입 급증, slow sink, poison record, idle consumers, hot partition</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">원인 partition과 처리 단계 격리, retention 여유 계산</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">sink 보호 후 scale/tune, 실패 record 격리, catch-up rate 제한</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">근거 없이 offset을 latest로 reset해 데이터 건너뛰기</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px;border:1px solid #e1c4c0">중복 결제</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">event key, partition/offset, sink transaction ID, commit timestamp, restart 기록</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">side effect 후 commit 전 crash, retry, replay group 오설정</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">consumer 일시 중지, idempotency ledger로 영향 범위 확인</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">중복 취소/보상, 처리 순서 수정, idempotency key 강제</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">증거 없이 topic record 삭제 또는 group 전체 reset</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px;border:1px solid #e1c4c0">OffsetOutOfRange</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">committed offset, log start/end, retention 변경, disk pressure, group idle 기간</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">consumer가 retention보다 오래 중단, segment 조기 삭제, 잘못된 reset</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">누락 범위와 원본 재생성 가능성부터 확인</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0">source backfill 후 새 group 검증 또는 승인된 reset</td>
+                  <td style="padding:8px;border:1px solid #e1c4c0"><code>auto.offset.reset=latest</code>로 조용히 유실 숨기기</td>
+                </tr>
+              </table>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">8. 30분 실습: 두 group과 replay</h2>
+              <p><strong>사전 조건:</strong> 저장소 루트, Docker 실행, <code>make up</code> 성공. 실습 전에 결과를 예측한다:
+                같은 group consumer 두 개는 record를 어떻게 나눌까? 새 group은 기존 record를 볼까?</p>
+              <h3 style="margin:18px 0 8px;color:#273b8f">최소 명령</h3>
+              <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>make up
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day02-consumption --partitions 3 --replication-factor 1
+
+# Terminal A: 같은 group의 첫 consumer
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day02-consumption \
+  --group workers --from-beginning
+
+# Terminal B: 같은 group의 둘째 consumer
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day02-consumption \
+  --group workers --from-beginning
+
+# Terminal C: 독립 구독자
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day02-consumption \
+  --group audit --from-beginning
+
+# Terminal D: 여섯 줄 입력 후 Ctrl-D
+printf 'r1\nr2\nr3\nr4\nr5\nr6\n' | \
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day02-consumption</code></pre>
+              <p><strong>예상 관찰:</strong> workers의 두 consumer는 partition assignment에 따라 전체 record를 나눠 보고,
+                audit group은 같은 여섯 record를 독립적으로 본다. 출력 순서는 여러 partition을 합쳐 화면에 찍으므로 입력 전역 순서와 같다고 보장하지 않는다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#273b8f">상태 확인과 실패 주입</h3>
+              <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group workers
+
+# 두 workers를 종료한 뒤 dry run으로 earliest replay 위치 확인
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group workers \
+  --topic day02-consumption --reset-offsets --to-earliest --dry-run
+
+# 결과를 확인한 뒤에만 실행
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group workers \
+  --topic day02-consumption --reset-offsets --to-earliest --execute</code></pre>
+              <p><strong>실패 주입:</strong> worker 한 개를 실행한 상태로 reset을 시도해 active group 오류를 확인한다.
+                이 실패는 보호 장치다. member가 계속 commit하는 동안 offset을 바꾸면 reset 결과가 즉시 덮일 수 있다.</p>
+              <p><strong>자주 나는 오류와 해결:</strong> topic already exists는 <code>--if-not-exists</code>로 피한다.
+                consumer 출력이 한 terminal에 몰리면 key가 없는 record의 partition 분포와 rebalance 완료를 확인한다.
+                <code>GROUP_ID_NOT_FOUND</code>면 해당 group으로 실제 poll/commit이 있었는지 확인한다.</p>
+              <h3 style="margin:18px 0 8px;color:#273b8f">Cleanup</h3>
+              <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day02-consumption</code></pre>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">9. 놓치기 쉬운 함정</h2>
+              <ul style="padding-left:22px">
+                <li><strong>“Kafka는 pub/sub”:</strong> group 내부 경쟁 소비와 partition 병렬성 상한을 빠뜨린 설명이다.</li>
+                <li><strong>“소비하면 삭제”:</strong> offset commit과 record retention은 별도 상태다.</li>
+                <li><strong>“offset commit = 처리 완료”:</strong> 외부 sink의 성공과 원자적으로 묶이지 않으면 failure window가 남는다.</li>
+                <li><strong>“새 group이면 항상 처음부터”:</strong> <code>auto.offset.reset</code> 정책과 실제 log start offset에 따라 달라진다.</li>
+                <li><strong>“partition 3개면 순서가 하나”:</strong> ordering은 partition 단위다. 여러 partition의 화면 출력은 전역 순서를 보장하지 않는다.</li>
+              </ul>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">10. 대기업 기술 면접 질문</h2>
+              <ol style="padding-left:22px">
+                <li><strong>Kafka를 queue와 pub/sub 중 무엇이라고 설명하겠는가?</strong><br>
+                  좋은 답은 먼저 workload를 묻고, partition log와 group별 offset을 핵심 모델로 둔다. 같은 group 안의 경쟁 소비,
+                  group 사이 fan-out, retention/replay, partition ordering, share group 또는 전용 queue 대안을 비교한다.</li>
+                <li><strong>결제 consumer가 record 처리 후 crash했다. 어떤 결과가 가능한가?</strong><br>
+                  poll → 결제 side effect → offset commit의 시간 순서를 그린다. side effect 후 commit 전 crash면 재전달과 중복이 가능하므로
+                  idempotency key, ledger, transaction/outbox 대안과 복구 절차를 설명한다.</li>
+                <li><strong>30일 replay 요구를 어떻게 설계하겠는가?</strong><br>
+                  peak records/s, record bytes, compression, replication, 30일 storage, catch-up throughput을 가정한다.
+                  별도 replay group과 sink 격리, quota, schema compatibility, retention 여유, dry run, rollback을 방어한다.</li>
+              </ol>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">11. 복습과 정답</h2>
+              <h3 style="margin:18px 0 8px;color:#273b8f">어제 내용 회상 3문제</h3>
+              <ol style="padding-left:22px">
+                <li>Kafka가 producer와 consumer의 어떤 결합을 끊는가?</li>
+                <li>event, record, stream을 각각 한 문장으로 구분하라.</li>
+                <li>broker가 durable log를 제공해도 end-to-end 성공이 자동 보장되지 않는 이유는?</li>
+              </ol>
+              <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>채점 기준:</strong>
+                ① 시간·속도·장애·재처리 결합 중 세 가지 이상, ② 현실의 사건/직렬화된 저장 단위/연속된 사건 흐름,
+                ③ consumer business 처리와 외부 sink transaction은 Kafka broker가 소유하지 않는다는 답이면 통과.</p>
+
+              <h3 style="margin:18px 0 8px;color:#273b8f">오늘 내용 확인 3문제</h3>
+              <ol style="padding-left:22px">
+                <li>consumer group A의 commit이 group B의 읽기 위치를 바꾸지 않는 이유는?</li>
+                <li>record가 retention에 남아 있는데도 재처리가 위험할 수 있는 이유 두 가지는?</li>
+                <li>일반 consumer group과 share group의 병렬성·ordering 차이를 설명하라.</li>
+              </ol>
+              <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>짧은 정답:</strong>
+                ① committed offset이 group·partition별 상태이기 때문. ② 외부 side effect 중복, 오래된 schema/코드, downstream 과부하 중 두 가지.
+                ③ 일반 group은 partition을 member에게 배타적으로 할당해 partition ordering을 유지하고, share group은 같은 partition을 여러 member가
+                공유해 record 단위 병렬성을 높이는 대신 동일한 ordering 가정을 할 수 없다.</p>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">12. 공식 자료</h2>
+              <ul style="padding-left:22px">
+                <li><a href="https://kafka.apache.org/43/implementation/distribution/" style="color:#3f51b5">Apache Kafka 4.3 · Distribution / Consumer Offset Tracking</a></li>
+                <li><a href="https://kafka.apache.org/43/operations/basic-kafka-operations/" style="color:#3f51b5">Apache Kafka 4.3 · Consumer/Share Group Operations</a></li>
+                <li><a href="https://kafka.apache.org/43/generated/consumer_config.html" style="color:#3f51b5">Apache Kafka 4.3 · Consumer Configuration</a></li>
+                <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaShareConsumer.html" style="color:#3f51b5">Kafka 4.3.1 API · KafkaShareConsumer</a></li>
+              </ul>
+
+              <div style="margin-top:28px;padding:18px;background:#101a33;color:#ffffff;border-radius:10px">
+                <strong style="color:#9db0ff">내일 예고 · Day 03</strong><br>
+                topic·partition·offset을 직접 생성·관찰하며, logical namespace와 physical log가 어떻게 연결되는지 확인합니다.
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:18px 30px;background:#f3f5f9;color:#637087;font-size:12px;border-radius:0 0 20px 20px">
+              Kafka 9주 63일 심화 커리큘럼 · Day 02 · 공식 Kafka 4.3 문서 기준
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

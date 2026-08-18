@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 04 · key와 partitioner, partition 단위 ordering</title>
+</head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7">
+    <tr>
+      <td align="center" style="padding:24px 10px">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#ffffff;border:1px solid #dbe3ef;border-radius:20px">
+          <tr>
+            <td style="padding:34px 30px;background:#101a33;color:#ffffff;border-radius:20px 20px 0 0">
+              <div style="color:#9db0ff;font-size:12px;font-weight:800;letter-spacing:1.5px">APACHE KAFKA 4.3 · WEEK 1 / DAY 04</div>
+              <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">key와 partitioner,<br>partition 단위 ordering</h1>
+              <p style="margin:0;color:#cbd5f5">같은 엔티티의 사건을 같은 log에 모으는 법과 순서가 깨지는 경계 · 예상 40분 + 실습 35분</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:30px">
+              <div style="padding:18px;background:#eef0ff;border-left:5px solid #5865d8;border-radius:10px">
+                <strong>한 줄 요약</strong><br>
+                key는 record의 business identity 그 자체라기보다 <strong>어느 partition에 보낼지 결정하는 routing 입력</strong>이다.
+                같은 serialized key가 같은 partition 수와 partitioner를 거치면 같은 partition으로 가지만, Kafka가 보장하는 순서는
+                그 partition log의 append 순서뿐이다. partition 증가, key 직렬화 변경, 다중 producer, 잘못된 retry는 이 전제를 깨뜨릴 수 있다.
+              </div>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">1. 선수 용어 사전</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+                <tr><td style="width:30%;padding:10px;border:1px solid #d5ddeb"><strong>Key</strong></td><td style="padding:10px;border:1px solid #d5ddeb">record에 선택적으로 붙이는 값. 기본 producer에서는 key의 직렬화된 bytes가 target partition 선택에 쓰인다. value와 달리 routing contract 역할을 한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Serialization</strong></td><td style="padding:10px;border:1px solid #d5ddeb">객체를 network와 log에 기록할 byte 배열로 바꾸는 과정. 논리적으로 같은 key라도 byte 표현이 다르면 다른 partition으로 갈 수 있다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Partitioner</strong></td><td style="padding:10px;border:1px solid #d5ddeb">topic metadata, 명시 partition, key bytes 등을 보고 target partition을 선택하는 producer-side 정책.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Hash</strong></td><td style="padding:10px;border:1px solid #d5ddeb">임의 길이 bytes를 고정 크기 숫자로 압축하는 함수. 같은 입력은 같은 결과를 내지만 서로 다른 입력이 같은 결과를 낼 수 있다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Sticky partition</strong></td><td style="padding:10px;border:1px solid #d5ddeb">key 없는 record를 매번 다른 곳에 흩뿌리지 않고 한 partition의 batch가 찰 때까지 모아 batching 효율을 높이는 선택 방식.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Ordering</strong></td><td style="padding:10px;border:1px solid #d5ddeb">관찰되는 record의 선후 관계. Kafka의 기본 경계는 topic 전체가 아니라 각 partition log다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>In-flight request</strong></td><td style="padding:10px;border:1px solid #d5ddeb">producer가 broker에 전송했지만 아직 성공·실패 응답을 받지 못한 요청. 여러 요청을 동시에 보내면 처리량은 늘지만 retry 순서를 조심해야 한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Idempotent producer</strong></td><td style="padding:10px;border:1px solid #d5ddeb">producer ID·epoch·partition별 sequence number로 내부 retry의 중복 append와 재정렬을 막는 producer 모드.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Hot partition</strong></td><td style="padding:10px;border:1px solid #d5ddeb">특정 key나 낮은 key cardinality 때문에 한 partition에 traffic·storage·lag가 집중된 상태.</td></tr>
+              </table>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">2. 왜 중요한가</h2>
+              <p>주문 상태가 <code>CREATED → PAID → SHIPPED</code> 순으로 처리되어야 한다면 세 event를 같은 partition에 모아야 한다.
+                일반적으로 <code>orderId</code>를 key로 삼는 이유다. 반대로 사용자 ID 하나가 전체 tenant traffic을 대표하면 모든 record가 한 partition으로 몰려
+                처리량과 consumer 병렬성이 사실상 1로 줄어든다. key 선택은 correctness와 load distribution을 함께 결정한다.</p>
+              <p>“같은 key니까 순서가 보장된다”는 문장은 조건이 빠져 있다. 같은 bytes, 같은 topic 인스턴스, 같은 partition 수와 partitioner,
+                partition 내 성공한 append, retry ordering, producer 간 경쟁까지 범위를 밝혀야 정확하다. 실무 장애는 대부분 이 숨은 전제 중 하나가 바뀔 때 생긴다.</p>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">3. Architecture: send에서 append까지</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:separate;border-spacing:0 8px">
+                <tr><td style="width:25%;padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>1 · Record</strong></td><td style="padding:12px;background:#f1f4fa">application이 topic, optional partition, key, value를 가진 <code>ProducerRecord</code> 생성</td></tr>
+                <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ key/value serializer가 객체를 bytes로 변환</td></tr>
+                <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>2 · Route</strong></td><td style="padding:12px;background:#f1f4fa">producer metadata cache의 partition 수·leader 정보와 partitioner 정책으로 target 결정</td></tr>
+                <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ explicit partition &gt; keyed hash &gt; unkeyed sticky/adaptive</td></tr>
+                <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>3 · Batch</strong></td><td style="padding:12px;background:#f1f4fa"><code>RecordAccumulator</code>가 TopicPartition별 batch에 record를 enqueue</td></tr>
+                <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ Sender thread가 leader broker별 ProduceRequest 구성</td></tr>
+                <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>4 · Append</strong></td><td style="padding:12px;background:#f1f4fa">partition leader가 PID·epoch·sequence를 검사하고 log end에 append</td></tr>
+                <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ acks 조건 충족 후 partition·offset 응답</td></tr>
+                <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>5 · Result</strong></td><td style="padding:12px;background:#f1f4fa">send future/callback 성공. 이것은 broker write 성공이지 downstream 처리 완료가 아님</td></tr>
+              </table>
+
+              <h3 style="margin:24px 0 8px;color:#273b8f">Partition 선택 우선순위</h3>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+                <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">입력</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">기본 선택</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">주의점</th></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">partition 명시</td><td style="padding:10px;border:1px solid #cbd3e6">그 partition 사용</td><td style="padding:10px;border:1px solid #cbd3e6">key보다 우선한다. 범위를 벗어나면 실패한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">partition 없음 + key 있음</td><td style="padding:10px;border:1px solid #cbd3e6">serialized key hash 기반</td><td style="padding:10px;border:1px solid #cbd3e6"><code>partitioner.ignore.keys=false</code> 기본일 때. custom partitioner면 구현 계약을 따른다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">partition·key 없음</td><td style="padding:10px;border:1px solid #cbd3e6">batch가 찰 때까지 sticky partition</td><td style="padding:10px;border:1px solid #cbd3e6">record별 round-robin이 아니다. 4.3 기본은 broker 성능에 적응할 수 있다.</td></tr>
+              </table>
+
+              <h3 style="margin:24px 0 8px;color:#273b8f">Ordering 경계 그림</h3>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+                <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">Partition 0</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">Partition 1</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">Partition 2</th></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">offset 20 · order-B CREATED</td><td style="padding:10px;border:1px solid #cbd3e6">offset 8 · order-A CREATED</td><td style="padding:10px;border:1px solid #cbd3e6">offset 31 · order-C CREATED</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">offset 21 · order-B PAID</td><td style="padding:10px;border:1px solid #cbd3e6">offset 9 · order-A PAID</td><td style="padding:10px;border:1px solid #cbd3e6">offset 32 · order-C CANCELLED</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">독립 순서</td><td style="padding:10px;border:1px solid #cbd3e6">offset 10 · order-A SHIPPED</td><td style="padding:10px;border:1px solid #cbd3e6">독립 순서</td></tr>
+              </table>
+              <p>order-A 내부에서는 8 &lt; 9 &lt; 10이라는 명확한 log 순서가 있다. 하지만 partition 0의 offset 20과 partition 1의 offset 8 중
+                어느 event가 “topic 전체에서 먼저”인지 Kafka offset만으로 비교할 수 없다. timestamp도 clock skew와 producer 지연 때문에 total order가 아니다.</p>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">4. CS 내부 동작: hash, state, 불변식</h2>
+              <p>keyed routing은 개념적으로 <code>partition = positiveHash(serializedKey) mod partitionCount</code>다.
+                modulo는 큰 hash 공간을 0부터 N-1까지의 bucket으로 접는다. 같은 bytes와 같은 N이면 결정적이지만 N이 3에서 5로 바뀌면 결과도 바뀔 수 있다.
+                이 때문에 partition 증가는 저장 공간 확장만이 아니라 routing contract 변경이다.</p>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+                <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">상태</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">소유자</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">불변식·성공 의미</th></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Key schema·serializer</td><td style="padding:10px;border:1px solid #cbd3e6">application/team contract</td><td style="padding:10px;border:1px solid #cbd3e6">같은 routing identity는 모든 producer 언어·버전에서 같은 bytes를 만들어야 한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Partition metadata cache</td><td style="padding:10px;border:1px solid #cbd3e6">producer client</td><td style="padding:10px;border:1px solid #cbd3e6">현재 partition 수와 leader를 사용한다. 증설·leader 변경 시 refresh한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Per-partition batch order</td><td style="padding:10px;border:1px solid #cbd3e6">producer accumulator/sender</td><td style="padding:10px;border:1px solid #cbd3e6">같은 producer가 enqueue한 record의 순서를 retry 정책과 함께 보존해야 한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">PID·epoch·sequence</td><td style="padding:10px;border:1px solid #cbd3e6">producer + partition leader</td><td style="padding:10px;border:1px solid #cbd3e6">idempotent session의 partition별 sequence로 duplicate·out-of-order batch를 판별한다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Committed append order</td><td style="padding:10px;border:1px solid #cbd3e6">partition leader/replicas</td><td style="padding:10px;border:1px solid #cbd3e6">offset은 append된 순서를 표현한다. application의 인과 순서까지 추론하지 않는다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">Domain sequence</td><td style="padding:10px;border:1px solid #cbd3e6">application/sink</td><td style="padding:10px;border:1px solid #cbd3e6">다중 writer나 replay가 있으면 entityVersion 같은 번호로 누락·역전을 검출한다.</td></tr>
+              </table>
+
+              <h3 style="margin:24px 0 8px;color:#273b8f">Retry가 순서를 바꾸는 failure window</h3>
+              <p>batch A와 B가 같은 partition으로 이 순서에 전송됐다고 하자. idempotence를 끄고 여러 in-flight 요청을 허용하면 A의 응답만 실패한 동안
+                B가 먼저 append되고, A retry가 뒤에 append될 수 있다. Kafka 4.3은 충돌 설정이 없으면 idempotence를 기본 활성화하며,
+                <code>acks=all</code>, 양수 retries, 허용 범위의 <code>max.in.flight.requests.per.connection</code>을 함께 요구해 이 내부 retry 순서를 보호한다.</p>
+              <p>하지만 application이 timeout 후 새 producer session으로 같은 business event를 다시 보내는 것은 다른 문제다.
+                단일 session의 idempotence가 application-level 재전송까지 자동 deduplicate하지 않는다. event ID와 sink idempotency가 여전히 필요하다.</p>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">5. 실무 설계 판단</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+                <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">판단 질문</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">권장 판단</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">이유</th></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">어떤 key를 쓸까?</td><td style="padding:10px;border:1px solid #cbd3e6">순서·동시성이 필요한 최소 business aggregate ID</td><td style="padding:10px;border:1px solid #cbd3e6">orderId는 주문 내 순서를 묶지만 tenantId 하나는 hot partition을 만든다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">key가 없어도 될까?</td><td style="padding:10px;border:1px solid #cbd3e6">record 간 affinity가 없고 균등 처리량이 목표일 때만</td><td style="padding:10px;border:1px solid #cbd3e6">sticky batching은 효율적이지만 같은 entity routing 계약을 제공하지 않는다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">partition을 늘릴까?</td><td style="padding:10px;border:1px solid #cbd3e6">key remapping과 in-flight drain을 포함한 migration으로 취급</td><td style="padding:10px;border:1px solid #cbd3e6">기존 record는 옮겨지지 않고 새 record의 hash modulo 대상만 바뀔 수 있다.</td></tr>
+                <tr><td style="padding:10px;border:1px solid #cbd3e6">custom partitioner가 필요한가?</td><td style="padding:10px;border:1px solid #cbd3e6">규제·지역 affinity 등 명시 요구가 있을 때만, 결정성·분포를 테스트</td><td style="padding:10px;border:1px solid #cbd3e6">client 언어·버전마다 구현이 다르면 같은 key가 갈라질 수 있다.</td></tr>
+              </table>
+
+              <h3 style="margin:24px 0 8px;color:#273b8f">Best Practice</h3>
+              <ul style="padding-left:22px">
+                <li>key schema, serializer, partitioner, partition 수를 하나의 routing contract로 문서화하고 변경 시 호환성 테스트를 한다.</li>
+                <li>partition별 records/sec·bytes/sec·produce latency·consumer lag와 상위 key 빈도를 함께 관찰한다. topic 평균만 보지 않는다.</li>
+                <li>idempotence 기본값에 기대기만 하지 말고 배포 config에서 <code>enable.idempotence</code>, <code>acks</code>, retries, max in-flight의 충돌을 검사한다.</li>
+                <li>payload에 event ID와 entity version을 넣어 duplicate, gap, reverse order를 downstream에서도 검출한다.</li>
+                <li>partition 증설 전 producer drain 또는 dual-topic migration, consumer cutover, rollback 조건을 ADR로 남긴다.</li>
+                <li>raw PII를 key에 그대로 넣지 않는다. key도 broker log와 tooling에 노출될 수 있으므로 최소 식별자·토큰화 정책을 적용한다.</li>
+              </ul>
+
+              <h3 style="margin:24px 0 8px;color:#273b8f">Version·engine 차이와 anti-pattern</h3>
+              <ul style="padding-left:22px">
+                <li><strong>Kafka 4.3 Java producer:</strong> custom partitioner가 없고 key가 없으면 batch 단위 sticky 선택을 하며 adaptive partitioning 기본값이 true다. record별 완전 균등 분배라고 가정하지 않는다.</li>
+                <li><strong>KIP-794 이후:</strong> 과거 <code>DefaultPartitioner</code>/<code>UniformStickyPartitioner</code>를 직접 지정하는 방식보다 내장 기본 동작과 관련 config를 사용한다.</li>
+                <li><strong>Anti-pattern:</strong> random UUID를 key로 넣고 “keyed라서 ordering이 안전하다”고 말한다. affinity는 생기지 않고 분포만 랜덤해진다.</li>
+                <li><strong>Anti-pattern:</strong> tenantId 하나를 key로 사용해 noisy tenant의 모든 traffic을 한 partition에 몰아넣는다.</li>
+                <li><strong>Edge case:</strong> 두 producer가 같은 key에 동시에 쓰면 partition은 같아도 business clock 순서가 아니라 broker 도착/append 순서로 interleave된다.</li>
+              </ul>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">6. 장애 대응: 증거부터 안전 조치까지</h2>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse;font-size:13px">
+                <tr style="background:#ffe9e7">
+                  <th align="left" style="padding:8px;border:1px solid #e1c4c0">증상</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">먼저 수집할 증거/지표</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">가능한 가설</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">안전한 첫 조치</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">rollback/복구</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">하지 말아야 할 조치</th>
+                </tr>
+                <tr><td style="padding:8px;border:1px solid #e1c4c0">같은 entity event 역전</td><td style="padding:8px;border:1px solid #e1c4c0">event ID/version, key bytes, partition/offset, producer instance, retry/config, deploy 시각</td><td style="padding:8px;border:1px solid #e1c4c0">key 변경, serializer 차이, partition 증설, 다중 writer, idempotence 충돌</td><td style="padding:8px;border:1px solid #e1c4c0">영향 entity를 격리하고 원본 record 좌표와 routing config diff 확보</td><td style="padding:8px;border:1px solid #e1c4c0">이전 producer config로 rollback, version 기준 reorder/replay, sink 보정</td><td style="padding:8px;border:1px solid #e1c4c0">근거 없이 전체 topic을 timestamp 순서로 재처리</td></tr>
+                <tr><td style="padding:8px;border:1px solid #e1c4c0">특정 partition만 lag·latency 급증</td><td style="padding:8px;border:1px solid #e1c4c0">partition별 ingress/lag/size, key frequency, leader broker CPU·disk·network</td><td style="padding:8px;border:1px solid #e1c4c0">hot key, low cardinality, skewed custom partitioner, noisy tenant</td><td style="padding:8px;border:1px solid #e1c4c0">상위 key와 blast radius를 특정하고 producer rate limit</td><td style="padding:8px;border:1px solid #e1c4c0">새 keying/topic으로 계획된 migration, backlog 격리 drain</td><td style="padding:8px;border:1px solid #e1c4c0">partition만 즉시 늘려 ordering contract를 더 깨기</td></tr>
+                <tr><td style="padding:8px;border:1px solid #e1c4c0">배포 후 같은 key가 다른 partition</td><td style="padding:8px;border:1px solid #e1c4c0">partition count history, producer client/version, serializer output hex/hash, partitioner config</td><td style="padding:8px;border:1px solid #e1c4c0">partition 증가, key schema/charset 변경, ignore.keys, custom partitioner drift</td><td style="padding:8px;border:1px solid #e1c4c0">새 producer rollout 중지, 두 partition의 entity version 비교</td><td style="padding:8px;border:1px solid #e1c4c0">호환 producer로 rollback 후 gap 보정; 필요 시 새 topic cutover</td><td style="padding:8px;border:1px solid #e1c4c0">기존 partition의 log file을 수동 이동·병합</td></tr>
+              </table>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">7. 35분 실습: key routing과 증설 failure 주입</h2>
+              <p><strong>사전 조건:</strong> 저장소 루트와 Docker. 실행 전에 예측한다.
+                A의 세 record는 같은 partition에서 offset이 증가할까? 전체 consumer 출력은 입력 순서와 같을까?
+                partition을 3개에서 5개로 늘리면 기존 record가 이동할까, 새 record의 routing만 달라질까?</p>
+
+              <h3 style="margin:18px 0 8px;color:#273b8f">1단계 · 3-partition topic 생성</h3>
+              <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>make up
+
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create \
+  --topic day04-key-ordering --partitions 3 --replication-factor 1</code></pre>
+
+              <h3 style="margin:18px 0 8px;color:#273b8f">2단계 · 같은 key의 순서 관찰</h3>
+              <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>printf 'A:A-1\nB:B-1\nA:A-2\nC:C-1\nB:B-2\nA:A-3\n' | \
+docker compose exec -T broker /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day04-key-ordering \
+  --property parse.key=true --property key.separator=:
+
+docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day04-key-ordering \
+  --from-beginning --timeout-ms 10000 \
+  --property print.partition=true --property print.offset=true \
+  --property print.key=true --property print.value=true</code></pre>
+              <p><strong>예상:</strong> 같은 key A는 한 partition에 있고 A-1, A-2, A-3의 offset이 증가한다. B도 마찬가지다.
+                그러나 여러 partition을 합친 console 출력은 입력의 global order와 다를 수 있다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#273b8f">3단계 · 실패 주입: partition 수 3 → 5</h3>
+              <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>for i in $(seq 1 20); do printf 'entity-%02d:before\n' "$i"; done | \
+docker compose exec -T broker /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day04-key-ordering \
+  --property parse.key=true --property key.separator=:
+
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --alter \
+  --topic day04-key-ordering --partitions 5
+
+for i in $(seq 1 20); do printf 'entity-%02d:after\n' "$i"; done | \
+docker compose exec -T broker /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day04-key-ordering \
+  --property parse.key=true --property key.separator=:</code></pre>
+              <p><strong>예상:</strong> 기존 record는 원래 partition에 그대로 남고, 일부 동일 key의 <code>after</code>는 새 partition 수를 사용해
+                <code>before</code>와 다른 partition으로 갈 수 있다. partition 증가는 되돌려 줄일 수 없는 운영 변경이다.</p>
+
+              <h3 style="margin:18px 0 8px;color:#273b8f">4단계 · before/after 좌표 비교</h3>
+              <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day04-key-ordering \
+  --from-beginning --timeout-ms 10000 \
+  --property print.partition=true --property print.offset=true \
+  --property print.key=true --property print.value=true</code></pre>
+              <p><strong>자주 나는 오류와 해결:</strong> <code>TopicExistsException</code>이면 이전 실습 topic을 cleanup하거나 describe로 partition 수를 확인한다.
+                key가 null로 보이면 producer의 <code>parse.key=true</code>와 separator를 확인한다. 모든 key가 한쪽에 몰려 보여도 20개 표본의 partition별 개수를 먼저 세고,
+                custom config 없이 임의로 producer를 재시작하지 않는다.</p>
+              <p><strong>Cleanup:</strong></p>
+              <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete \
+  --topic day04-key-ordering</code></pre>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">8. 놓치기 쉬운 함정</h2>
+              <ul style="padding-left:22px">
+                <li><strong>key = unique ID:</strong> 여러 record가 같은 key를 공유할 수 있고 hash collision도 가능하다. business uniqueness는 별도 event ID로 관리한다.</li>
+                <li><strong>같은 문자열 = 같은 bytes:</strong> charset, normalization, 숫자·문자 타입, serializer version이 다르면 bytes가 달라질 수 있다.</li>
+                <li><strong>같은 partition = business order:</strong> 다중 producer가 쓰면 broker arrival order일 뿐 원천 시스템의 인과 순서를 자동 복원하지 않는다.</li>
+                <li><strong>key 없음 = 매 record round-robin:</strong> Kafka 4.3 기본은 batch 효율을 위한 sticky/adaptive 선택이다.</li>
+                <li><strong>send 성공 = 처리 성공:</strong> producer ack는 broker write 범위다. consumer 처리·sink commit은 별도 상태다.</li>
+                <li><strong>partition 증설 = 무해한 scale-out:</strong> keyed routing이 바뀔 수 있고 partition 수는 다시 줄일 수 없다.</li>
+              </ul>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">9. 대기업 기술 면접 질문</h2>
+              <ol style="padding-left:22px">
+                <li><strong>“같은 key면 순서가 보장된다”를 정확하게 고쳐 말해보라.</strong><br>
+                  좋은 답은 same serialized key·partitioner·partition count 조건, partition-local append order, 다중 producer interleave,
+                  idempotent retry와 application resend 범위를 분리한다. global ordering이 없다는 결론까지 말한다.</li>
+                <li><strong>주문 이벤트 topic의 partition key를 어떻게 선택하겠는가?</strong><br>
+                  orderId·customerId·tenantId 후보별 ordering aggregate, cardinality, skew, consumer locality를 수치로 비교한다.
+                  peak tenant 비율과 partition 처리량을 가정하고 hot key 완화, event version, 모니터링까지 설계한다.</li>
+                <li><strong>운영 중 partition을 24개에서 48개로 늘려야 한다면?</strong><br>
+                  왜 필요한지 throughput 증거부터 확인하고 hash remapping, in-flight event, consumer cutover, schema/key contract를 분석한다.
+                  drain·새 topic migration·dual write 중 대안을 비교하고 rollback이 어려운 이유와 검증 지표를 제시한다.</li>
+              </ol>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">10. 복습과 정답</h2>
+              <h3 style="margin:18px 0 8px;color:#273b8f">어제 내용 회상 3문제</h3>
+              <ol style="padding-left:22px">
+                <li>topic, partition, offset의 정확한 관계를 한 문장씩 설명하라.</li>
+                <li>partition의 마지막 record offset이 9라면 LEO는 무엇이며 왜 그런가?</li>
+                <li>topic 생성 control path와 produce data path의 상태 소유자는 누구인가?</li>
+              </ol>
+              <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>채점 기준:</strong>
+                ① topic은 논리/config 경계, partition은 ordered log, offset은 partition-local 위치.
+                ② LEO=10이며 다음 append 위치. ③ KRaft controller quorum이 metadata를, partition leader/replicas가 record append를 소유하면 통과.</p>
+
+              <h3 style="margin:18px 0 8px;color:#273b8f">오늘 내용 확인 3문제</h3>
+              <ol style="padding-left:22px">
+                <li>기본 producer에서 partition 명시, key 있음, 둘 다 없음의 선택 우선순위를 설명하라.</li>
+                <li>partition 수 증가가 같은 key의 ordering을 깨뜨릴 수 있는 이유는?</li>
+                <li>idempotent producer가 해결하는 retry와 해결하지 못하는 retry를 구분하라.</li>
+              </ol>
+              <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>짧은 정답:</strong>
+                ① explicit partition, serialized-key hash, unkeyed sticky/adaptive 순이다.
+                ② hash modulo의 N이 바뀌어 새 record가 다른 partition으로 갈 수 있고 기존 record는 이동하지 않는다.
+                ③ 같은 producer session의 내부 retry 중복·순서는 보호하지만 새 session의 application-level resend와 sink 중복은 자동 해결하지 않는다.</p>
+
+              <h2 style="margin:30px 0 12px;color:#273b8f">11. 공식 자료</h2>
+              <ul style="padding-left:22px">
+                <li><a href="https://kafka.apache.org/43/generated/producer_config.html" style="color:#3f51b5">Apache Kafka 4.3 · Producer Configs</a></li>
+                <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html" style="color:#3f51b5">Kafka 4.3.1 · KafkaProducer API</a></li>
+                <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/191336857/KIP-794%2BStrictly%2BUniform%2BSticky%2BPartitioner" style="color:#3f51b5">KIP-794 · Strictly Uniform Sticky Partitioner</a></li>
+                <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/66854913/KIP-98%2B-%2BExactly%2BOnce%2BDelivery%2Band%2BTransactional%2BMessaging" style="color:#3f51b5">KIP-98 · Idempotent and Transactional Messaging</a></li>
+              </ul>
+
+              <div style="margin-top:28px;padding:18px;background:#101a33;color:#ffffff;border-radius:10px">
+                <strong style="color:#9db0ff">내일 예고 · Day 05</strong><br>
+                consumer group이 partition을 멤버에게 어떻게 배정하는지 따라가고, consumer 수를 늘려도 partition 수를 넘으면 병렬성이 늘지 않는 이유를 실험합니다.
+              </div>
+            </td>
+          </tr>
+          <tr><td style="padding:18px 30px;background:#f3f5f9;color:#637087;font-size:12px;border-radius:0 0 20px 20px">Kafka 9주 63일 심화 커리큘럼 · Day 04 · 공식 Kafka 4.3 문서 기준</td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 09 · offset/time index와 lookup 비용</title>
+</head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7">
+    <tr><td align="center" style="padding:24px 10px">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#ffffff;border:1px solid #dbe3ef;border-radius:20px">
+        <tr><td style="padding:34px 30px;background:#101a33;color:#ffffff;border-radius:20px 20px 0 0">
+          <div style="color:#9db0ff;font-size:12px;font-weight:800;letter-spacing:1.5px">APACHE KAFKA 4.3 · WEEK 2 / DAY 09</div>
+          <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">offset/time index와<br>lookup 비용</h1>
+          <p style="margin:0;color:#cbd5f5">거대한 segment에서 정답 근처로 점프한 뒤 확정하는 탐색 설계 · 예상 이론 45분 + 실습 35분</p>
+        </td></tr>
+        <tr><td style="padding:30px">
+          <div style="padding:18px;background:#eef0ff;border-left:5px solid #5865d8;border-radius:10px">
+            <strong>한 줄 요약</strong><br>
+            Kafka는 record마다 위치를 저장하지 않는다. <strong>sparse index를 memory-map한 뒤 binary search로 target 이하의 가장 가까운 checkpoint를 찾고, 그 file position부터 <code>.log</code>의 record batch를 짧게 순차 scan</strong>한다. Index를 촘촘하게 하면 scan은 짧아지지만 file·page cache·recovery 비용이 커진다.
+          </div>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">1. 선수 용어 사전</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr><td style="width:30%;padding:10px;border:1px solid #d5ddeb"><strong>Logical offset</strong></td><td style="padding:10px;border:1px solid #d5ddeb">partition 안 record의 논리적 위치. Consumer와 broker가 대화하는 주소이며 disk byte 주소가 아니다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>File position</strong></td><td style="padding:10px;border:1px solid #d5ddeb">segment <code>.log</code> 시작에서 몇 byte 떨어졌는지를 나타내는 물리 위치.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Index</strong></td><td style="padding:10px;border:1px solid #d5ddeb">검색 key를 data 위치와 연결하는 보조 자료구조. Kafka에서는 index가 원본이 아니며 <code>.log</code>에서 재구축할 수 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Sparse index</strong></td><td style="padding:10px;border:1px solid #d5ddeb">모든 record가 아니라 일정 byte 간격의 checkpoint만 저장하는 성긴 index. 크기를 줄이는 대신 checkpoint 이후 scan이 필요하다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Relative offset</strong></td><td style="padding:10px;border:1px solid #d5ddeb">전체 offset에서 segment base offset을 뺀 값. 예: base 1,000에서 offset 1,025는 25로 저장한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Binary search</strong></td><td style="padding:10px;border:1px solid #d5ddeb">정렬된 범위를 절반씩 버리는 탐색. entry가 N개면 비교 횟수는 대략 <code>log₂N</code>이다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Memory mapping</strong></td><td style="padding:10px;border:1px solid #d5ddeb">파일을 process의 virtual address space에 연결하는 OS 기능. 접근 시 필요한 page를 page cache에서 읽는다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Page fault</strong></td><td style="padding:10px;border:1px solid #d5ddeb">virtual memory page가 아직 RAM에 없을 때 kernel이 매핑·disk read를 처리하는 사건. mmap이 곧 “항상 RAM”이라는 뜻은 아니다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Timestamp</strong></td><td style="padding:10px;border:1px solid #d5ddeb">record가 생성되거나 broker에 append된 시각. Topic의 <code>message.timestamp.type</code>에 따라 의미가 달라진다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>ListOffsets</strong></td><td style="padding:10px;border:1px solid #d5ddeb">earliest·latest 또는 특정 timestamp에 대응하는 offset을 broker에 묻는 Kafka protocol 요청.</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">2. 왜 중요한가</h2>
+          <p>Consumer가 offset 8억을 요청했다고 broker가 segment 처음부터 8억 건을 읽지는 않는다. 먼저 segment base offset 목록에서 대상 file을 고르고, 그 segment의 offset index에서 target 이하 가장 가까운 entry를 찾은 뒤 짧게 scan한다. 이 계층을 알면 “offset lookup은 O(1)” 또는 “binary search이므로 O(log N)” 같은 반쪽 답을 피할 수 있다.</p>
+          <p>실제 지연은 <strong>segment 선택 + index page 접근 + binary search + data page 접근 + batch scan + network 전송</strong>의 합이다. Hot page cache에서는 매우 짧지만, cold replay에서는 major page fault와 disk read가 지배할 수 있다. Timestamp 기반 reset은 time index만 보고 끝나지 않고 offset index와 data scan을 다시 거친다는 점도 운영에서 중요하다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">3. Architecture: offset/timestamp가 record batch로 번역되는 길</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:separate;border-spacing:0 8px">
+            <tr><td style="width:27%;padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>1 · 요청</strong></td><td style="padding:12px;background:#f1f4fa">Fetch offset 또는 ListOffsets timestamp가 partition leader에 도착</td></tr>
+            <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ base offset이 target 이하인 가장 가까운 segment 선택</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>2 · 1차 index</strong></td><td style="padding:12px;background:#f1f4fa">offset이면 <code>.index</code>, 시간이면 <code>.timeindex</code>를 mmap에서 binary search</td></tr>
+            <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ target 이하의 greatest lower bound checkpoint</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>3 · 번역</strong></td><td style="padding:12px;background:#f1f4fa">timestamp 결과는 offset이므로 다시 <code>.index</code>에서 file position을 얻음</td></tr>
+            <tr><td colspan="2" align="center" style="color:#c05a2c;font-weight:800">↓ checkpoint는 후보일 뿐 정답이 아님</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>4 · Log scan</strong></td><td style="padding:12px;background:#f1f4fa"><code>.log</code>의 해당 byte position부터 batch header·offset·timestamp를 순차 확인</td></tr>
+            <tr><td colspan="2" align="center" style="color:#5865d8;font-weight:800">↓ 요청 조건을 처음 만족하는 batch/record 확정</td></tr>
+            <tr><td style="padding:12px;background:#273b8f;color:#ffffff;border-radius:8px"><strong>5 · 응답</strong></td><td style="padding:12px;background:#f1f4fa">Fetch data 또는 timestamp에 대응하는 offset 반환</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">파일 형식: 작은 정수로 큰 주소 공간 다루기</h3>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">파일</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">entry</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">크기·의미</th></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6"><code>.index</code></td><td style="padding:10px;border:1px solid #cbd3e6"><code>(relativeOffset:int32, position:int32)</code></td><td style="padding:10px;border:1px solid #cbd3e6">8 bytes. Full offset와 file position의 checkpoint.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6"><code>.timeindex</code></td><td style="padding:10px;border:1px solid #cbd3e6"><code>(timestamp:int64, relativeOffset:int32)</code></td><td style="padding:10px;border:1px solid #cbd3e6">12 bytes. 지금까지 본 최대 timestamp와 대응 offset.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6"><code>.log</code></td><td style="padding:10px;border:1px solid #cbd3e6">record batch bytes</td><td style="padding:10px;border:1px solid #cbd3e6">source of truth. Index 후보에서 최종 정답까지 scan.</td></tr>
+          </table>
+          <p>Segment base offset이 5,000,000이고 index entry의 relative offset이 120, file position이 65,536이라면 full offset 5,000,120 부근의 batch는 <code>.log</code> byte 65,536부터 찾는다. Relative offset을 쓰면 segment 안 offset을 4 bytes로 표현할 수 있다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">4. CS 내부 동작: owner·불변식·복잡도·실패 창</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">상태</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">소유자</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">불변식·성공 의미</th></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Offset→position</td><td style="padding:10px;border:1px solid #cbd3e6">각 broker replica의 <code>OffsetIndex</code></td><td style="padding:10px;border:1px solid #cbd3e6">entry offset은 증가하며 lookup은 target 이하 가장 큰 entry를 반환한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Timestamp→offset</td><td style="padding:10px;border:1px solid #cbd3e6">각 replica의 <code>TimeIndex</code></td><td style="padding:10px;border:1px solid #cbd3e6">같은 time index의 timestamp는 단조 증가하고 더 큰 timestamp일 때만 entry를 append한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Mapped pages</td><td style="padding:10px;border:1px solid #cbd3e6">OS virtual memory·page cache</td><td style="padding:10px;border:1px solid #cbd3e6">mmap 주소 접근 성공은 필요한 page가 RAM에 있거나 kernel이 fault를 해결했다는 뜻이다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">정답 record</td><td style="padding:10px;border:1px solid #cbd3e6"><code>.log</code> record batch</td><td style="padding:10px;border:1px solid #cbd3e6">Index는 탐색 시작점이다. 최종 offset·timestamp 조건은 data scan에서 확정한다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Cluster metadata</td><td style="padding:10px;border:1px solid #cbd3e6">KRaft controller quorum</td><td style="padding:10px;border:1px solid #cbd3e6">leader 위치를 알려 주지만 topic data index lookup의 hot path에는 참여하지 않는다.</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">정확한 lookup 비용 모델</h3>
+          <p><strong>Offset lookup</strong>은 대략 <code>segment 선택 O(log S) + index search O(log I) + local scan O(B)</code>다. S는 segment 수, I는 선택된 index entry 수, B는 checkpoint와 target 사이에서 검사한 batch 수다. 모든 record를 훑는 O(N)은 아니지만, page cache miss와 storage latency까지 포함하면 Big-O만으로 latency를 예측할 수 없다.</p>
+          <p>Kafka 4.3 기본 <code>index.interval.bytes=4096</code>은 대략 4 KiB마다 offset index entry를 추가하고 조건부로 time index도 추가한다. 간격을 512 bytes로 줄이면 최대 local scan은 짧아지지만 entry 수·mmap virtual memory·page cache pressure·rebuild write가 약 8배 방향으로 증가할 수 있다. 실제 비율은 batch 경계와 timestamp 중복 때문에 정확히 8배가 아니다.</p>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">mmap은 복사를 없애는 마법이 아니다</h3>
+          <p>Broker는 index를 <code>MappedByteBuffer</code>로 접근한다. User-space buffer로 매번 <code>read()</code>할 필요는 줄지만, cold page라면 page fault 후 storage에서 page를 가져와야 한다. 많은 partition·segment를 한꺼번에 cold scan하면 작은 index file도 random page fault를 만들 수 있다. 따라서 benchmark는 warm-cache P50만이 아니라 cold replay P95/P99와 disk read latency를 함께 봐야 한다.</p>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">Timestamp lookup은 두 번의 index와 한 번의 scan</h3>
+          <p><code>TimeIndex.lookup(T)</code>은 T 이하 가장 가까운 timestamp entry의 offset을 찾는다. 이어 <code>OffsetIndex.lookup(offset)</code>으로 byte position을 얻고, 그 지점부터 <code>.log</code>를 scan해 timestamp가 T 이상인 첫 record를 찾는다. <code>CreateTime</code>은 producer clock의 영향을 받고, 같은 batch 안 record는 index granularity보다 세밀하게 표현되지 않으므로 “timestamp→offset이 정확한 해시맵”이라고 설명하면 틀린다.</p>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">Failure window와 recovery</h3>
+          <p>Index에는 별도 checksum이 없고 crash·truncation 뒤 <code>.log</code>를 scan해 재구축할 수 있다. 따라서 data file은 원본, index는 파생 상태다. 재시작 시 index corruption이 발견되면 rebuild 비용을 내지만 곧바로 record 유실을 의미하지 않는다. 반대로 <code>.log</code> 자체가 손상됐는데 index file만 복사해서는 복구되지 않는다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">5. 실무 설계 판단</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse">
+            <tr style="background:#e7ebff"><th align="left" style="padding:10px;border:1px solid #cbd3e6">판단 질문</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">권장 판단</th><th align="left" style="padding:10px;border:1px solid #cbd3e6">이유</th></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6"><code>index.interval.bytes</code>를 줄일까?</td><td style="padding:10px;border:1px solid #cbd3e6">실제 cold random fetch가 SLO 병목일 때만 canary·benchmark 후 조정</td><td style="padding:10px;border:1px solid #cbd3e6">보통 network·disk·batch·consumer 처리 병목이 먼저이며 index 확대 비용이 전 partition에 누적된다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">시간 기반 replay를 믿어도 되나?</td><td style="padding:10px;border:1px solid #cbd3e6">timestamp type·producer clock·late event·retention 경계를 명시하고 조회 결과를 샘플 검증</td><td style="padding:10px;border:1px solid #cbd3e6">CreateTime은 event time과 다를 수 있고 오래된 segment가 이미 삭제됐을 수 있다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">Index file이 10 MiB면 실제 entry도 가득 찼나?</td><td style="padding:10px;border:1px solid #cbd3e6">active preallocation과 valid entry 수를 구분하고 dump tool로 확인</td><td style="padding:10px;border:1px solid #cbd3e6"><code>segment.index.bytes</code>는 최대 preallocation이며 roll 뒤 valid size로 trim된다.</td></tr>
+            <tr><td style="padding:10px;border:1px solid #cbd3e6">OffsetOutOfRange가 lookup 오류인가?</td><td style="padding:10px;border:1px solid #cbd3e6">requested/earliest/latest offset과 retention·truncation·leader epoch부터 확인</td><td style="padding:10px;border:1px solid #cbd3e6">대부분 존재 범위 문제이며 index를 삭제하는 것은 원인 없는 위험 조치다.</td></tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">Best Practice</h3>
+          <ul style="padding-left:22px">
+            <li>기본 <code>index.interval.bytes</code>는 근거 없이 바꾸지 말고, 변경 시 fetch latency·disk reads·index bytes·recovery time을 함께 비교한다.</li>
+            <li>시간 기반 reset 전에 topic의 effective <code>message.timestamp.type</code>과 producer clock skew 정책을 확인한다.</li>
+            <li>운영 도구가 반환한 offset을 곧바로 전체 consumer group에 적용하지 말고 sample partition에서 예상 record timestamp를 검증한다.</li>
+            <li>Index corruption은 broker log·offline log directory·recovery progress를 수집한 뒤 healthy replica와 자동 rebuild 경로를 우선한다.</li>
+            <li>Cold replay SLO에는 index 탐색뿐 아니라 page-cache eviction, storage queue depth, remote-tier fetch, consumer deserialization을 포함한다.</li>
+          </ul>
+
+          <h3 style="margin:24px 0 8px;color:#273b8f">Anti-pattern·edge case·version 차이</h3>
+          <ul style="padding-left:22px">
+            <li><strong>Anti-pattern:</strong> offset index를 B-tree 또는 hash map이라고 부른다. Kafka segment index는 정렬된 fixed-width sparse array에 가깝다.</li>
+            <li><strong>Anti-pattern:</strong> time index 결과가 target timestamp와 정확히 같은 record라고 가정한다. 결과는 scan 시작 후보이며 API는 조건을 만족하는 offset을 찾는다.</li>
+            <li><strong>Edge case:</strong> target offset이 record batch 내부에 있으면 broker는 그 offset을 포함하는 batch의 시작 position을 찾아 반환 경계를 계산한다.</li>
+            <li><strong>Edge case:</strong> 동일 timestamp가 반복되면 time index는 더 큰 timestamp일 때만 새 entry를 넣으므로 offset index보다 더 성길 수 있다.</li>
+            <li><strong>Clock skew:</strong> Kafka 4.3의 CreateTime 기본 정책은 미래 timestamp 허용 범위를 기본 1시간으로 제한하지만 과거 허용 범위 기본값은 매우 크다. 조직 정책으로 더 엄격히 제한할 수 있다.</li>
+            <li><strong>Tiered storage:</strong> local segment가 없으면 remote fetch와 local cache가 추가된다. Local mmap 비용 모델만으로 P99를 예측하면 안 된다.</li>
+          </ul>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">6. 장애 대응: 증거부터 안전 조치까지</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;word-break:break-word;border-collapse:collapse;font-size:13px">
+            <tr style="background:#ffe9e7"><th align="left" style="padding:8px;border:1px solid #e1c4c0">증상</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">먼저 수집할 증거/지표</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">가능한 가설</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">안전한 첫 조치</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">rollback/복구</th><th align="left" style="padding:8px;border:1px solid #e1c4c0">하지 말아야 할 조치</th></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">특정 offset fetch가 느림</td><td style="padding:8px;border:1px solid #e1c4c0">partition·offset, request P95/P99, disk read latency/queue, page faults, local/remote tier, segment 수</td><td style="padding:8px;border:1px solid #e1c4c0">cold page cache, remote segment, slow disk, hot partition, 큰 scan gap</td><td style="padding:8px;border:1px solid #e1c4c0">한 partition·한 offset으로 재현하고 hot/cold 차이를 분리</td><td style="padding:8px;border:1px solid #e1c4c0">부하 제한·storage 복구·검증된 config rollback</td><td style="padding:8px;border:1px solid #e1c4c0">근거 없이 index interval을 전 topic에서 축소</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">시간 reset 결과가 기대와 다름</td><td style="padding:8px;border:1px solid #e1c4c0">requested timestamp/timezone, timestamp type, sample record timestamp, earliest/latest, producer clock skew</td><td style="padding:8px;border:1px solid #e1c4c0">초·ms 혼동, CreateTime skew, retention 삭제, 잘못된 partition, late event</td><td style="padding:8px;border:1px solid #e1c4c0">읽기 전용 offset 조회 후 sample consume</td><td style="padding:8px;border:1px solid #e1c4c0">기존 group offset 백업·검증된 offset으로 단계 복구</td><td style="padding:8px;border:1px solid #e1c4c0">검증 없이 모든 partition offset reset 실행</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0">재시작 후 index rebuild 장기화</td><td style="padding:8px;border:1px solid #e1c4c0">broker recovery log, affected log dir, segment bytes/count, disk errors, offline partitions, healthy replica</td><td style="padding:8px;border:1px solid #e1c4c0">unclean shutdown, corrupt index, 많은 작은 segment, disk degradation</td><td style="padding:8px;border:1px solid #e1c4c0">영향 replica를 특정하고 recovery progress·disk health 관찰</td><td style="padding:8px;border:1px solid #e1c4c0">healthy replica에서 재동기화·disk 교체·설정 rollback</td><td style="padding:8px;border:1px solid #e1c4c0">broker 실행 중 index file 삭제·복사</td></tr>
+            <tr><td style="padding:8px;border:1px solid #e1c4c0"><code>OffsetOutOfRange</code></td><td style="padding:8px;border:1px solid #e1c4c0">requested·committed·log start/end offset, retention, truncation, leader epoch, recent failover</td><td style="padding:8px;border:1px solid #e1c4c0">retention 초과, stale checkpoint, replica truncation, 잘못된 reset</td><td style="padding:8px;border:1px solid #e1c4c0">처리 의미에 맞춰 earliest/latest/recovery source를 선택</td><td style="padding:8px;border:1px solid #e1c4c0">DLQ·source replay·checkpoint 복구 후 gap 기록</td><td style="padding:8px;border:1px solid #e1c4c0">무조건 latest로 넘겨 데이터 gap 은폐</td></tr>
+          </table>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">7. 35분 실습: sparse index를 dump하고 시간→offset 조회</h2>
+          <p><strong>사전 조건:</strong> 저장소 루트, Docker, 약 15 MiB 여유 공간. 실행 전 예측한다. 4 KiB가 아니라 512 bytes마다 index하면 <code>.index</code> entry가 왜 더 많아질까? 그래도 모든 record가 entry를 갖지 않는 이유는?</p>
+
+          <h3 style="margin:18px 0 8px;color:#273b8f">1단계 · 관찰용 topic 생성</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>make up
+
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create \
+  --topic day09-index --partitions 1 --replication-factor 1 \
+  --config segment.bytes=1048576 \
+  --config index.interval.bytes=512</code></pre>
+          <p><strong>예상:</strong> base offset 0의 active <code>.log/.index/.timeindex</code>가 생긴다. Active index는 최대 크기로 preallocate될 수 있으므로 <code>ls -lh</code> 크기만 entry 수로 해석하면 안 된다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#273b8f">2단계 · 첫 구간을 쓰고 조회 기준 시각 저장</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>awk 'BEGIN {
+  for (i=1; i&lt;=5000; i++)
+    printf "old-%05d-%0400d\n", i, 0
+}' | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day09-index
+
+LOOKUP_MS=$(( $(date +%s) * 1000 ))
+sleep 2
+printf 'LOOKUP_MS=%s\n' "$LOOKUP_MS"</code></pre>
+          <p>이 시각은 old 구간 뒤, 다음 new 구간 앞이다. Shell을 바꾸면 변수는 사라지므로 같은 terminal에서 이어서 실행한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#273b8f">3단계 · 다음 구간과 segment roll 만들기</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>awk 'BEGIN {
+  for (i=1; i&lt;=7000; i++)
+    printf "new-%05d-%0400d\n", i, 0
+}' | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day09-index
+
+docker compose exec broker bash -lc \
+  'ls -lh /tmp/kraft-combined-logs/day09-index-0'</code></pre>
+          <p><strong>예상:</strong> 여러 base offset의 file trio가 보인다. 가장 큰 base offset이 active이고, base 0 segment는 roll되어 index가 valid size로 trim됐을 가능성이 높다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#273b8f">4단계 · offset/time index dump</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec broker /opt/kafka/bin/kafka-dump-log.sh \
+  --files /tmp/kraft-combined-logs/day09-index-0/00000000000000000000.index
+
+docker compose exec broker /opt/kafka/bin/kafka-dump-log.sh \
+  --files /tmp/kraft-combined-logs/day09-index-0/00000000000000000000.timeindex</code></pre>
+          <p><strong>예상 관찰:</strong> offset index에는 증가하는 relative offset과 position, time index에는 timestamp와 offset이 출력된다. Position 차이가 정확히 512가 아닌 이유는 Kafka가 byte threshold를 넘은 <strong>batch 경계</strong>에서 entry를 기록하기 때문이다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#273b8f">5단계 · 저장한 timestamp를 offset으로 번역</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec broker /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 \
+  --topic day09-index --time "$LOOKUP_MS"
+
+docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day09-index \
+  --partition 0 --offset &lt;위에서_확인한_offset&gt; \
+  --max-messages 3 \
+  --property print.offset=true \
+  --property print.timestamp=true</code></pre>
+          <p><strong>예상:</strong> 조회 offset 근처부터 <code>new-</code> record가 보인다. 실제 출력 offset을 두 번째 명령의 placeholder에 넣는다. Timestamp 조회는 group offset을 변경하지 않는 읽기 전용 작업이다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#273b8f">실패 주입 · milliseconds를 seconds로 잘못 전달</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>WRONG_SECONDS=$(date +%s)
+
+docker compose exec broker /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 \
+  --topic day09-index --time "$WRONG_SECONDS"</code></pre>
+          <p><strong>예상:</strong> 1970년대에 가까운 millisecond 값으로 해석되어 earliest 쪽 offset이 나올 수 있다. 숫자가 정상처럼 보여도 단위가 틀린 semantic failure다. 자동 reset 전에 UTC epoch milliseconds와 sample record를 반드시 검증한다.</p>
+
+          <h3 style="margin:18px 0 8px;color:#273b8f">자주 나는 오류와 해결</h3>
+          <ul style="padding-left:22px">
+            <li>topic이 이미 존재한다: cleanup 여부를 확인하고 새 topic 이름을 사용한다.</li>
+            <li>base 0 file이 없다: retention 또는 이전 topic 상태를 의심하고 현재 directory의 가장 작은 base offset file을 선택한다.</li>
+            <li>dump 결과가 너무 많다: 출력 앞부분과 entry 간 offset·position 차이만 샘플링한다.</li>
+            <li><code>LOOKUP_MS</code>가 비어 있다: 같은 shell session인지 확인하고 다시 값을 저장한다.</li>
+            <li>timestamp 결과가 new 구간과 다르다: milliseconds·timezone·timestamp type·producer clock과 batch 경계를 확인한다.</li>
+          </ul>
+
+          <h3 style="margin:18px 0 8px;color:#273b8f">Cleanup</h3>
+          <pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#101a33;color:#e6eaff;padding:16px;border-radius:10px;font-size:13px"><code>docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --delete --topic day09-index</code></pre>
+          <p>Index file을 직접 삭제하지 않는다. 실습 실패로 broker가 비정상 상태가 되면 먼저 <code>docker compose logs broker</code>와 topic 존재 여부를 확인한다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">8. 놓치기 쉬운 함정</h2>
+          <ul style="padding-left:22px">
+            <li><strong>Offset = byte position:</strong> offset은 논리 주소이고 index가 physical position으로 번역한다.</li>
+            <li><strong>Index = source of truth:</strong> 원본은 <code>.log</code>이며 index는 재구축 가능한 파생 상태다.</li>
+            <li><strong>Binary search면 끝:</strong> checkpoint 이후 batch scan과 page-cache/disk 비용이 남는다.</li>
+            <li><strong>mmap = no I/O:</strong> cold page는 page fault와 storage read를 유발한다.</li>
+            <li><strong>Time index = 정확한 timestamp map:</strong> sparse·batch·timestamp type·clock skew 경계가 있다.</li>
+            <li><strong>작은 interval = 무조건 빠름:</strong> lookup scan 감소와 index memory/recovery 비용을 교환한다.</li>
+          </ul>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">9. 대기업 기술 면접 질문</h2>
+          <ol style="padding-left:22px">
+            <li><strong>Consumer가 임의 offset을 요청할 때 broker 내부 탐색을 설명하라.</strong><br>좋은 답은 leader data path, segment base offset 선택, mmap offset index의 greatest-lower-bound binary search, <code>.log</code> batch scan, fetch slicing 순서로 설명한다. Hot/cold cache, sparse interval, batch 경계, remote tier라는 비용·실패 변수를 덧붙인다.</li>
+            <li><strong>왜 모든 record를 index하지 않고 4 KiB 안팎의 sparse index를 쓰는가?</strong><br>초당 bytes·평균 batch size·partition 수·retention을 가정해 index bytes와 최대 scan bytes를 비교한다. Dense index의 memory/page-cache/rebuild 비용과 sparse index의 local scan을 trade-off로 제시하고 benchmark·canary·rollback 기준을 말한다.</li>
+            <li><strong>“어제 09:00부터 재처리” 요구를 안전하게 설계하라.</strong><br>timezone→epoch milliseconds 변환, CreateTime/LogAppendTime, clock skew·late event·retention, partition별 timestamp lookup, sample consume, 기존 committed offset 백업, 단계적 reset·rollback을 포함한다. Exactly-once가 외부 sink 중복을 자동 해결하지 않는 범위도 방어한다.</li>
+          </ol>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">10. 복습과 정답</h2>
+          <h3 style="margin:18px 0 8px;color:#273b8f">어제 내용 회상 3문제</h3>
+          <ol style="padding-left:22px">
+            <li>Partition log와 segment의 관계, active segment가 하나인 이유는?</li>
+            <li><code>segment.bytes</code>가 작을 때 얻는 이점과 지불하는 비용은?</li>
+            <li>Producer ack와 fsync·replication이 같은 개념이 아닌 이유는?</li>
+          </ol>
+          <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>채점 기준:</strong> ① 하나의 논리 log가 base offset별 physical segment 묶음이며 append 대상은 tail 하나, ② retention/remote-upload 정밀도 대 file·index·recovery churn, ③ ack는 설정·ISR 복제 조건이고 OS stable storage flush 시점은 별도라고 답하면 통과.</p>
+
+          <h3 style="margin:18px 0 8px;color:#273b8f">오늘 내용 확인 3문제</h3>
+          <ol style="padding-left:22px">
+            <li>Offset index entry가 8 bytes인 이유와 full offset 복원법은?</li>
+            <li>Timestamp lookup이 time index 한 번으로 끝나지 않는 이유는?</li>
+            <li><code>index.interval.bytes</code>를 4096에서 512로 줄일 때의 양방향 trade-off는?</li>
+          </ol>
+          <p style="padding:14px;background:#f5f7fb;border-radius:9px"><strong>짧은 정답:</strong> ① int32 relative offset+int32 file position이며 base offset을 더한다. ② time index가 후보 offset만 주므로 offset index로 position을 얻고 log를 scan해 첫 만족 record를 확정한다. ③ 최대 local scan은 짧아지지만 index entry·mmap/page-cache·rebuild 비용이 커진다.</p>
+
+          <h2 style="margin:30px 0 12px;color:#273b8f">11. 공식 자료</h2>
+          <ul style="padding-left:22px">
+            <li><a href="https://kafka.apache.org/43/implementation/log/" style="color:#3f51b5">Apache Kafka 4.3 · Log Implementation</a></li>
+            <li><a href="https://kafka.apache.org/43/configuration/topic-configs/#topicconfigs_index.interval.bytes" style="color:#3f51b5">Apache Kafka 4.3 · index.interval.bytes</a></li>
+            <li><a href="https://github.com/apache/kafka/blob/4.3.1/storage/src/main/java/org/apache/kafka/storage/internals/log/OffsetIndex.java" style="color:#3f51b5">Apache Kafka 4.3.1 source · OffsetIndex</a></li>
+            <li><a href="https://github.com/apache/kafka/blob/4.3.1/storage/src/main/java/org/apache/kafka/storage/internals/log/TimeIndex.java" style="color:#3f51b5">Apache Kafka 4.3.1 source · TimeIndex</a></li>
+          </ul>
+
+          <div style="margin-top:28px;padding:18px;background:#101a33;color:#ffffff;border-radius:10px">
+            <strong style="color:#9db0ff">내일 예고 · Day 10</strong><br>
+            Sequential I/O가 locality와 queueing을 어떻게 활용하는지, write syscall·page cache·dirty page·flush·fsync의 성공 시점을 OS 관점에서 분리합니다.
+          </div>
+        </td></tr>
+        <tr><td style="padding:18px 30px;background:#f3f5f9;color:#637087;font-size:12px;border-radius:0 0 20px 20px">Kafka 9주 63일 심화 커리큘럼 · Day 09 · 공식 Kafka 4.3 문서와 4.3.1 소스 기준</td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>

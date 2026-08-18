@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 17 · in-flight request와 ordering 조건</title>
+</head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #dbe3ef;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#253b6e;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#c9d8ff;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 3 / DAY 17 · PRODUCER PIPELINE</div>
+  <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">in-flight request와<br>ordering 조건</h1>
+  <p style="margin:0;color:#e5ebff">여러 요청을 겹쳐 보내는 성능 이득과 retry 순서 역전의 경계 · 이론 55분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#edf2ff;border-left:5px solid #3c61b8;border-radius:10px"><strong>한 줄 요약</strong><br>
+  <code>max.in.flight.requests.per.connection</code>은 한 broker connection에서 응답을 기다리는 ProduceRequest 수의 상한이다. 값을 키우면 네트워크 왕복 대기 시간을 겹쳐 throughput을 높이지만, <strong>idempotence를 끈 채 retry와 2개 이상의 in-flight를 함께 쓰면 먼저 보낸 batch가 나중에 기록되는 순서 역전</strong>이 가능하다. Kafka 4.3의 idempotent producer는 sequence 검증으로 허용 범위 5 안에서 partition ordering을 보존한다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #d5ddeb"><strong>In-flight request</strong></td><td style="padding:10px;border:1px solid #d5ddeb">client가 socket으로 보냈지만 아직 response를 받지 못한 요청. 실패했다는 뜻이 아니라 결과가 미확정인 진행 중 상태다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Connection</strong></td><td style="padding:10px;border:1px solid #d5ddeb">producer와 특정 broker node 사이의 지속 TCP 연결. 설정 상한은 producer 전체나 partition별이 아니라 <em>connection별</em>이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Pipelining</strong></td><td style="padding:10px;border:1px solid #d5ddeb">이전 응답을 기다리지 않고 다음 요청을 보내 대기 시간을 겹치는 기법. CPU pipeline이나 HTTP pipelining과 같은 지연 숨기기 원리다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Ordering</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Kafka에서는 같은 topic-partition log에 append된 record의 순서. 서로 다른 partition 사이에는 전역 순서를 약속하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Retry</strong></td><td style="padding:10px;border:1px solid #d5ddeb">일시 오류나 응답 유실 뒤 같은 전송을 다시 시도하는 것. 재시도 횟수보다 전체 <code>delivery.timeout.ms</code> deadline이 실무 경계다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Head-of-line blocking</strong></td><td style="padding:10px;border:1px solid #d5ddeb">앞선 작업 하나가 지연되어 뒤 작업까지 진행하지 못하는 현상. in-flight=1은 순서가 단순하지만 한 요청의 RTT가 pipeline 전체를 멈춘다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>RTT</strong></td><td style="padding:10px;border:1px solid #d5ddeb">Round Trip Time. 요청이 broker에 갔다가 응답이 돌아오는 왕복 시간이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Batch</strong></td><td style="padding:10px;border:1px solid #d5ddeb">같은 partition의 여러 record를 묶은 압축·전송·append 단위. 하나의 ProduceRequest에는 여러 partition batch가 함께 실릴 수도 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Idempotence</strong></td><td style="padding:10px;border:1px solid #d5ddeb">PID·epoch·partition별 sequence로 retry batch의 중복과 순서를 broker가 판별하는 producer 보장이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d5ddeb"><strong>Backpressure</strong></td><td style="padding:10px;border:1px solid #d5ddeb">downstream이 느릴 때 upstream 전송을 제한해 무한 적체를 막는 압력. in-flight 상한은 network client의 bounded concurrency다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">2. 왜 중요한가</h2>
+  <p>요청 하나를 처리하는 데 RTT 10ms가 걸리고 매번 응답 뒤에만 다음 요청을 보낸다면 단순 상한은 초당 약 100 request다. in-flight를 5로 늘리면 다섯 RTT 대기를 겹칠 수 있다. 실제 처리량은 batch 크기·broker disk/network·quota에도 묶이지만, <strong>대기 시간을 겹쳐 link utilization을 높인다</strong>는 핵심은 같다.</p>
+  <p>문제는 실패 경로다. batch A를 먼저 보내고 B를 뒤에 보낸 상태에서 A만 실패하고 B는 성공하면, idempotence가 꺼져 있을 때 A retry가 B 뒤에 append될 수 있다. 평상시 부하 테스트에서는 잘 보이지 않고 timeout·leader change·packet loss 때만 나타나므로 실무 사고와 면접 모두에서 좋은 경계 질문이다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">3. Architecture: 두 batch가 순서를 잃는 순간</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:25%;padding:12px;background:#294b98;color:#fff;border-radius:8px"><strong>1 · Accumulator</strong></td><td style="padding:12px;background:#edf2ff">같은 P0에 batch A=[1,2], B=[3,4]가 순서대로 ready</td></tr>
+    <tr><td colspan="2" align="center" style="color:#3c61b8;font-weight:800">↓ in-flight 상한이 2 이상이라 응답 전에 연속 전송</td></tr>
+    <tr><td style="padding:12px;background:#294b98;color:#fff;border-radius:8px"><strong>2 · Socket</strong></td><td style="padding:12px;background:#edf2ff">ProduceRequest A → ProduceRequest B → 같은 broker TCP connection</td></tr>
+    <tr><td colspan="2" align="center" style="color:#bd5d27;font-weight:800">↓ A는 retriable error/응답 유실 · B는 성공</td></tr>
+    <tr><td style="padding:12px;background:#294b98;color:#fff;border-radius:8px"><strong>3 · Broker log</strong></td><td style="padding:12px;background:#fff1e8">idempotence=false라면 B=[3,4]가 먼저 append</td></tr>
+    <tr><td colspan="2" align="center" style="color:#bd5d27;font-weight:800">↓ backoff 뒤 A retry</td></tr>
+    <tr><td style="padding:12px;background:#294b98;color:#fff;border-radius:8px"><strong>4 · Reorder</strong></td><td style="padding:12px;background:#fff1e8">최종 log [3,4,1,2] — producer 호출 순서와 달라짐</td></tr>
+    <tr><td colspan="2" align="center" style="color:#29795a;font-weight:800">↓ idempotence=true면 partition sequence 검증</td></tr>
+    <tr><td style="padding:12px;background:#294b98;color:#fff;border-radius:8px"><strong>5 · Preserve</strong></td><td style="padding:12px;background:#eaf8f1">sequence gap을 허용하지 않고 retry/dedup하여 A → B ordering 보존</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>Sender thread:</strong> partition별 ready batch를 고르고 broker node별 ProduceRequest를 만든다.</li>
+    <li><strong>NetworkClient:</strong> connection의 미응답 요청 수가 상한보다 작을 때 다음 request를 보낸다. 상한에 닿으면 그 node 전송이 대기한다.</li>
+    <li><strong>Failure window:</strong> TCP 전송 순서와 애플리케이션 성공 확정 순서는 동일 개념이 아니다. broker별·partition별 응답과 retry가 갈라진다.</li>
+    <li><strong>Non-idempotent:</strong> broker에 batch 간 인과관계를 증명할 sequence가 없으므로 늦은 retry를 정상 새 append로 볼 수 있다.</li>
+    <li><strong>Idempotent:</strong> 어제 배운 PID·epoch·sequence가 A의 누락과 B의 gap을 감지한다. 허용되는 <code>max.in.flight≤5</code>에서는 ordering을 유지한다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">4. CS 내부 동작</h2>
+  <h3 style="margin:18px 0 8px;color:#294b98">상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfe8ff"><th align="left" style="padding:10px;border:1px solid #c8d3ed">상태</th><th align="left" style="padding:10px;border:1px solid #c8d3ed">소유자</th><th align="left" style="padding:10px;border:1px solid #c8d3ed">불변식</th></tr>
+    <tr><td style="padding:10px;border:1px solid #c8d3ed">미응답 request 수</td><td style="padding:10px;border:1px solid #c8d3ed">producer NetworkClient, broker connection별</td><td style="padding:10px;border:1px solid #c8d3ed">configured maximum을 넘겨 새 request를 쓰지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c8d3ed">batch 순서·retry 상태</td><td style="padding:10px;border:1px solid #c8d3ed">producer RecordAccumulator/Sender, partition별</td><td style="padding:10px;border:1px solid #c8d3ed">idempotent 모드에서는 lower sequence batch가 해결되기 전에 gap을 확정 append하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c8d3ed">수락 sequence history</td><td style="padding:10px;border:1px solid #c8d3ed">partition leader broker</td><td style="padding:10px;border:1px solid #c8d3ed">같은 PID·epoch·partition에서 expected sequence만 새 append한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c8d3ed">업무 순서 의미</td><td style="padding:10px;border:1px solid #c8d3ed">application·partitioning contract</td><td style="padding:10px;border:1px solid #c8d3ed">순서를 비교해야 할 event는 같은 key로 같은 partition에 보내야 한다.</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#294b98">왜 상한은 “record 수”가 아니라 “request 수”인가</h3>
+  <p>Kafka protocol의 ProduceRequest는 broker node 하나를 대상으로 하며 여러 topic-partition batch를 포함할 수 있다. 따라서 값 5는 record 5개나 partition마다 batch 5개라는 뜻이 아니다. 한 connection에서 response가 돌아오지 않은 <strong>protocol request</strong>가 최대 5개라는 뜻이다. batch 크기와 request당 partition 수가 달라지면 같은 설정에서도 메모리·wire bytes·risk exposure가 달라진다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#294b98">Little's Law로 보는 처리량</h3>
+  <p>안정 상태에서 <code>동시 진행 수 L ≈ 처리량 λ × 체류시간 W</code>다. RTT와 broker 처리시간을 합친 W가 20ms이고 초당 200 request를 원하면 평균 in-flight는 약 4가 필요하다. 이는 설계 출발점일 뿐이다. batch당 bytes, compression CPU, broker request queue, quota를 함께 측정해야 하며 상한을 무작정 키우면 memory와 tail latency만 커질 수 있다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#294b98">성공 확정과 state transition</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfe8ff"><th align="left" style="padding:9px;border:1px solid #c8d3ed">상태</th><th align="left" style="padding:9px;border:1px solid #c8d3ed">전이 조건</th><th align="left" style="padding:9px;border:1px solid #c8d3ed">관찰 의미</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c8d3ed">READY</td><td style="padding:9px;border:1px solid #c8d3ed">batch가 send 가능</td><td style="padding:9px;border:1px solid #c8d3ed">아직 network 결과 없음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c8d3ed">IN_FLIGHT</td><td style="padding:9px;border:1px solid #c8d3ed">request socket write</td><td style="padding:9px;border:1px solid #c8d3ed">broker append 여부가 미확정</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c8d3ed">RETRY_BACKOFF</td><td style="padding:9px;border:1px solid #c8d3ed">retriable error/timeout</td><td style="padding:9px;border:1px solid #c8d3ed">새 event 생성이 아니라 같은 batch 재시도</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c8d3ed">ACKED</td><td style="padding:9px;border:1px solid #c8d3ed">요구한 acks 조건의 성공 response</td><td style="padding:9px;border:1px solid #c8d3ed">callback/future 성공, 해당 record delivery 확정</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c8d3ed">EXPIRED/FAILED</td><td style="padding:9px;border:1px solid #c8d3ed">delivery deadline 또는 fatal error</td><td style="padding:9px;border:1px solid #c8d3ed">일부 결과는 ambiguous할 수 있어 business idempotency 필요</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfe8ff"><th align="left" style="padding:9px;border:1px solid #c8d3ed">상황</th><th align="left" style="padding:9px;border:1px solid #c8d3ed">판단</th><th align="left" style="padding:9px;border:1px solid #c8d3ed">이유·비용</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c8d3ed">일반 업무 event</td><td style="padding:9px;border:1px solid #c8d3ed"><code>enable.idempotence=true</code>, <code>acks=all</code>, in-flight 기본 5 유지</td><td style="padding:9px;border:1px solid #c8d3ed">Kafka 4.3 기본 보장과 pipeline 성능을 함께 얻는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c8d3ed">idempotence를 의도적으로 끔</td><td style="padding:9px;border:1px solid #c8d3ed">retry가 있고 partition ordering이 필수면 in-flight=1</td><td style="padding:9px;border:1px solid #c8d3ed">순서 안전 대신 RTT당 한 요청으로 throughput 감소.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c8d3ed">전역 업무 순서 필요</td><td style="padding:9px;border:1px solid #c8d3ed">ordering key·single partition 또는 상위 sequence/reconciliation 설계</td><td style="padding:9px;border:1px solid #c8d3ed">in-flight 값만으로 partition 간 순서는 생기지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c8d3ed">p99 지연 상승</td><td style="padding:9px;border:1px solid #c8d3ed">먼저 request latency/queue, batch, throttling, retry rate 측정</td><td style="padding:9px;border:1px solid #c8d3ed">상한 증가는 포화 원인을 가리고 queueing을 키울 수 있다.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> 설정 하나를 튜닝하지 말고 <code>batch.size</code>·<code>linger.ms</code>·compression·<code>delivery.timeout.ms</code>·retry rate와 함께 부하 실험한다. 같은 key가 같은 partition에 간다는 contract를 schema/producer test로 고정하고 callback 오류를 관측한다.</p>
+  <p><strong>Anti-pattern:</strong> “in-flight=1이면 exactly-once”라고 생각하기, consumer 처리 순서를 producer 설정으로 해결하려 하기, 오류 callback을 버리고 성공 건수만 보기, 더 큰 concurrency가 항상 더 빠르다고 가정하기.</p>
+  <p><strong>Version 경계:</strong> Kafka 4.3 공식 설정에서 idempotence는 충돌 설정이 없으면 기본 활성화되고 <code>acks=all</code>·<code>retries&gt;0</code>·<code>max.in.flight≤5</code>가 필요하다. 5보다 크게 명시하면 idempotence 조건과 충돌한다. 향후 제안 상태 KIP의 내용은 현재 배포 동작으로 단정하지 않는다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffe6d6"><th style="padding:7px;border:1px solid #e7c7b3">증상</th><th style="padding:7px;border:1px solid #e7c7b3">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e7c7b3">가능한 가설</th><th style="padding:7px;border:1px solid #e7c7b3">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e7c7b3">rollback/복구</th><th style="padding:7px;border:1px solid #e7c7b3">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">같은 key event 순서 역전</td><td style="padding:7px;border:1px solid #e7c7b3">실제 partition·offset, producer effective config, retry/error callback, client version</td><td style="padding:7px;border:1px solid #e7c7b3">idempotence off + retry + in-flight&gt;1, key/partition 변경</td><td style="padding:7px;border:1px solid #e7c7b3">영향 producer 격리, 설정 snapshot과 샘플 offset 보존</td><td style="padding:7px;border:1px solid #e7c7b3">검증된 idempotent 설정 복원, business sequence로 재정렬·보정</td><td style="padding:7px;border:1px solid #e7c7b3">topic 전체 삭제·무근거 replay</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">throughput 낮고 request latency 높음</td><td style="padding:7px;border:1px solid #e7c7b3">request-rate/latency, batch-size-avg, records-per-request, throttle, broker queue</td><td style="padding:7px;border:1px solid #e7c7b3">in-flight=1 HOL blocking, 작은 batch, broker 포화</td><td style="padding:7px;border:1px solid #e7c7b3">한 변수씩 canary 부하 실험</td><td style="padding:7px;border:1px solid #e7c7b3">p99·error 악화 시 이전 config 즉시 복원</td><td style="padding:7px;border:1px solid #e7c7b3">상한·timeout 동시 대폭 증가</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3"><code>ConfigException</code>으로 시작 실패</td><td style="padding:7px;border:1px solid #e7c7b3">effective acks/retries/idempotence/in-flight, client version</td><td style="padding:7px;border:1px solid #e7c7b3">명시적 idempotence와 충돌 설정</td><td style="padding:7px;border:1px solid #e7c7b3">배포 중지, known-good config 비교</td><td style="padding:7px;border:1px solid #e7c7b3">이전 artifact/config rollback</td><td style="padding:7px;border:1px solid #e7c7b3">오류를 없애려고 idempotence만 끄기</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">7. 35분 실습: 실패 경로의 순서를 증거로 남기기</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측</strong><br>정상 경로에서는 in-flight=1과 5 모두 key 순서를 유지한다. 따라서 단순 console 출력만으로 보장을 입증할 수 없다. 어떤 실패 조건이 있어야 non-idempotent + retry + in-flight&gt;1에서 역전 가능성이 생기는지 먼저 한 문장으로 적는다.</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker 실행, 제공된 Kafka 4.3.1 KRaft broker. 아래 명령은 local 학습 cluster에만 사용한다.</p>
+  <ol style="padding-left:22px">
+    <li><strong>환경 확인:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+make smoke</code></li>
+    <li><strong>effective 조건 표 작성:</strong> A=<code>idempotence=true, max.in.flight=5</code>, B=<code>false, 1</code>, C=<code>false, 5</code>를 적고 정상/response 유실에서 예상 중복·순서를 표로 예측한다.</li>
+    <li><strong>CLI producer 속성 확인:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec kafka /opt/kafka/bin/kafka-producer-perf-test.sh --help | head -40</code></li>
+    <li><strong>기준 부하:</strong> test topic에 같은 record 수·크기로 in-flight 1과 5를 각각 실행하고 records/sec, MB/sec, avg/p99 latency를 기록한다. 명령의 <code>--producer-props</code>에 <code>acks=all enable.idempotence=true max.in.flight.requests.per.connection=1</code>을 넣고 두 번째 실행에서 마지막 값만 5로 바꾼다.</li>
+    <li><strong>실패 주입:</strong> 별도 터미널에서 짧게 broker를 pause한 뒤 resume하여 미응답 window를 만든다.<br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose pause kafka
+docker compose unpause kafka</code>producer의 retry/error와 전체 delivery deadline을 관찰한다. 같은 실행에서 반복 pause하지 않는다.</li>
+    <li><strong>관찰:</strong> consumer에서 key, partition, offset, application sequence를 함께 출력한다. “역전이 안 나왔다”는 안전 증명이 아니라 이번 스케줄링에서 재현되지 않았다는 결과로 기록한다.</li>
+  </ol>
+  <p><strong>예상 관찰:</strong> in-flight=5는 RTT 대기를 겹쳐 throughput이 같거나 높을 수 있다. broker pause 동안 latency와 retry가 솟고, idempotent 구성에서는 성공한 같은-partition record의 sequence ordering이 유지된다.</p>
+  <p><strong>자주 나는 오류와 해결:</strong> container 이름 불일치는 <code>docker compose ps</code>로 확인한다. idempotence=false인데 <code>acks=all</code>만 썼다고 ordering이 생기지 않는다. perf test가 너무 빨리 끝나면 record 수를 늘리되 production broker에 실행하지 않는다. timeout이면 delivery deadline과 pause 시간을 함께 기록하고 무작정 timeout을 늘리지 않는다.</p>
+  <p><strong>Cleanup:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose unpause kafka
+make down</code>pause 상태를 반드시 해제한 뒤 종료한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>호출 순서 ≠ 전역 Kafka 순서:</strong> ordering은 같은 partition에서만 논할 수 있다.</li>
+    <li><strong>TCP ordered delivery ≠ retry ordering:</strong> 재연결·새 request·broker 처리 결과가 포함되면 application-level 순서 문제가 남는다.</li>
+    <li><strong>5는 partition별 5가 아니다:</strong> broker connection별 unacknowledged request 상한이다.</li>
+    <li><strong>in-flight=1은 중복을 제거하지 않는다:</strong> response 유실 후 non-idempotent retry는 같은 batch를 다시 append할 수 있다.</li>
+    <li><strong>idempotence도 업무 순서를 발명하지 않는다:</strong> key가 바뀌거나 partition 수 변경으로 routing이 바뀌면 별도 contract가 필요하다.</li>
+    <li><strong>성능은 단조 증가하지 않는다:</strong> broker queue가 포화되면 concurrency 증가는 p99와 memory를 악화시킨다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. retries가 ordering을 깨뜨리는 정확한 조건을 그려보세요.</strong><br>
+  좋은 답변 구조: 같은 partition의 A/B batch 가정 → in-flight&gt;1 → A 실패·B 성공 → A retry가 B 뒤 append → idempotence=false 조건 → idempotence sequence 또는 in-flight=1 대안 → throughput trade-off.</p>
+  <p><strong>Q2. max.in.flight=1과 5를 어떻게 선택하겠습니까?</strong><br>
+  좋은 답변 구조: ordering scope와 client version 확인 → idempotence 사용 여부 → RTT·목표 request rate로 Little's Law 추정 → batch/latency/error canary 측정 → 기본 5 유지 근거와 1의 HOL 비용 → rollback 기준.</p>
+  <p><strong>Q3. idempotent producer인데도 사용자가 주문 상태 역전을 봤습니다. 어디부터 조사합니까?</strong><br>
+  좋은 답변 구조: 주문 ID별 event sequence와 timestamp 수집 → 실제 topic/partition/offset 확인 → key·partitioner·partition-count 변화 → producer effective config와 callback → consumer concurrency·sink upsert → Kafka partition ordering과 end-to-end 처리 순서를 분리 → 보정/replay 계획.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#294b98">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>PID·epoch·sequence의 상태 key를 말해보라.</li><li>response 유실 retry를 broker가 중복으로 판별하는 기준은?</li><li>producer idempotence가 외부 DB 중복까지 막지 못하는 이유는?</li></ol>
+  <p style="padding:12px;background:#f3f6fb"><strong>짧은 정답:</strong> ① identity는 PID/epoch이고 sequence는 partition별이다. ② 같은 identity와 이미 수락한 batch sequence history다. ③ Kafka log append 경계의 보장이며 DB side effect·business retry에는 동일 identity가 자동 전달되지 않는다.</p>
+  <h3 style="margin:16px 0 8px;color:#294b98">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>non-idempotent retry에서 순서 역전에 필요한 세 조건은?</li><li>in-flight 5는 정확히 무엇을 세는가?</li><li>값을 키울 때 throughput과 p99가 어떻게 달라질 수 있는가?</li></ol>
+  <p style="padding:12px;background:#f3f6fb"><strong>채점 기준:</strong> ① 같은 partition, retries&gt;0, in-flight&gt;1 및 앞 batch 실패·뒤 batch 성공 failure window(3점). ② producer-broker node connection의 미응답 protocol request 수(3점). ③ RTT overlap 이득과 queueing/memory/tail-latency 비용을 함께 말하면 4점. 총 8점 이상이면 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294b98">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/generated/producer_config.html" style="color:#294b98">Apache Kafka 4.3 Producer Configs</a> — max.in.flight, retries, idempotence의 현재 조건</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html" style="color:#294b98">KafkaProducer 4.3.1 API</a> — batching·delivery·idempotent producer 설명</li>
+    <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/66854913/KIP-98%2B-%2BExactly%2BOnce%2BDelivery%2Band%2BTransactional%2BMessaging" style="color:#294b98">KIP-98</a> — PID·sequence 기반 설계 배경</li>
+    <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/73632637/KIP-185%2BMake%2Bexactly%2Bonce%2Bin%2Border%2Bdelivery%2Bper%2Bpartition%2Bthe%2Bdefault%2Bproducer%2Bsetting" style="color:#294b98">KIP-185</a> — pipelining 성능과 in-order delivery 논의</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#253b6e;color:#fff;border-radius:10px"><strong>내일 예고 · Day 18</strong><br>poll loop, fetch, deserialization, processing — consumer의 한 번의 poll 뒤에서 bytes가 업무 side effect가 되기까지의 data path와 실패 창을 해부한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>

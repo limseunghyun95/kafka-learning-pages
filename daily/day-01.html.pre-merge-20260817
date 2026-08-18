@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kafka 심화 커리큘럼 Day 01</title>
+</head>
+<body style="margin:0;padding:0;background:#f5f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans KR',Arial,sans-serif;font-size:16px;line-height:1.72;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f5f7fb;">
+<tr><td align="center" style="padding:20px 10px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:680px;background:#ffffff;border:1px solid #dde3ef;border-radius:14px;overflow:hidden;">
+<tr><td style="background:#19213a;padding:30px 26px;color:#fff;">
+<div style="font-size:13px;letter-spacing:1.5px;color:#a9bdff;font-weight:700;">APACHE KAFKA 4.3 · WEEK 1 / DAY 01</div>
+<h1 style="margin:8px 0 10px;font-size:28px;line-height:1.3;color:#fff;">event, record, stream과 Kafka가 해결하는 결합 문제</h1>
+<p style="margin:0;color:#dbe3ff;">분산 로그 정신 모델 · 예상 학습 30분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:26px;">
+<div style="background:#eef2ff;border-left:5px solid #526fe8;padding:16px 18px;margin-bottom:28px;"><strong style="color:#2946b6;">한 줄 요약</strong><br>Kafka는 “메시지를 전달하는 통로”에 그치지 않는다. producer와 consumer 사이에 오래 유지되는 partition log를 두어 시간·처리 속도·장애 복구·재처리의 결합을 분리하는 분산 event streaming 시스템이다.</div>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:30px 0 14px;">1. 선수 용어 사전</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;width:29%;font-weight:700;vertical-align:top;">Event</td><td style="padding:10px;border:1px solid #dde3ef;">“무언가 일어났다”는 사실. 주문 생성, 결제 승인, 센서 측정처럼 과거에 발생한 업무 사실을 표현한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;vertical-align:top;">Record</td><td style="padding:10px;border:1px solid #dde3ef;">Kafka가 event를 저장·전송하는 단위. key, value, timestamp, headers를 가지며 최종적으로 byte 배열로 직렬화된다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;vertical-align:top;">Stream</td><td style="padding:10px;border:1px solid #dde3ef;">시간 순서로 계속 도착하는 event의 논리적 연속. 끝이 정해지지 않은 dataset으로 생각하면 쉽다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;vertical-align:top;">Producer</td><td style="padding:10px;border:1px solid #dde3ef;">record를 Kafka에 쓰는 client application. 업무 transaction의 성공과 Kafka 전송 성공은 별도 상태이므로 경계를 설계해야 한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;vertical-align:top;">Consumer</td><td style="padding:10px;border:1px solid #dde3ef;">저장된 record를 읽어 처리하는 application. 읽었다는 사실과 외부 DB 반영 완료는 동일하지 않다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;vertical-align:top;">Broker</td><td style="padding:10px;border:1px solid #dde3ef;">Kafka server process. partition log를 저장하고 client의 produce/fetch 요청을 처리한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;vertical-align:top;">Topic / Partition</td><td style="padding:10px;border:1px solid #dde3ef;">Topic은 event의 논리적 이름, partition은 append 순서와 offset을 가진 실제 분산 로그 단위다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;vertical-align:top;">Offset</td><td style="padding:10px;border:1px solid #dde3ef;">partition 안에서 record 위치를 나타내는 증가 숫자. 전역 메시지 ID나 처리 완료 표시는 아니다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;vertical-align:top;">Durability</td><td style="padding:10px;border:1px solid #dde3ef;">성공으로 확인된 data가 장애 뒤에도 남는 성질. 복제본 수만 아니라 ack 조건과 ISR 상태를 함께 봐야 한다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">2. Kafka가 해결하는 결합 문제</h2>
+<p>Kafka가 없다고 가정해 보자. 주문 서비스가 warehouse 적재기, 알림, 추천, 부정 거래 탐지, 검색 색인에 직접 HTTP 요청을 보낸다면 producer는 consumer의 주소·schema·속도·장애 상태를 모두 알아야 한다. consumer 하나의 지연이 주문 요청 latency를 늘리고, 새 consumer를 붙일 때 producer를 다시 배포하며, 장애 중 누락된 데이터를 재현하기도 어렵다.</p>
+<p>Kafka는 중간에 보존되는 log를 둔다. producer의 책임은 “계약에 맞는 event를 어떤 성공 조건으로 log에 기록했는가”까지이고, consumer의 책임은 “어느 offset까지 어떤 side effect를 완료했는가”까지다. 양쪽은 topic과 schema contract를 공유하지만 실행 시점과 처리 속도는 분리된다.</p>
+<div style="background:#fff7e8;border:1px solid #f0cf8c;padding:15px 17px;margin:18px 0;"><strong>중요:</strong> 결합이 사라지는 것이 아니라 위치가 바뀐다. API 호출 결합은 topic 이름, key, schema, retention, delivery semantics, ownership이라는 data contract 결합으로 이동한다.</div>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">3. 아키텍처와 요청 흐름</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0 6px;">
+<tr><td style="background:#19213a;color:#fff;text-align:center;padding:13px;border-radius:8px;"><strong>① 주문 서비스 / Producer</strong><br><span style="font-size:14px;color:#dbe3ff;">business event → serializer → record batch</span></td></tr>
+<tr><td style="text-align:center;color:#526fe8;font-size:22px;">↓ metadata 조회 · TCP produce request</td></tr>
+<tr><td style="background:#eef2ff;text-align:center;padding:13px;border:1px solid #b9c6ff;border-radius:8px;"><strong>② Partition leader Broker</strong><br><span style="font-size:14px;">append-only log · page cache · replica fetch · ack</span></td></tr>
+<tr><td style="text-align:center;color:#526fe8;font-size:22px;">↓ durable retention · 독립된 fetch</td></tr>
+<tr><td style="background:#f2f8ff;text-align:center;padding:13px;border:1px solid #bfd9ef;border-radius:8px;"><strong>③ Consumer Group A</strong><br><span style="font-size:14px;">warehouse 적재 · group별 offset</span></td></tr>
+<tr><td style="background:#f2fff7;text-align:center;padding:13px;border:1px solid #b7dfc7;border-radius:8px;"><strong>④ Consumer Group B</strong><br><span style="font-size:14px;">fraud 탐지 · 같은 record를 독립적으로 replay</span></td></tr>
+<tr><td style="background:#fff7f2;text-align:center;padding:13px;border:1px solid #e6c6b3;border-radius:8px;"><strong>⑤ KRaft Controller Quorum</strong><br><span style="font-size:14px;">topic·partition·replica·leader metadata의 control path</span></td></tr>
+</table>
+<ol style="padding-left:22px;">
+<li>Producer는 bootstrap server에 연결해 topic metadata와 partition leader를 찾는다. bootstrap server가 항상 실제 write 대상인 것은 아니다.</li>
+<li>Serializer가 key/value를 byte로 바꾸고 partitioner가 partition을 선택한다. producer는 partition별로 record를 batch해 network와 compression 비용을 amortize한다.</li>
+<li>Leader broker가 batch를 partition log 끝에 append한다. 설정된 <code>acks</code>와 replica 상태를 만족해야 producer가 성공을 확정한다.</li>
+<li>Consumer는 자신의 group에 할당된 partition에서 offset 기준으로 fetch한다. broker가 record를 consumer에게 “밀어 넣는” 구조가 아니라 consumer가 위치를 유지하며 당겨 온다.</li>
+<li>Consumer A와 B는 같은 log를 서로 다른 offset으로 읽는다. 한쪽 장애나 replay가 다른 쪽의 진행 위치를 바꾸지 않는다.</li>
+<li>KRaft controller는 leader·replica 같은 metadata를 관리한다. client data는 controller를 통과하지 않는다. data path와 control path를 구분해야 장애 범위를 빠르게 좁힐 수 있다.</li>
+</ol>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">4. CS·OS·분산 시스템 내부 동작</h2>
+<h3 style="font-size:18px;color:#2946b6;">상태의 소유자와 불변식</h3>
+<ul style="padding-left:22px;">
+<li><strong>Producer:</strong> 아직 ack되지 않은 batch, retry, delivery timeout 상태를 소유한다.</li>
+<li><strong>Broker partition leader:</strong> partition의 append 순서와 offset 배정을 소유한다.</li>
+<li><strong>Replica set:</strong> 장애 후에도 읽을 수 있는 log 복사본을 유지한다. replication factor와 현재 ISR 크기는 다르다.</li>
+<li><strong>Consumer group:</strong> partition assignment와 committed offset을 소유한다. business side effect의 정확성은 application이 소유한다.</li>
+<li><strong>KRaft quorum:</strong> cluster metadata의 순서 있는 변경 log와 controller 선출을 소유한다.</li>
+</ul>
+<p>핵심 불변식은 partition 안에서 append된 record의 순서가 offset 순서와 일치한다는 것이다. Topic 전체의 전역 순서는 없다. 같은 주문의 상태 전이를 순서대로 봐야 한다면 stable business key로 같은 partition에 모아야 한다.</p>
+<h3 style="font-size:18px;color:#2946b6;">왜 log가 decoupling을 만드는가</h3>
+<p>Queue의 순간 전달만 생각하면 consumer가 내려간 동안 producer가 기다리거나 data를 잃을 수 있다. Kafka는 retention 기간 동안 record를 소비 여부와 독립적으로 보존한다. Consumer position은 record 수명과 분리되므로 새 consumer가 과거 offset부터 replay할 수 있다.</p>
+<p>OS 관점에서 broker는 append와 sequential access, page cache, batch I/O를 활용한다. 다만 “디스크가 빠르다”가 아니라, random update를 피하고 locality와 batching으로 syscall·network·compression 비용을 여러 record에 나눠 갖는 것이 핵심이다.</p>
+<h3 style="font-size:18px;color:#2946b6;">성공의 경계</h3>
+<p>Producer callback 성공은 설정된 Kafka write 조건 충족을 뜻한다. Consumer가 처리했다는 뜻이 아니다. Consumer가 record를 fetch했다는 사실도 외부 DB transaction 성공을 뜻하지 않는다. 면접과 사고 분석에서는 <strong>어느 구성요소가 어떤 시점에 성공을 확정했는지</strong>를 범위와 함께 말해야 한다.</p>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">5. 실무 설계 판단</h2>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;">
+<tr><th style="padding:10px;border:1px solid #dde3ef;background:#19213a;color:#fff;text-align:left;">판단</th><th style="padding:10px;border:1px solid #dde3ef;background:#19213a;color:#fff;text-align:left;">권장 기준과 이유</th></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;vertical-align:top;"><strong>Event 정의</strong></td><td style="padding:10px;border:1px solid #dde3ef;">명령형 “sendEmail”보다 사실형 “OrderPaid”를 선호한다. 과거 사실은 여러 consumer가 각자의 목적에 재사용하기 쉽다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;vertical-align:top;"><strong>Topic 경계</strong></td><td style="padding:10px;border:1px solid #dde3ef;">업무 ownership, retention, 보안, schema compatibility, 처리량이 함께 변하는 단위를 기준으로 한다. microservice마다 무조건 topic 하나는 피한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;vertical-align:top;"><strong>Key</strong></td><td style="padding:10px;border:1px solid #dde3ef;">“어떤 event끼리 ordering이 필요한가?”에 답한 뒤 선택한다. 높은 cardinality와 skew를 함께 검증한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;vertical-align:top;"><strong>Retention</strong></td><td style="padding:10px;border:1px solid #dde3ef;">replay·감사·장애 복구 window와 저장 비용을 함께 계산한다. consumer가 읽었으니 즉시 삭제하는 queue식 가정을 피한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;vertical-align:top;"><strong>Dual write</strong></td><td style="padding:10px;border:1px solid #dde3ef;">DB commit과 Kafka send를 두 개의 독립 호출로 두면 한쪽만 성공하는 failure window가 생긴다. transactional outbox·CDC 또는 명시적 reconciliation을 설계한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;vertical-align:top;"><strong>Backpressure</strong></td><td style="padding:10px;border:1px solid #dde3ef;">Kafka가 burst를 흡수해도 downstream capacity가 사라지지 않는다. lag 증가율, 처리율, 최대 허용 지연으로 overload를 판단한다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">6. 장애 대응 표</h2>
+<p><strong>상황:</strong> 주문 API는 성공했는데 downstream에서 일부 주문이 보이지 않는다.</p>
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;">
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;width:34%;font-weight:700;">증상</td><td style="padding:10px;border:1px solid #dde3ef;">특정 시간대 event 누락, producer error 증가, consumer lag 또는 sink count 불일치.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;">먼저 수집할 증거/지표</td><td style="padding:10px;border:1px solid #dde3ef;">business ID·request ID, producer callback 결과, topic/partition/offset, retry·timeout log, broker request error, ISR, consumer group offset·lag, sink transaction ID.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;">가능한 가설</td><td style="padding:10px;border:1px solid #dde3ef;">DB만 성공한 dual write, serialization 실패, 잘못된 topic/key, ack timeout 결과 불명확, consumer poison pill, sink commit 전 offset commit.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#eefaf2;font-weight:700;">안전한 첫 조치</td><td style="padding:10px;border:1px solid #dde3ef;">무조건 재발행하지 말고 business ID로 DB·producer log·Kafka record·consumer log를 연결한다. 해당 partition과 offset 범위를 고정해 read-only 조회한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#f8f9fc;font-weight:700;">Rollback/복구</td><td style="padding:10px;border:1px solid #dde3ef;">멱등 key나 event ID가 확인되면 누락분만 재발행하고 consumer dedup을 검증한다. 잘못된 offset이면 별도 recovery group으로 replay해 결과를 비교한 뒤 전환한다.</td></tr>
+<tr><td style="padding:10px;border:1px solid #dde3ef;background:#fff1f2;font-weight:700;">하지 말아야 할 조치</td><td style="padding:10px;border:1px solid #dde3ef;">증거 없이 offset을 latest로 이동하거나 retention을 줄이지 않는다. timeout을 실패로 단정해 동일 non-idempotent event를 대량 재발행하지 않는다.</td></tr>
+</table>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">7. 30분 재현 실습</h2>
+<p><strong>목표:</strong> 하나의 topic에 저장된 record를 서로 다른 두 consumer group이 독립적으로 replay하는 모습을 관찰한다.</p>
+<p><strong>먼저 예측:</strong> group A가 모두 읽은 뒤 group B를 처음 실행하면 B는 아무것도 못 읽을까, 같은 record를 다시 읽을까?</p>
+<pre style="padding:14px;background:#12192c;color:#eef2ff;border-radius:8px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:14px;line-height:1.55;">make up
+make topic-create TOPIC=day01.events PARTITIONS=3
+
+make produce TOPIC=day01.events
+# 아래 세 줄 입력 후 Ctrl-C
+order-100 created
+order-101 paid
+order-102 cancelled
+
+make consume TOPIC=day01.events GROUP=warehouse-loader
+make consume TOPIC=day01.events GROUP=fraud-detector
+
+make groups</pre>
+<p><strong>예상 관찰:</strong> 두 group 모두 같은 record를 독립적으로 읽을 수 있다. 같은 group을 다시 실행하면 committed offset 이후부터 읽는다. 출력 순서는 partition 배치에 따라 입력 전체 순서와 다를 수 있다.</p>
+<p><strong>실패 주입:</strong> partition 수보다 많은 consumer를 같은 group으로 실행해 일부 consumer가 할당받지 못하는지 관찰한다. 이는 장애가 아니라 parallelism 상한이다.</p>
+<p><strong>자주 나는 오류:</strong> broker 준비 전 연결 실패는 <code>make doctor</code>와 container log를 확인한다. Topic already exists는 실습 재사용 시 정상일 수 있다. Consumer가 출력 없이 기다리면 해당 group의 offset이 이미 끝에 있는지 <code>make groups</code>로 본다.</p>
+<p><strong>Cleanup:</strong> 실습 종료 후 consumer를 Ctrl-C로 끝낸다. 다른 실습 data까지 지우는 광범위한 volume 삭제는 하지 않는다.</p>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">8. 놓치기 쉬운 함정</h2>
+<ol style="padding-left:22px;">
+<li><strong>Kafka를 단순 queue로만 설명:</strong> retention과 replay, 여러 group의 독립 position을 놓친다.</li>
+<li><strong>Offset을 message ID로 사용:</strong> offset은 partition-local 위치라 topic 전체와 재생성된 data 사이의 영구 ID가 아니다.</li>
+<li><strong>Producer 성공을 end-to-end 성공으로 간주:</strong> broker ack와 downstream side effect는 별도 단계다.</li>
+<li><strong>Consumer lag 0을 업무 성공으로 간주:</strong> deserialize 후 sink에 쓰기 전 실패하거나 잘못된 값을 정상 처리할 수 있다.</li>
+<li><strong>Partition을 무조건 많이 생성:</strong> metadata, file handle, recovery, rebalance, 작은 batch 비용과 key mapping 변경을 만든다.</li>
+</ol>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">9. 대기업 기술 면접 질문</h2>
+<h3 style="font-size:18px;color:#2946b6;">Q1. Kafka와 전통적인 queue의 차이를 설명하세요.</h3>
+<p><strong>좋은 답변 구조:</strong> 요구사항 → consumption 후 data 수명 → group별 position → replay·fan-out → ordering 범위 → 저장/운영 비용 → 단순 task queue가 더 적합한 대안까지 말한다.</p>
+<h3 style="font-size:18px;color:#2946b6;">Q2. 주문 DB 저장과 Kafka 발행 사이의 누락을 어떻게 막습니까?</h3>
+<p><strong>좋은 답변 구조:</strong> dual-write failure window를 상태 전이로 그림 → DB transaction과 outbox row 원자 저장 → CDC publish → event ID·consumer idempotency → lag/SLO/reconciliation → outbox cleanup과 장애 복구를 설명한다.</p>
+<h3 style="font-size:18px;color:#2946b6;">Q3. Partition 수를 어떻게 결정합니까?</h3>
+<p><strong>좋은 답변 구조:</strong> 목표 처리량과 consumer 병렬성 → broker/partition당 측정 처리량 → key cardinality·skew → ordering 범위 → growth headroom → replication/recovery 시간 → 늘린 뒤 되돌리기 어려운 trade-off를 수치 가정과 함께 방어한다.</p>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">10. 선수 지식 확인과 정답</h2>
+<ol style="padding-left:22px;"><li>Process와 server는 같은 말인가?</li><li>Byte와 character는 항상 1:1인가?</li><li>TCP 전송 성공은 application 처리 완료를 의미하는가?</li></ol>
+<p><strong>정답:</strong> ① server는 요청을 처리하는 역할이고 process는 실행 중인 프로그램의 OS 단위라 동일하지 않다. ② UTF-8 등 encoding에 따라 한 character가 여러 byte가 될 수 있다. ③ TCP ACK는 peer network stack 수신 범위이며 business 처리 완료 보장이 아니다.</p>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">11. 오늘 내용 확인과 리뷰</h2>
+<ol style="padding-left:22px;"><li>Kafka가 producer와 consumer 사이에서 분리하는 결합 세 가지는?</li><li>두 consumer group이 같은 record를 읽을 수 있는 이유는?</li><li>Data path와 control path를 구분해야 하는 이유는?</li></ol>
+<p><strong>채점 기준:</strong> ① 시간·속도·장애/재처리 중 세 가지를 설명, ② log의 수명과 group별 offset이 독립임을 설명, ③ client data가 오가는 broker 경로와 KRaft metadata 경로의 상태·장애 범위가 다름을 설명하면 통과다.</p>
+<div style="background:#f5f7fb;border:1px solid #dde3ef;padding:15px 17px;"><strong>3분 리뷰 체크리스트</strong><br>event와 command를 구분했는가? · 성공 범위를 component별로 말했는가? · offset을 처리 완료로 오해하지 않았는가? · replay 비용과 보안·retention까지 말했는가?</div>
+
+<h2 style="font-size:22px;color:#19213a;border-bottom:2px solid #e3e7f2;padding-bottom:8px;margin:32px 0 14px;">12. 공식 자료</h2>
+<ul style="padding-left:22px;">
+<li><a href="https://kafka.apache.org/documentation/" style="color:#3c5bd6;overflow-wrap:anywhere;">Apache Kafka Introduction — event, producer, consumer, topic, partition</a></li>
+<li><a href="https://kafka.apache.org/43/getting-started/quickstart/" style="color:#3c5bd6;overflow-wrap:anywhere;">Kafka 4.3 Quick Start — topic 생성과 produce/consume</a></li>
+<li><a href="https://kafka.apache.org/43/apis/" style="color:#3c5bd6;overflow-wrap:anywhere;">Kafka 4.3 APIs — Producer/Consumer/Admin/Streams/Connect</a></li>
+<li><a href="https://kafka.apache.org/43/operations/basic-kafka-operations/" style="color:#3c5bd6;overflow-wrap:anywhere;">Basic Operations — partition과 consumer position</a></li>
+</ul>
+<div style="margin-top:28px;background:#19213a;color:#fff;padding:18px;border-radius:10px;"><strong style="color:#a9bdff;">내일 예고 · Day 02</strong><br>Queue, pub/sub, append-only log를 “누가 data 수명을 소유하고 누가 position을 소유하는가” 기준으로 비교합니다.</div>
+</td></tr></table>
+</td></tr></table>
+</body></html>
