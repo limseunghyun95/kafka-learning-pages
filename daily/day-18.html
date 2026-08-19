@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 18 · poll loop, fetch, deserialization, processing</title>
+</head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #dbe3ef;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#3f315f;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#dbcdf7;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 3 / DAY 18 · CONSUMER DATA PATH</div>
+  <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">poll loop, fetch,<br>deserialization, processing</h1>
+  <p style="margin:0;color:#eee7fb">log bytes가 업무 side effect가 되기까지의 상태 소유자와 실패 창 · 이론 55분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#f4effd;border-left:5px solid #7655ad;border-radius:10px"><strong>한 줄 요약</strong><br>
+  <code>poll()</code>은 “broker에서 매번 record를 바로 읽는 함수”가 아니다. consumer network layer가 미리 가져와 local buffer에 둔 <strong>record batch bytes</strong>를 key/value deserializer로 객체화하고, <code>max.poll.records</code>만큼 application에 반환하는 경계다. 그 뒤의 업무 처리와 offset commit은 Kafka가 자동으로 하나의 원자 연산으로 묶어주지 않으므로 failure window를 따로 설계해야 한다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #d8d0e5"><strong>Poll loop</strong></td><td style="padding:10px;border:1px solid #d8d0e5">application이 <code>poll(Duration)</code>을 반복 호출해 record를 받고 처리하는 주 실행 루프. 단순 조회가 아니라 group liveness·callback·fetch 진행도 함께 전진시키는 경계다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>FetchRequest</strong></td><td style="padding:10px;border:1px solid #d8d0e5">consumer가 broker에 “각 partition의 이 offset부터 batch를 달라”고 보내는 Kafka protocol 요청.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>Fetch position</strong></td><td style="padding:10px;border:1px solid #d8d0e5">다음에 가져오거나 반환할 record의 offset을 나타내는 consumer 내부 위치. committed offset과 같지 않을 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>Committed offset</strong></td><td style="padding:10px;border:1px solid #d8d0e5">group이 재시작·rebalance 후 다시 시작할 위치로 Kafka의 <code>__consumer_offsets</code>에 저장한 checkpoint.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>Deserializer</strong></td><td style="padding:10px;border:1px solid #d8d0e5">wire의 byte 배열을 String, Avro 객체, Protobuf 객체 같은 application type으로 바꾸는 코드. schema 불일치가 여기서 poison pill이 된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>Record batch</strong></td><td style="padding:10px;border:1px solid #d8d0e5">broker log·compression·fetch의 묶음 단위. fetch limit보다 첫 batch가 커도 consumer가 전진하도록 반환될 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>Local buffer</strong></td><td style="padding:10px;border:1px solid #d8d0e5">fetch response로 받은 뒤 아직 application에 모두 반환하지 않은 record를 consumer process memory에 보관하는 영역.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>Side effect</strong></td><td style="padding:10px;border:1px solid #d8d0e5">DB update, API 호출, 파일 쓰기처럼 consumer process 밖의 상태를 바꾸는 업무 효과.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>Poison pill</strong></td><td style="padding:10px;border:1px solid #d8d0e5">현재 deserializer나 처리 코드가 계속 실패하는 특정 record. 같은 offset에서 재시작할 때마다 진행을 막을 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>Backpressure</strong></td><td style="padding:10px;border:1px solid #d8d0e5">처리가 fetch보다 느릴 때 유입을 제한하거나 pause해 memory·lag 폭주를 막는 제어.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d8d0e5"><strong>Lag</strong></td><td style="padding:10px;border:1px solid #d8d0e5">보통 log end offset과 committed offset 또는 consumer position의 차이. 정의에 따라 의미가 달라 측정 기준을 함께 말해야 한다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">2. 왜 중요한가</h2>
+  <p>“consumer가 느리다”는 한 문장에는 적어도 네 병목이 숨어 있다. broker가 fetch response를 늦게 만드는가, network bytes가 큰가, deserializer CPU·allocation이 비싼가, DB/API 처리가 느린가. 이 단계를 분리하지 않으면 consumer 수나 fetch 크기만 올려 장애를 증폭한다.</p>
+  <p>또한 <code>poll()</code>이 record를 반환한 순간, fetch position은 전진할 수 있지만 업무 처리는 아직 시작도 안 했다. 처리 완료 전 commit하면 유실 window, 처리 완료 후 commit하면 중복 window가 생긴다. 오늘은 commit 설정 자체보다 그 전 단계의 상태가 어디에 있고 언제 성공이 확정되는지 해부한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">3. Architecture: broker log에서 업무 처리까지</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:25%;padding:12px;background:#5c3d8d;color:#fff;border-radius:8px"><strong>1 · poll()</strong></td><td style="padding:12px;background:#f4effd">application thread가 poll timeout과 함께 consumer 진입</td></tr>
+    <tr><td colspan="2" align="center" style="color:#7655ad;font-weight:800">↓ assignment·metadata·heartbeat 상태 진행</td></tr>
+    <tr><td style="padding:12px;background:#5c3d8d;color:#fff;border-radius:8px"><strong>2 · Fetch</strong></td><td style="padding:12px;background:#f4effd">broker leader에 partition별 fetch position을 담은 FetchRequest</td></tr>
+    <tr><td colspan="2" align="center" style="color:#7655ad;font-weight:800">↓ fetch.min.bytes 또는 fetch.max.wait.ms 조건</td></tr>
+    <tr><td style="padding:12px;background:#5c3d8d;color:#fff;border-radius:8px"><strong>3 · Response</strong></td><td style="padding:12px;background:#f4effd">broker page cache/log에서 compressed record batch bytes 반환</td></tr>
+    <tr><td colspan="2" align="center" style="color:#7655ad;font-weight:800">↓ consumer local completed-fetch buffer</td></tr>
+    <tr><td style="padding:12px;background:#5c3d8d;color:#fff;border-radius:8px"><strong>4 · Decode</strong></td><td style="padding:12px;background:#f4effd">batch CRC·decompression·record parse → key/value deserializer</td></tr>
+    <tr><td colspan="2" align="center" style="color:#7655ad;font-weight:800">↓ max.poll.records 범위로 ConsumerRecords 반환</td></tr>
+    <tr><td style="padding:12px;background:#5c3d8d;color:#fff;border-radius:8px"><strong>5 · Process</strong></td><td style="padding:12px;background:#fff4e8">application validation → DB/API/file side effect</td></tr>
+    <tr><td colspan="2" align="center" style="color:#b85c2d;font-weight:800">↓ 처리 시간·실패·retry·commit은 application 책임</td></tr>
+    <tr><td style="padding:12px;background:#5c3d8d;color:#fff;border-radius:8px"><strong>6 · Next poll</strong></td><td style="padding:12px;background:#eaf8f1">남은 local buffer를 반환하거나 다음 fetch를 기다리며 loop 반복</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>poll 진입:</strong> consumer는 thread-safe하지 않다. 일반적으로 한 owner thread가 poll·position·commit 상태를 직렬화한다.</li>
+    <li><strong>fetch 요청:</strong> 한 request가 여러 assigned partition을 포함하며 consumer는 broker node별 fetch를 병렬 수행할 수 있다.</li>
+    <li><strong>broker 응답:</strong> <code>fetch.min.bytes</code>가 채워지거나 wait deadline이 오면 반환한다. 작은 값은 latency, 큰 값은 batch efficiency 쪽이다.</li>
+    <li><strong>decode:</strong> 압축을 풀고 header와 record를 검사한 뒤 사용자 deserializer가 객체를 만든다. 이 구간은 consumer CPU·heap·GC 비용이다.</li>
+    <li><strong>processing:</strong> Kafka client가 업무 함수의 성공을 알지 못한다. 따라서 side effect와 commit 사이 원자성은 별도 설계가 필요하다.</li>
+    <li><strong>loop:</strong> <code>max.poll.records</code>보다 많이 fetch해 cache해도 poll마다 일부만 반환한다. fetch와 poll 반환량은 독립된 두 제어면이다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">4. CS 내부 동작</h2>
+  <h3 style="margin:18px 0 8px;color:#5c3d8d">Data path와 control path를 분리하라</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#e9def7"><th align="left" style="padding:10px;border:1px solid #d4c5e5">경로</th><th align="left" style="padding:10px;border:1px solid #d4c5e5">주요 메시지</th><th align="left" style="padding:10px;border:1px solid #d4c5e5">실패 증상</th></tr>
+    <tr><td style="padding:10px;border:1px solid #d4c5e5">Data path</td><td style="padding:10px;border:1px solid #d4c5e5">FetchRequest/Response, batch bytes, deserialize, application process</td><td style="padding:10px;border:1px solid #d4c5e5">fetch latency, low byte rate, deserialization error, processing backlog</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4c5e5">Control path</td><td style="padding:10px;border:1px solid #d4c5e5">metadata, group join/sync, heartbeat, assignment, offset commit</td><td style="padding:10px;border:1px solid #d4c5e5">rebalance, stale assignment, commit failure, max poll interval 초과</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#5c3d8d">세 offset을 섞지 말 것</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#e9def7"><th align="left" style="padding:9px;border:1px solid #d4c5e5">offset</th><th align="left" style="padding:9px;border:1px solid #d4c5e5">소유자</th><th align="left" style="padding:9px;border:1px solid #d4c5e5">뜻</th></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">Log end offset</td><td style="padding:9px;border:1px solid #d4c5e5">partition leader log</td><td style="padding:9px;border:1px solid #d4c5e5">다음 append 위치. 현재 데이터 꼬리.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">Consumer position</td><td style="padding:9px;border:1px solid #d4c5e5">consumer memory, partition별</td><td style="padding:9px;border:1px solid #d4c5e5">다음 poll/fetch에서 반환할 위치. poll 반환으로 전진할 수 있다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">Committed offset</td><td style="padding:9px;border:1px solid #d4c5e5">group coordinator의 offsets log</td><td style="padding:9px;border:1px solid #d4c5e5">다른 member·재시작이 복구할 checkpoint. “마지막 처리 offset”이 아니라 보통 “다음 처리 offset”을 저장한다.</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#5c3d8d">Fetch 크기 제어의 계층</h3>
+  <p><code>fetch.max.bytes</code>는 fetch response 전체의 대략적 상한이고, <code>max.partition.fetch.bytes</code>는 partition별 상한이다. 둘 다 첫 non-empty partition의 첫 record batch가 더 크면 전진 가능성을 위해 그 batch를 반환할 수 있어 절대 hard limit가 아니다. 반면 <code>max.poll.records</code>는 이미 fetch된 cache에서 application에 한 번에 반환할 record 수만 제한하며 network fetch량을 줄이지 않는다.</p>
+  <p>이 구분은 heap sizing에 중요하다. assigned partition 수 × per-partition fetch 범위 × 병렬 broker fetch × decompression 후 object 크기를 고려해야 한다. wire에서 1MiB로 압축된 batch가 heap 객체로는 훨씬 커질 수 있다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#5c3d8d">State transition과 성공 확정</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#e9def7"><th align="left" style="padding:9px;border:1px solid #d4c5e5">상태</th><th align="left" style="padding:9px;border:1px solid #d4c5e5">전이</th><th align="left" style="padding:9px;border:1px solid #d4c5e5">성공의 의미</th></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">FETCHED_BYTES</td><td style="padding:9px;border:1px solid #d4c5e5">broker response 수신</td><td style="padding:9px;border:1px solid #d4c5e5">network fetch 성공일 뿐 업무 성공 아님</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">DESERIALIZED</td><td style="padding:9px;border:1px solid #d4c5e5">key/value 변환 완료</td><td style="padding:9px;border:1px solid #d4c5e5">application object 생성, schema validation은 별도일 수 있음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">RETURNED_BY_POLL</td><td style="padding:9px;border:1px solid #d4c5e5">ConsumerRecords 반환</td><td style="padding:9px;border:1px solid #d4c5e5">position 전진 가능, side effect는 미실행</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">PROCESSED</td><td style="padding:9px;border:1px solid #d4c5e5">업무 함수 성공</td><td style="padding:9px;border:1px solid #d4c5e5">sink 관점 성공, Kafka recovery point는 아직 다를 수 있음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">COMMITTED</td><td style="padding:9px;border:1px solid #d4c5e5">next offset commit 성공</td><td style="padding:9px;border:1px solid #d4c5e5">group 재시작 위치 확정. side effect와 원자적이라는 뜻 아님</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#e9def7"><th align="left" style="padding:9px;border:1px solid #d4c5e5">상황</th><th align="left" style="padding:9px;border:1px solid #d4c5e5">판단</th><th align="left" style="padding:9px;border:1px solid #d4c5e5">이유·trade-off</th></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">DB 처리 20ms/record</td><td style="padding:9px;border:1px solid #d4c5e5">max.poll.records를 poll interval 예산 안으로 제한, batch DB write 검토</td><td style="padding:9px;border:1px solid #d4c5e5">500개 직렬 처리면 10초. 처리량·메모리·rebalance 안전을 함께 맞춘다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">저유량·throughput 우선</td><td style="padding:9px;border:1px solid #d4c5e5">fetch.min.bytes를 높이고 wait budget 측정</td><td style="padding:9px;border:1px solid #d4c5e5">큰 response로 syscall/request 비용 감소, 저유량 latency 증가.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">큰 message topic</td><td style="padding:9px;border:1px solid #d4c5e5">topic max batch와 consumer partition/total fetch 설정 정렬</td><td style="padding:9px;border:1px solid #d4c5e5">progress 예외가 있어도 큰 decompress·allocation으로 OOM 가능.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d4c5e5">poison pill</td><td style="padding:9px;border:1px solid #d4c5e5">원본 bytes·topic/partition/offset·schema ID를 격리하고 명시 정책 적용</td><td style="padding:9px;border:1px solid #d4c5e5">무한 재시도는 partition 전체 HOL blocking, 무조건 skip은 데이터 유실.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> fetch latency/size/rate, records-lag, time-between-poll, processing latency, deserialize error, sink latency를 한 dashboard에서 단계별로 본다. poll thread와 worker pool을 분리한다면 partition별 완료 frontier를 추적하고 pause/resume·bounded queue·rebalance drain을 함께 설계한다.</p>
+  <p><strong>Anti-pattern:</strong> <code>max.poll.records</code>를 내리면 network memory도 자동 감소한다고 믿기, deserialization error를 catch하지 못한 채 process 재시작만 반복하기, lag 0을 업무 처리 성공으로 간주하기, consumer instance를 여러 thread에서 공유하기.</p>
+  <p><strong>Version/engine 경계:</strong> Kafka 4.3에는 classic과 consumer group protocol이 공존하며 heartbeat 설정 주체가 다를 수 있다. 그러나 오늘의 fetch bytes→deserialize→poll 반환 data path 핵심은 group protocol 선택과 분리해서 이해한다. framework(Spring Kafka, Flink, Connect)는 poll loop를 감추므로 container concurrency·ack mode·error handler의 실제 offset semantics를 문서로 확인해야 한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffe6d6"><th style="padding:7px;border:1px solid #e7c7b3">증상</th><th style="padding:7px;border:1px solid #e7c7b3">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e7c7b3">가능한 가설</th><th style="padding:7px;border:1px solid #e7c7b3">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e7c7b3">rollback/복구</th><th style="padding:7px;border:1px solid #e7c7b3">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">lag 증가·CPU 낮음</td><td style="padding:7px;border:1px solid #e7c7b3">fetch rate/latency/size, broker throttle, bytes-in, assignment</td><td style="padding:7px;border:1px solid #e7c7b3">fetch 대기·network·quota·stale assignment</td><td style="padding:7px;border:1px solid #e7c7b3">data/control path를 나눠 병목 broker·partition 특정</td><td style="padding:7px;border:1px solid #e7c7b3">canary 설정 복원, 누락 기간 replay</td><td style="padding:7px;border:1px solid #e7c7b3">consumer 수·fetch 크기 동시 증대</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">특정 offset에서 반복 crash</td><td style="padding:7px;border:1px solid #e7c7b3">exception chain, topic/partition/offset, raw bytes, schema ID/version</td><td style="padding:7px;border:1px solid #e7c7b3">poison pill, incompatible schema, corrupt payload</td><td style="padding:7px;border:1px solid #e7c7b3">영향 partition pause·원본 증거 보존·격리 정책 적용</td><td style="padding:7px;border:1px solid #e7c7b3">fixed deserializer 재배포 또는 승인된 DLQ 후 seek</td><td style="padding:7px;border:1px solid #e7c7b3">증거 없이 offset 강제 점프</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">poll 간격 초과·rebalance</td><td style="padding:7px;border:1px solid #e7c7b3">time-between-poll-max, batch records, processing/sink p99, GC pause</td><td style="padding:7px;border:1px solid #e7c7b3">과대 poll batch, slow sink, blocking retry, stop-the-world GC</td><td style="padding:7px;border:1px solid #e7c7b3">유입 pause·batch 축소·느린 의존성 우회</td><td style="padding:7px;border:1px solid #e7c7b3">이전 batch/concurrency로 rollback, 안전 replay</td><td style="padding:7px;border:1px solid #e7c7b3">max.poll.interval만 무한 확대</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">heap 급증/OOM</td><td style="padding:7px;border:1px solid #e7c7b3">fetch-size-max/avg, assigned partitions, batch compression ratio, heap histogram</td><td style="padding:7px;border:1px solid #e7c7b3">large batch, parallel fetch, decoded object amplification</td><td style="padding:7px;border:1px solid #e7c7b3">영향 partition·producer 제한, heap dump 확보</td><td style="padding:7px;border:1px solid #e7c7b3">호환되는 fetch/batch 설정 복원</td><td style="padding:7px;border:1px solid #e7c7b3">heap만 크게 늘리고 payload 방치</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">7. 35분 실습: fetch·decode·poison pill 관찰</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측</strong><br>
+  <code>max.poll.records=2</code>는 broker가 매 fetch에서 정확히 두 record만 보내게 할까? 아니면 consumer가 더 많이 fetch해 cache한 뒤 두 개씩 반환할까? 또 String으로 쓴 payload를 IntegerDeserializer로 읽으면 어느 단계에서 멈출지 적는다.</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker 실행 가능, local Kafka 4.3.1 단일 broker. production topic에는 실행하지 않는다.</p>
+  <ol style="padding-left:22px">
+    <li><strong>환경·topic:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+make smoke
+make topic-create TOPIC=day18.poll</code></li>
+    <li><strong>5개 record 입력:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">make produce TOPIC=day18.poll</code>대화형 입력에 <code>event-1</code>부터 <code>event-5</code>까지 한 줄씩 넣고 종료한다.</li>
+    <li><strong>작은 poll 반환량 관찰:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day18.poll \
+  --group day18-string --from-beginning --max-messages 5 \
+  --consumer-property max.poll.records=2 \
+  --property print.partition=true --property print.offset=true</code>CLI 출력은 빠르게 이어질 수 있으므로 두 개씩 보이는 UI만으로 fetch량을 단정하지 않는다.</li>
+    <li><strong>실패 주입 — 잘못된 deserializer:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day18.poll \
+  --group day18-bad --from-beginning --max-messages 1 \
+  --consumer-property value.deserializer=org.apache.kafka.common.serialization.IntegerDeserializer</code>String bytes 길이가 Integer 형식과 맞지 않아 deserialization exception이 나는지, 오류에 partition·offset 단서가 있는지 기록한다.</li>
+    <li><strong>안전 복구:</strong> 같은 group을 무작정 offset reset하지 말고 StringDeserializer 기본값으로 다시 실행해 원본 record가 정상인지 확인한다. 실제 서비스라면 raw bytes·schema ID를 격리하고 승인된 skip/DLQ 정책을 적용한다.</li>
+  </ol>
+  <p><strong>예상 관찰:</strong> 정상 consumer는 partition/offset과 5개 문자열을 읽는다. bad consumer는 fetch 자체가 아니라 byte→Integer 변환 단계에서 실패한다. 이 실패는 broker에 record가 없어서가 아니며, 재시작만 하면 같은 offset을 다시 만나 반복될 수 있다.</p>
+  <p><strong>자주 나는 오류와 해결:</strong> service 이름은 <code>broker</code>다. topic이 이미 있으면 <code>--if-not-exists</code>라 안전하다. CLI가 deserializer 옵션을 덮어쓰는 버전이면 출력된 effective error와 <code>--help</code>를 확인하고, application client 실험으로 옮긴다. group이 이전 offset을 가졌다면 새 group 이름을 쓴다.</p>
+  <p><strong>Cleanup:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day18.poll
+make down</code></p>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>poll timeout과 max poll interval은 다르다:</strong> 전자는 한 호출이 기다리는 시간, 후자는 group member가 다음 poll을 호출해야 하는 liveness 상한이다.</li>
+    <li><strong>max.poll.records는 fetch bytes knob가 아니다:</strong> cache에서 application으로 꺼내는 수만 제한한다.</li>
+    <li><strong>첫 batch progress 예외:</strong> 설정 byte limit을 절대 메모리 상한으로 계산하면 위험하다.</li>
+    <li><strong>position 전진은 처리 성공이 아니다:</strong> poll 반환 뒤 crash하면 commit 정책에 따라 재처리 또는 skip window가 생긴다.</li>
+    <li><strong>deserializer는 신뢰 경계다:</strong> 외부 payload로 객체를 만들므로 size limit·schema validation·오류 격리가 필요하다.</li>
+    <li><strong>worker pool은 공짜 병렬화가 아니다:</strong> partition ordering, 완료 frontier, commit, rebalance drain을 새로 책임져야 한다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. poll() 한 번의 내부 흐름을 상태 소유자까지 설명해보세요.</strong><br>
+  좋은 답변 구조: assignment/position → broker별 FetchRequest → fetch min/wait → batch bytes/local cache → decompression/deserialization → max.poll.records 반환 → position과 committed offset 분리 → application side effect failure window.</p>
+  <p><strong>Q2. consumer lag이 오르는데 CPU는 낮습니다. 어떻게 진단합니까?</strong><br>
+  좋은 답변 구조: 요구 SLO·유입률 확인 → data/control path 분리 → fetch latency/rate/size·throttle·assignment → poll interval·sink latency → partition skew → 증거 기반 canary → rollback과 replay. consumer 수부터 늘리지 않는다.</p>
+  <p><strong>Q3. 초당 10k records, 처리 5ms/record인 consumer를 설계하세요.</strong><br>
+  좋은 답변 구조: record 크기·key ordering·partition 수·sink batch 가능성 질문 → 직렬 한 partition 약 200 records/s 가정 → 필요한 병렬성 계산 → max.poll.records × p99가 poll interval 예산 내인지 검증 → bounded worker/pause-resume → commit frontier·idempotent sink → poison pill·rebalance 복구.</p>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#5c3d8d">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>non-idempotent retry에서 ordering이 깨지는 조건은?</li><li>in-flight=5는 무엇의 수인가?</li><li>Little's Law가 producer pipeline tuning에 주는 힌트는?</li></ol>
+  <p style="padding:12px;background:#f3f6fb"><strong>짧은 정답:</strong> ① 같은 partition에서 retry가 있고 2개 이상 미응답 요청 중 앞 batch 실패·뒤 batch 성공. ② broker connection별 unacknowledged protocol request 수. ③ 목표 처리량×요청 체류시간으로 필요한 평균 동시 진행 수를 추정하되 queue 포화와 p99를 실측한다.</p>
+  <h3 style="margin:16px 0 8px;color:#5c3d8d">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li><code>max.poll.records</code>와 <code>fetch.max.bytes</code>의 제어 대상은 어떻게 다른가?</li><li>position과 committed offset 사이에서 crash하면 무엇이 생기는가?</li><li>deserialization error를 안전하게 다루기 위해 먼저 보존할 증거는?</li></ol>
+  <p style="padding:12px;background:#f3f6fb"><strong>채점 기준:</strong> ① local 반환 record 수와 network fetch response bytes를 구분(3점). ② commit 위치에 따른 중복·유실 window를 설명(3점). ③ topic/partition/offset, raw bytes, headers/schema ID, exception chain을 말하고 무근거 skip을 피함(4점). 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#5c3d8d">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/generated/consumer_config.html" style="color:#5c3d8d">Apache Kafka 4.3 Consumer Configs</a> — fetch·poll·group 설정의 현재 정의</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html" style="color:#5c3d8d">KafkaConsumer 4.3.1 API</a> — poll·thread ownership·offset API</li>
+    <li><a href="https://kafka.apache.org/43/operations/monitoring/" style="color:#5c3d8d">Apache Kafka 4.3 Monitoring</a> — fetch와 poll 간격 지표</li>
+    <li><a href="https://kafka.apache.org/43/design/design/" style="color:#5c3d8d">Apache Kafka Design</a> — consumer·protocol·storage 배경</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#3f315f;color:#fff;border-radius:10px"><strong>내일 예고 · Day 19</strong><br>auto/manual commit과 중복·유실 window — 처리 전·후 commit의 crash timeline을 직접 그려 delivery semantics를 선택한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>

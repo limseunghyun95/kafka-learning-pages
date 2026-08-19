@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-18T09:09:36+09:00",
+  "updatedAt": "2026-08-19T09:10:46+09:00",
   "lessons": [
     {
       "day": 1,
@@ -158,6 +158,15 @@
       "path": "day-17.html",
       "kind": "lesson",
       "publishedAt": "2026-08-18T09:09:36+09:00"
+    },
+    {
+      "day": 18,
+      "week": 3,
+      "title": "poll loop, fetch, deserialization, processing",
+      "summary": "broker fetch부터 local cache·decompression·deserialization·poll 반환·업무 side effect까지 consumer data path를 따라 position과 committed offset, poison pill, backpressure 경계를 분석합니다.",
+      "path": "day-18.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-19T09:10:46+09:00"
     }
   ]
 }
