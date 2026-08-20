@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 19 · auto/manual commit과 중복·유실 window</title>
+</head>
+<body style="margin:0;background:#eef2f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef2f7"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #dbe3ef;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#5a2f3d;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#f2cbd7;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 3 / DAY 19 · OFFSET COMMIT</div>
+  <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">auto/manual commit과<br>중복·유실 window</h1>
+  <p style="margin:0;color:#fae7ed">업무 side effect와 복구 checkpoint 사이의 원자성 부재를 crash timeline으로 설계하기 · 이론 60분 + 실습 35분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#fff0f4;border-left:5px solid #a34e68;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Offset commit은 “이 record의 처리가 성공했다”는 Kafka의 판정이 아니라 <strong>이 consumer group이 장애 후 어디서 다시 시작할지 저장하는 checkpoint</strong>다. 처리 전에 next offset을 commit하면 유실 window, 처리 후 commit하면 중복 window가 생긴다. 일반 외부 sink에서는 둘을 동시에 0으로 만들 수 없으므로 at-least-once + idempotent sink, transaction/outbox 같은 경계 설계가 필요하다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #e1cfd5"><strong>Offset commit</strong></td><td style="padding:10px;border:1px solid #e1cfd5">consumer group의 partition별 재시작 위치를 저장하는 작업. record 삭제나 broker log 이동이 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>Next offset</strong></td><td style="padding:10px;border:1px solid #e1cfd5">commit해야 하는 값은 마지막 완료 record의 offset이 아니라 <strong>다음에 읽을 offset</strong>이다. offset 41까지 완료했다면 42를 저장한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>Auto commit</strong></td><td style="padding:10px;border:1px solid #e1cfd5"><code>enable.auto.commit=true</code>일 때 client가 <code>auto.commit.interval.ms</code> 주기에 맞춰 position을 자동 commit하는 정책. 업무 처리 성공을 관찰하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>Manual commit</strong></td><td style="padding:10px;border:1px solid #e1cfd5">application이 처리 완료 frontier를 계산해 <code>commitSync</code> 또는 <code>commitAsync</code>를 호출하는 방식.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>Failure window</strong></td><td style="padding:10px;border:1px solid #e1cfd5">두 상태 변경 사이 crash가 나면 보장이 달라지는 시간 구간. 여기서는 sink side effect와 offset commit 사이가 핵심이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>At-most-once</strong></td><td style="padding:10px;border:1px solid #e1cfd5">중복 처리는 피하지만 일부 event가 처리되지 않을 수 있는 전달 의미. 보통 처리 전에 checkpoint를 전진시킨다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>At-least-once</strong></td><td style="padding:10px;border:1px solid #e1cfd5">성공한 event를 놓치지 않도록 재처리할 수 있지만 crash 경계에서 중복 side effect가 생길 수 있는 의미.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>Idempotent sink</strong></td><td style="padding:10px;border:1px solid #e1cfd5">같은 business event ID를 다시 적용해도 최종 결과가 한 번 처리한 것과 같은 DB/API 저장소.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>Completed frontier</strong></td><td style="padding:10px;border:1px solid #e1cfd5">partition에서 offset 0부터 연속으로 처리가 끝난 가장 먼 지점. 뒤 offset이 끝나도 앞에 gap이 있으면 frontier를 넘겨 commit하면 안 된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>Group coordinator</strong></td><td style="padding:10px;border:1px solid #e1cfd5">group membership과 offset commit을 담당하는 broker 역할. commit을 <code>__consumer_offsets</code> compacted topic에 기록한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #e1cfd5"><strong>Generation</strong></td><td style="padding:10px;border:1px solid #e1cfd5">rebalance로 갱신되는 group 세대. 늦은 옛 member의 commit을 막는 fencing 정보다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">2. 왜 중요한가</h2>
+  <p>DB 업데이트는 성공했지만 commit response 전에 process가 죽으면 재시작 후 같은 record를 다시 읽는다. 반대로 commit이 먼저 성공하고 DB 업데이트 전에 죽으면 그 record는 기본 재시작 경로에서 건너뛴다. Kafka가 어느 쪽을 선택해주는 것이 아니라 application이 작업 순서를 선택한다.</p>
+  <p>면접에서 “manual commit이면 exactly-once”라고 말하면 부족하다. 강한 답은 <strong>상태 소유자(Kafka coordinator vs 외부 sink), 성공 확정 시점, crash 지점, replay identity, rollback</strong>을 말하고, 왜 두 독립 시스템의 원자성에는 transaction protocol이나 idempotency가 필요한지 설명한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">3. Architecture: 같은 record가 중복 또는 유실되는 두 timeline</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:25%;padding:12px;background:#7c334b;color:#fff;border-radius:8px"><strong>1 · poll</strong></td><td style="padding:12px;background:#fff0f4">P0 offset 41 반환, consumer position은 42로 전진</td></tr>
+    <tr><td colspan="2" align="center" style="color:#a34e68;font-weight:800">↓ 선택 A: commit 42 먼저</td></tr>
+    <tr><td style="padding:12px;background:#7c334b;color:#fff;border-radius:8px"><strong>2A · Commit</strong></td><td style="padding:12px;background:#fff0f4">coordinator가 P0=42를 offsets log에 저장</td></tr>
+    <tr><td colspan="2" align="center" style="color:#bb5b27;font-weight:800">↓ CRASH — DB 처리 전</td></tr>
+    <tr><td style="padding:12px;background:#7c334b;color:#fff;border-radius:8px"><strong>3A · Loss</strong></td><td style="padding:12px;background:#fff1e8">재시작은 42부터 → offset 41 side effect가 빠질 수 있음</td></tr>
+    <tr><td colspan="2" align="center" style="color:#54739c;font-weight:800">──────── 또는 선택 B: DB 처리 먼저 ────────</td></tr>
+    <tr><td style="padding:12px;background:#7c334b;color:#fff;border-radius:8px"><strong>2B · Process</strong></td><td style="padding:12px;background:#edf5ff">order-900 상태를 DB에 반영</td></tr>
+    <tr><td colspan="2" align="center" style="color:#bb5b27;font-weight:800">↓ CRASH — commit 42 전</td></tr>
+    <tr><td style="padding:12px;background:#7c334b;color:#fff;border-radius:8px"><strong>3B · Duplicate</strong></td><td style="padding:12px;background:#edf5ff">재시작은 41부터 → 같은 side effect 재실행 가능</td></tr>
+    <tr><td colspan="2" align="center" style="color:#27785b;font-weight:800">↓ business event ID로 idempotent upsert</td></tr>
+    <tr><td style="padding:12px;background:#7c334b;color:#fff;border-radius:8px"><strong>4 · Converge</strong></td><td style="padding:12px;background:#eaf8f1">재처리돼도 최종 DB 상태는 한 번 적용한 것과 같음</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>poll:</strong> P0의 position 42는 client memory 상태이고 아직 복구 checkpoint가 아니다.</li>
+    <li><strong>commit path:</strong> OffsetCommitRequest는 data partition leader가 아니라 group coordinator로 간다.</li>
+    <li><strong>coordinator:</strong> group generation·member 권한을 검증하고 <code>__consumer_offsets</code>에 group/P0=42를 append한다.</li>
+    <li><strong>success:</strong> commit response 성공은 checkpoint 내구성의 확정이지 DB 처리 성공의 확정이 아니다.</li>
+    <li><strong>restart:</strong> 새 member가 committed 42를 읽고 그 위치부터 fetch한다. commit되지 않은 position은 process와 함께 사라진다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">4. CS 내부 동작</h2>
+  <h3 style="margin:18px 0 8px;color:#7c334b">Commit의 상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#f4dfe6"><th align="left" style="padding:9px;border:1px solid #e1c7d0">상태</th><th align="left" style="padding:9px;border:1px solid #e1c7d0">소유자</th><th align="left" style="padding:9px;border:1px solid #e1c7d0">불변식</th></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0">position</td><td style="padding:9px;border:1px solid #e1c7d0">consumer process memory</td><td style="padding:9px;border:1px solid #e1c7d0">partition별 다음 반환 위치이며 poll로 전진한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0">completed frontier</td><td style="padding:9px;border:1px solid #e1c7d0">application 처리 추적기</td><td style="padding:9px;border:1px solid #e1c7d0">앞 offset gap을 넘어 전진하지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0">committed offset</td><td style="padding:9px;border:1px solid #e1c7d0">group coordinator + offsets topic</td><td style="padding:9px;border:1px solid #e1c7d0">group/partition별 다음 복구 위치 하나가 최신값으로 남는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0">business completion</td><td style="padding:9px;border:1px solid #e1c7d0">DB/API/object store</td><td style="padding:9px;border:1px solid #e1c7d0">business key 또는 event ID로 중복 적용 규칙을 가져야 한다.</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#7c334b">OffsetCommit protocol</h3>
+  <p>Consumer는 group ID를 hash해 배정된 offsets topic partition의 leader, 즉 group coordinator를 찾는다. coordinator는 현재 generation/member가 그 partition을 소유하는지 검증한 후 OffsetCommitRequest를 compacted <code>__consumer_offsets</code>에 기록한다. 성공 response 뒤에는 다른 member가 OffsetFetch로 최신 checkpoint를 복구할 수 있다. compacted topic이므로 과거 모든 commit을 업무 audit log로 의존하면 안 된다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#7c334b">Auto commit의 정확한 경계</h3>
+  <p><code>enable.auto.commit=true</code>는 client가 주기적으로 offset을 commit하지만 application의 DB transaction이나 worker 완료 신호를 알지 못한다. 단일 poll thread가 받은 batch를 모두 처리한 뒤 다음 poll로 돌아오는 단순 구조에서는 주로 처리 후 commit에 가까워 중복 window가 남는다. 반면 poll thread가 record를 worker queue에 넘기고 곧바로 다음 poll을 호출하면 아직 처리되지 않은 position까지 자동 commit되어 유실 window가 생길 수 있다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#7c334b">commitSync vs commitAsync</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#f4dfe6"><th align="left" style="padding:9px;border:1px solid #e1c7d0">방식</th><th align="left" style="padding:9px;border:1px solid #e1c7d0">장점</th><th align="left" style="padding:9px;border:1px solid #e1c7d0">비용·주의</th></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0"><code>commitSync</code></td><td style="padding:9px;border:1px solid #e1c7d0">성공·예외를 호출 지점에서 확인, 종료·revoke 경계가 단순</td><td style="padding:9px;border:1px solid #e1c7d0">coordinator RTT 동안 poll thread block, timeout·rebalance 예외 처리 필요</td></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0"><code>commitAsync</code></td><td style="padding:9px;border:1px solid #e1c7d0">commit latency를 pipeline과 겹쳐 throughput 개선</td><td style="padding:9px;border:1px solid #e1c7d0">callback 실패를 관측해야 하며 오래된 offset을 임의 재시도하면 최신 checkpoint를 뒤로 덮을 위험</td></tr>
+  </table>
+  <p>실무 패턴은 steady state에 async commit을 쓰되 callback에서 offset·generation·error를 기록하고, shutdown이나 partition revoke 전에 completed frontier를 sync commit하는 방식이다. 다만 framework가 제공하는 ack/rebalance lifecycle과 중복되지 않게 소유권을 한 곳에 둔다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#7c334b">병렬 worker의 contiguous frontier</h3>
+  <p>P0의 40, 41, 42를 동시에 처리해 42와 40이 끝났지만 41이 진행 중이라면 43을 commit하면 안 된다. crash 후 43부터 시작해 41을 잃기 때문이다. 안전한 next offset은 41이다. partition별 bitmap/ordered set으로 완료를 추적하고 앞에서부터 연속 완료된 지점만 commit한다. 이 자료구조는 처리량을 주지만 memory·timeout·poison pill 정책이라는 비용을 만든다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#f4dfe6"><th align="left" style="padding:9px;border:1px solid #e1c7d0">요구사항</th><th align="left" style="padding:9px;border:1px solid #e1c7d0">권장 출발점</th><th align="left" style="padding:9px;border:1px solid #e1c7d0">이유·trade-off</th></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0">외부 DB에 중요 event 반영</td><td style="padding:9px;border:1px solid #e1c7d0">auto commit off, 처리 후 partition별 next offset manual commit, event ID unique/upsert</td><td style="padding:9px;border:1px solid #e1c7d0">중복은 허용하되 유실을 막고 재처리를 수렴시킨다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0">Kafka→Kafka 변환</td><td style="padding:9px;border:1px solid #e1c7d0">transactional producer + offsets in same Kafka transaction 검토</td><td style="padding:9px;border:1px solid #e1c7d0">output records와 input offsets를 한 transaction으로 묶지만 외부 DB까지 자동 확장되지는 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0">손실 허용 telemetry</td><td style="padding:9px;border:1px solid #e1c7d0">단순 auto commit도 가능하되 loss budget 명시</td><td style="padding:9px;border:1px solid #e1c7d0">운영 복잡도 감소와 정확성 비용을 의식적으로 교환한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #e1c7d0">고비용 side effect</td><td style="padding:9px;border:1px solid #e1c7d0">inbox/dedup table, 상태 machine, retry budget</td><td style="padding:9px;border:1px solid #e1c7d0">API가 비멱등이면 Kafka commit만으로 중복 청구를 막을 수 없다.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> commit 기준을 코드 주석이 아니라 ADR로 남긴다. partition별 <code>processed_offset</code>·<code>committed_offset</code>·commit latency/error·duplicate suppression count를 관측한다. graceful shutdown과 rebalance revoke에서는 새 작업 수락을 중지하고 bounded time 안에 완료 frontier만 commit한다.</p>
+  <p><strong>Anti-pattern:</strong> poll 직후 전체 batch의 next offset을 먼저 commit, async callback 무시, 실패한 오래된 async commit을 무조건 재시도, 여러 worker 중 최대 완료 offset을 commit, DLQ에 보냈다는 이유로 원본과 복구 근거 없이 offset 전진.</p>
+  <p><strong>Edge case:</strong> commit response가 유실되면 client는 성공 여부를 모를 수 있다. 같은 또는 더 높은 안전 frontier를 재commit하는 것은 괜찮지만, generation이 바뀌었거나 partition 소유권이 사라졌다면 늦은 commit을 강행하지 말아야 한다. commit metadata와 leader epoch는 진단·log truncation 탐지에 도움을 줄 수 있다.</p>
+  <p><strong>Version/engine 차이:</strong> Kafka 4.3 Java consumer의 <code>enable.auto.commit</code> 기본값은 true다. Spring Kafka의 ack mode, Kafka Connect의 task offset, Flink checkpoint는 서로 다른 상위 state machine이므로 raw KafkaConsumer 설정만 보고 의미를 추측하지 않는다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffe6d6"><th style="padding:7px;border:1px solid #e7c7b3">증상</th><th style="padding:7px;border:1px solid #e7c7b3">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e7c7b3">가능한 가설</th><th style="padding:7px;border:1px solid #e7c7b3">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e7c7b3">rollback/복구</th><th style="padding:7px;border:1px solid #e7c7b3">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">중복 주문 처리</td><td style="padding:7px;border:1px solid #e7c7b3">event ID, topic/partition/offset, sink transaction log, processed/committed offset, restart 시간</td><td style="padding:7px;border:1px solid #e7c7b3">처리 성공 후 commit 전 crash·response 유실</td><td style="padding:7px;border:1px solid #e7c7b3">consumer pause, event ID별 side effect 대조</td><td style="padding:7px;border:1px solid #e7c7b3">idempotent upsert/보상 후 안전 frontier 재개</td><td style="padding:7px;border:1px solid #e7c7b3">group offset 임의 점프</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">Kafka에는 있는데 DB 누락</td><td style="padding:7px;border:1px solid #e7c7b3">committed offset과 sink 완료 offset, auto commit 설정, worker queue, deploy/crash log</td><td style="padding:7px;border:1px solid #e7c7b3">처리 전 commit·worker 미완료 상태 commit</td><td style="padding:7px;border:1px solid #e7c7b3">영향 partition/기간 격리, 원본 보존</td><td style="padding:7px;border:1px solid #e7c7b3">별도 replay group/sink 검증 후 보정</td><td style="padding:7px;border:1px solid #e7c7b3">운영 group을 바로 earliest로 reset</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">commit failure 급증</td><td style="padding:7px;border:1px solid #e7c7b3">error class, generation/member, rebalance, coordinator latency, offsets ISR</td><td style="padding:7px;border:1px solid #e7c7b3">소유권 상실, coordinator 이동, timeout, offsets topic 문제</td><td style="padding:7px;border:1px solid #e7c7b3">새 assignment 확인, stale worker 중단</td><td style="padding:7px;border:1px solid #e7c7b3">현재 owner의 안전 frontier에서 재처리</td><td style="padding:7px;border:1px solid #e7c7b3">옛 generation commit 무한 retry</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e7c7b3">committed offset 후퇴</td><td style="padding:7px;border:1px solid #e7c7b3">commit callback 순서, 요청 offset, client instance, metadata</td><td style="padding:7px;border:1px solid #e7c7b3">오래된 async 실패를 늦게 재시도</td><td style="padding:7px;border:1px solid #e7c7b3">commit publisher 단일화, monotonic guard</td><td style="padding:7px;border:1px solid #e7c7b3">최신 검증 frontier 재commit</td><td style="padding:7px;border:1px solid #e7c7b3">모든 callback에서 blind retry</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">7. 35분 실습: checkpoint와 처리 증거를 분리해 관찰</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측</strong><br>
+  P0 offset 0과 1을 읽은 뒤 checkpoint가 2라면 재시작 시 어디서 시작할까? offset 1의 업무 처리가 끝나지 않았는데 2를 저장했다면 어떤 유실이 생기는지, 반대로 처리 후 checkpoint 1에서 죽으면 무엇이 중복되는지 적는다.</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker 실행 가능, local Kafka 4.3.1 단일 broker. 아래 offset reset은 실습 전용 group/topic에만 실행한다.</p>
+  <ol style="padding-left:22px">
+    <li><strong>환경·1 partition topic:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day19.commit --partitions 1 --replication-factor 1</code></li>
+    <li><strong>5개 event 입력:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">make produce TOPIC=day19.commit</code><code>order-0</code>부터 <code>order-4</code>까지 한 줄씩 넣고 종료한다.</li>
+    <li><strong>auto commit 관찰:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day19.commit \
+  --group day19-auto --from-beginning --max-messages 2 \
+  --consumer-property enable.auto.commit=true \
+  --consumer-property auto.commit.interval.ms=1000 \
+  --property print.offset=true</code>정상 종료 후 group describe로 committed offset을 확인한다.</li>
+    <li><strong>실패 주입:</strong> 새 group <code>day19-crash</code>로 같은 명령을 실행하되 record가 보인 직후 <code>Ctrl+C</code>로 종료한다. 아래 describe를 즉시 실행해 출력된 record 수와 committed offset이 일치하는지 비교한다.<br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group day19-crash</code></li>
+    <li><strong>manual 경계 모사:</strong> 실습 group이 inactive임을 확인한 뒤 checkpoint를 1로 명시해 재시작 위치를 관찰한다.<br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group day19-manual \
+  --topic day19.commit --reset-offsets --to-offset 1 --execute</code>그 group으로 consume하면 offset 1부터 보이는지 확인한다. 이 CLI reset은 application <code>commitSync</code> 구현이 아니라 checkpoint 의미만 분리해 보는 도구다.</li>
+  </ol>
+  <p><strong>예상 관찰:</strong> committed offset N은 N부터 다시 읽게 한다. crash 타이밍에 따라 출력된 마지막 record와 checkpoint 사이가 다를 수 있다. 한 번의 결과로 auto commit의 보장을 일반화하지 말고 timeline과 설정을 함께 기록한다.</p>
+  <p><strong>자주 나는 오류와 해결:</strong> group이 active면 reset이 거부되므로 consumer를 종료하고 재확인한다. group이 처음이라 offset entry가 없으면 먼저 한 번 소비하거나 <code>--to-earliest</code>로 초기화한다. 출력 offset과 committed offset을 혼동하지 않는다. production group에는 reset 명령을 쓰지 않는다.</p>
+  <p><strong>Cleanup:</strong><br><code style="display:block;padding:10px;background:#101827;color:#e8eefc;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day19.commit
+make down</code></p>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>commit 값은 next offset:</strong> 완료 offset 자체를 저장하면 정상 재시작마다 마지막 record를 다시 읽는다.</li>
+    <li><strong>auto commit은 처리 성공 감지기가 아니다:</strong> worker queue 사용 시 특히 위험하다.</li>
+    <li><strong>manual commit ≠ exactly-once:</strong> 두 독립 상태 저장소 사이 crash window는 남는다.</li>
+    <li><strong>max completed offset ≠ contiguous frontier:</strong> 앞 gap을 넘기면 유실된다.</li>
+    <li><strong>lag 0 ≠ sink 완료:</strong> committed offset을 일찍 전진시키면 lag는 좋아 보여도 DB는 비어 있을 수 있다.</li>
+    <li><strong>rebalance는 ownership 변경:</strong> revoke 뒤 옛 worker가 side effect·commit을 계속하지 않도록 fencing해야 한다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. 처리와 commit 순서에 따른 delivery semantics를 timeline으로 설명하세요.</strong><br>
+  좋은 답변 구조: offset 41/next 42 예시 → commit-before-process crash는 loss → process-before-commit crash는 duplicate → 외부 sink 원자성 부재 → 요구사항에 따라 at-least-once+idempotency 또는 transaction 대안 → 관측·복구.</p>
+  <p><strong>Q2. 8개 worker가 partition 하나를 병렬 처리할 때 무엇을 commit합니까?</strong><br>
+  좋은 답변 구조: partition ordering 요구 확인 → offset별 완료 set → contiguous frontier만 next offset으로 commit → 앞 record 지연/poison pill → bounded buffer·pause → rebalance revoke drain/fence → memory와 throughput trade-off.</p>
+  <p><strong>Q3. Kafka→DB exactly-once를 설계해보세요.</strong><br>
+  좋은 답변 구조: 정확히 한 번의 범위 정의 → Kafka commit과 DB transaction은 독립임을 명시 → business event ID unique constraint/inbox table → DB transaction으로 side effect+dedup 기록 → 처리 후 Kafka commit → crash별 replay 수렴 → 대안으로 outbox/CDC 또는 Kafka 내부 transaction, RPO/RTO와 운영 비용.</p>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#7c334b">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li><code>max.poll.records</code>가 network fetch bytes를 제한하지 않는 이유는?</li><li>position과 committed offset은 누가 소유하는가?</li><li>deserialization poison pill에서 먼저 보존할 증거는?</li></ol>
+  <p style="padding:12px;background:#f3f6fb"><strong>짧은 정답:</strong> ① fetch된 local cache에서 poll 반환 수만 제한한다. ② position은 consumer memory, committed offset은 group coordinator/offsets topic. ③ topic/partition/offset, raw bytes, headers/schema ID, exception chain.</p>
+  <h3 style="margin:16px 0 8px;color:#7c334b">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>offset 41 완료 후 commit할 값은 무엇이며 왜인가?</li><li>process→commit 사이 crash와 commit→process 사이 crash의 결과는?</li><li>async worker에서 안전한 commit frontier를 어떻게 계산하는가?</li></ol>
+  <p style="padding:12px;background:#f3f6fb"><strong>채점 기준:</strong> ① 다음 위치 42를 말함(2점). ② 각각 중복과 유실 window를 정확히 구분(4점). ③ partition별 연속 완료 구간만 전진하며 gap을 넘지 않고 revoke/fencing까지 말함(4점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#7c334b">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/generated/consumer_config.html" style="color:#7c334b">Apache Kafka 4.3 Consumer Configs</a> — auto commit·poll 설정</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html" style="color:#7c334b">KafkaConsumer 4.3.1 API</a> — sync/async commit과 thread model</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/ConsumerRecords.html" style="color:#7c334b">ConsumerRecords 4.3.1 API</a> — partition별 nextOffsets</li>
+    <li><a href="https://kafka.apache.org/43/implementation/distribution/" style="color:#7c334b">Kafka Distribution: Consumer Offset Tracking</a> — coordinator와 __consumer_offsets 내부 동작</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#5a2f3d;color:#fff;border-radius:10px"><strong>내일 예고 · Day 20</strong><br>랩: 처리 전/후 crash로 delivery semantics 관찰 — 실제 consumer를 두 crash 지점에서 종료해 DB 결과와 committed offset을 대조한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>
