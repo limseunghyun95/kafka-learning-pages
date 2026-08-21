@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-20T09:19:11+09:00",
+  "updatedAt": "2026-08-21T09:00:17+09:00",
   "lessons": [
     {
       "day": 1,
@@ -176,6 +176,15 @@
       "path": "day-19.html",
       "kind": "lesson",
       "publishedAt": "2026-08-20T09:19:11+09:00"
+    },
+    {
+      "day": 20,
+      "week": 3,
+      "title": "랩: 처리 전/후 crash로 delivery semantics 관찰",
+      "summary": "commit-first와 process-first 두 crash window를 독립 group·checkpoint·sink ledger로 재현하고, 누락과 중복의 상태 소유자·증거·실무 복구 전략을 분석합니다.",
+      "path": "day-20.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-21T09:00:17+09:00"
     }
   ]
 }

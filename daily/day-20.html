@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 20 · 랩: 처리 전/후 crash로 delivery semantics 관찰</title>
+</head>
+<body style="margin:0;background:#edf3f2;color:#172523;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#edf3f2"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d4e2df;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#164e46;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#9fe2d4;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 3 / DAY 20 · INTEGRATION LAB</div>
+  <h1 style="margin:10px 0 8px;font-size:29px;line-height:1.28">처리 전/후 crash로<br>delivery semantics 관찰</h1>
+  <p style="margin:0;color:#d8f4ee">Kafka checkpoint와 외부 side effect의 어긋남을 두 번의 실패 주입으로 증명하기 · 예상 35~40분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#e9f8f4;border-left:5px solid #238b78;border-radius:10px"><strong>한 줄 요약</strong><br>
+  같은 record에서 <strong>commit → 처리 → crash</strong> 순서는 기본 재시작 경로의 누락을, <strong>처리 → crash → commit</strong> 순서는 중복 처리를 만든다. 오늘은 Kafka log를 지우지 않고도 committed offset과 sink 증거를 나란히 기록해 이 차이를 재현한다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#166456">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #cfe0dc"><strong>Delivery semantics</strong></td><td style="padding:10px;border:1px solid #cfe0dc">장애와 재시도까지 포함했을 때 record의 효과가 0회·1회·여러 번 나타날 수 있는지를 설명하는 계약이다. 단순 수신 횟수가 아니라 <strong>관찰 가능한 업무 효과</strong>의 범위를 먼저 정해야 한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0dc"><strong>Side effect</strong></td><td style="padding:10px;border:1px solid #cfe0dc">DB 행 갱신, 결제 API 호출, 파일 append처럼 process 밖의 상태를 바꾸는 결과. 오늘은 텍스트 ledger 한 줄을 외부 sink의 축소 모형으로 쓴다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0dc"><strong>Consumer position</strong></td><td style="padding:10px;border:1px solid #cfe0dc">현재 process가 다음 poll에서 받을 partition offset. poll이 record를 반환하면 메모리에서 전진하지만, 아직 장애 복구 위치가 아닐 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0dc"><strong>Committed offset</strong></td><td style="padding:10px;border:1px solid #cfe0dc">consumer group이 재시작할 다음 offset으로 broker에 저장한 checkpoint. offset 0 처리를 끝냈다면 보통 1을 저장한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0dc"><strong>Crash window</strong></td><td style="padding:10px;border:1px solid #cfe0dc">서로 다른 두 상태 변경 사이에서 process가 죽으면 결과가 달라지는 구간. sink 반영과 Kafka offset commit은 기본적으로 하나의 원자적 연산이 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0dc"><strong>Checkpoint</strong></td><td style="padding:10px;border:1px solid #cfe0dc">작업 전체 결과가 아니라 “어디서 다시 시작할지”를 기록한 좌표. 책갈피를 옮겼다고 앞장을 이해했다는 보장은 없는 것과 같다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0dc"><strong>Idempotency</strong></td><td style="padding:10px;border:1px solid #cfe0dc">같은 business event를 여러 번 적용해도 최종 상태가 한 번 적용한 것과 같아지는 성질. unique key, upsert, inbox/dedup table로 구현할 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0dc"><strong>Reset offsets</strong></td><td style="padding:10px;border:1px solid #cfe0dc">inactive group의 checkpoint를 관리 CLI로 옮기는 운영 기능. 오늘은 특정 commit 상태를 재현하는 실험 도구이며 application의 commit API 자체는 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0dc"><strong>Evidence</strong></td><td style="padding:10px;border:1px solid #cfe0dc">가설을 판별하는 증거. topic/partition/offset, group checkpoint, sink의 event ID, crash 시각을 함께 묶어야 한다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#166456">2. 왜 중요한가</h2>
+  <p>운영에서 “Kafka 메시지가 사라졌다”는 신고가 들어와도 실제 Kafka log가 삭제된 것은 아닐 수 있다. group checkpoint가 처리보다 앞서 가면 기본 consume 경로에서 record를 건너뛰어 <em>업무 결과만</em> 빠진다. 반대로 처리 결과가 checkpoint보다 앞서면 같은 record가 다시 배달되어 중복 주문·중복 알림이 생길 수 있다.</p>
+  <p>실무자는 세 숫자를 구분해야 한다. <strong>log end offset</strong>은 broker log의 끝, <strong>committed offset</strong>은 group의 재시작 위치, <strong>sink completed offset</strong>은 업무 처리가 실제 확정된 지점이다. lag가 0이어도 세 번째 숫자가 뒤처질 수 있다. 면접에서도 설정 이름보다 이 상태들의 소유자와 실패 창을 설명해야 설계 역량이 드러난다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#166456">3. Architecture: 두 crash 실험의 요청·상태 흐름</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:26%;padding:12px;background:#166456;color:#fff;border-radius:8px"><strong>1 · Broker log</strong></td><td style="padding:12px;background:#e9f8f4">P0: [offset 0 = order-0] [1 = order-1] [2 = order-2]</td></tr>
+    <tr><td colspan="2" align="center" style="color:#238b78;font-weight:800">↓ Fetch / poll: offset 0 반환, position=1</td></tr>
+    <tr><td style="padding:12px;background:#7a4b19;color:#fff;border-radius:8px"><strong>A · Commit first</strong></td><td style="padding:12px;background:#fff4e5">coordinator에 group A / P0 = 1 저장 → 아직 sink는 비어 있음</td></tr>
+    <tr><td colspan="2" align="center" style="color:#b7671a;font-weight:800">↓ CRASH before sink write</td></tr>
+    <tr><td style="padding:12px;background:#7a4b19;color:#fff;border-radius:8px"><strong>A · Restart</strong></td><td style="padding:12px;background:#fff4e5">group A는 offset 1부터 재개 → order-0은 log에 있지만 sink에서 누락</td></tr>
+    <tr><td colspan="2" align="center" style="color:#54706c;font-weight:800">──────── 같은 입력, 독립 group B ────────</td></tr>
+    <tr><td style="padding:12px;background:#305e87;color:#fff;border-radius:8px"><strong>B · Process first</strong></td><td style="padding:12px;background:#edf5fc">order-0을 sink에 append → group B committed=0</td></tr>
+    <tr><td colspan="2" align="center" style="color:#305e87;font-weight:800">↓ CRASH before commit 1</td></tr>
+    <tr><td style="padding:12px;background:#305e87;color:#fff;border-radius:8px"><strong>B · Restart</strong></td><td style="padding:12px;background:#edf5fc">offset 0 재배달 → 단순 append sink에는 order-0이 두 줄</td></tr>
+    <tr><td colspan="2" align="center" style="color:#238b78;font-weight:800">↓ event ID unique/upsert로 수렴</td></tr>
+    <tr><td style="padding:12px;background:#166456;color:#fff;border-radius:8px"><strong>Safe baseline</strong></td><td style="padding:12px;background:#e9f8f4">처리 후 commit + 중복을 흡수하는 sink + replay 증거 보존</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>Fetch path:</strong> consumer는 partition leader에서 record bytes를 받고 poll로 application에 넘긴다. position=1은 client memory 상태다.</li>
+    <li><strong>Commit path:</strong> OffsetCommitRequest는 group coordinator로 가며, 성공한 checkpoint는 <code>__consumer_offsets</code>에 저장된다.</li>
+    <li><strong>Sink path:</strong> DB/file/API는 Kafka coordinator와 독립된 상태 소유자다. 한쪽의 성공 response가 다른 쪽 성공을 증명하지 않는다.</li>
+    <li><strong>Crash:</strong> RAM의 position과 미전송 요청은 사라진다. 재시작 consumer는 broker의 committed offset을 기준으로 새 position을 잡는다.</li>
+    <li><strong>복구:</strong> Kafka log가 retention 안에 남아 있으면 별도 replay group이나 검증된 offset reset으로 재처리할 수 있지만, 비멱등 side effect는 먼저 격리해야 한다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#166456">4. CS 내부 동작: 무엇이 확정됐는가</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcefeb"><th align="left" style="padding:9px;border:1px solid #bad4ce">상태</th><th align="left" style="padding:9px;border:1px solid #bad4ce">소유자</th><th align="left" style="padding:9px;border:1px solid #bad4ce">성공 확정 시점·불변식</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bad4ce">partition log</td><td style="padding:9px;border:1px solid #bad4ce">leader/follower broker</td><td style="padding:9px;border:1px solid #bad4ce">produce ack 정책을 만족한 append. consumer commit과 무관하게 retention까지 남는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bad4ce">position</td><td style="padding:9px;border:1px solid #bad4ce">consumer process</td><td style="padding:9px;border:1px solid #bad4ce">poll 반환으로 다음 offset까지 전진. crash 시 소실될 수 있다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bad4ce">committed offset</td><td style="padding:9px;border:1px solid #bad4ce">group coordinator</td><td style="padding:9px;border:1px solid #bad4ce">OffsetCommit 성공 response. 값은 다음에 읽을 offset이며 업무 성공 증명이 아니다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bad4ce">sink row/line</td><td style="padding:9px;border:1px solid #bad4ce">DB·파일·외부 API</td><td style="padding:9px;border:1px solid #bad4ce">sink transaction/response가 성공했을 때. event ID별 유일성은 sink가 보장해야 한다.</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#166456">분산 시스템 관점: dual write 문제</h3>
+  <p>Kafka offset 저장과 외부 DB 갱신은 두 개의 독립 state machine이다. application이 순서를 정할 수는 있지만 일반 commit 두 번을 하나의 원자적 commit으로 만들 수는 없다. 첫 작업 뒤 두 번째 작업 전에 crash하는 구간이 언제나 생긴다. 이것이 dual write 문제다. 2-phase commit을 붙이면 조정자·blocking·복구 비용이 늘고, 모든 sink가 참여할 수도 없다.</p>
+  <p>그래서 흔한 실무 해법은 <strong>at-least-once + idempotent sink</strong>다. DB라면 event ID unique constraint와 같은 transaction 안에서 업무 갱신·inbox 기록을 확정한다. Kafka→Kafka라면 transactional producer와 input offsets를 같은 Kafka transaction에 포함하는 대안을 검토한다. 단, Kafka 내부 exactly-once가 외부 REST 결제까지 자동으로 보호하지는 않는다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#166456">OS 관점: 출력 한 줄도 바로 내구적이지 않을 수 있다</h3>
+  <p>파일 append나 DB client의 “성공”은 어느 계층까지 확정됐는지 따져야 한다. user-space buffer, kernel page cache, storage controller를 거쳐 실제 stable storage에 반영되는 시점이 다를 수 있다. 오늘 ledger는 의미를 관찰하기 위한 모형이므로 금융 내구성을 증명하지 않는다. production에서는 DB transaction commit, fsync 정책, replica quorum까지 성공 정의에 넣는다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#166456">Network 관점: response 유실과 불확실한 결과</h3>
+  <p>요청이 server에서 성공한 뒤 response packet만 유실되면 client는 timeout을 본다. “timeout=실패”로 단정하고 비멱등 요청을 재시도하면 중복 효과가 생긴다. event ID와 조회 가능한 operation ID가 필요한 이유다. commit request도 outcome이 불확실할 수 있으므로 현재 group generation과 안전한 completed frontier를 확인해 같은 또는 더 높은 offset을 재확정한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#166456">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcefeb"><th align="left" style="padding:9px;border:1px solid #bad4ce">요구사항</th><th align="left" style="padding:9px;border:1px solid #bad4ce">권장 출발점</th><th align="left" style="padding:9px;border:1px solid #bad4ce">비용·판단 이유</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bad4ce">주문·정산 DB</td><td style="padding:9px;border:1px solid #bad4ce">처리 후 manual commit + event ID unique/inbox</td><td style="padding:9px;border:1px solid #bad4ce">유실보다 중복 재전달을 선택하고 sink에서 수렴시킨다. dedup 보관·인덱스 비용이 든다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bad4ce">Kafka→Kafka 변환</td><td style="padding:9px;border:1px solid #bad4ce">transactional producer + <code>read_committed</code></td><td style="padding:9px;border:1px solid #bad4ce">input offset과 output record를 Kafka transaction에 묶을 수 있으나 transaction timeout·LSO 지연을 운영해야 한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bad4ce">손실 허용 telemetry</td><td style="padding:9px;border:1px solid #bad4ce">단순 auto commit 가능, loss budget 수치화</td><td style="padding:9px;border:1px solid #bad4ce">복잡도를 줄이는 대신 deploy/crash 한 번당 허용 누락량을 명시한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bad4ce">비멱등 외부 API</td><td style="padding:9px;border:1px solid #bad4ce">provider idempotency key, outbox/relay, 상태 조회</td><td style="padding:9px;border:1px solid #bad4ce">단순 retry 금지. 결과 불확실성을 operation ID로 해소한다.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> event ID와 topic/partition/offset을 sink audit에 같이 남긴다. <code>processed frontier ≤ committed frontier</code> 같은 숫자 하나만 믿지 말고, 처리 후 commit 설계에서는 정상적으로 committed가 잠시 뒤처질 수 있음을 대시보드에 표현한다. 장애 훈련은 별도 topic/group/sink에서 자동화하고 결과 행 수·unique event 수·checkpoint를 동시에 assert한다.</p>
+  <p><strong>Anti-pattern:</strong> lag 0을 처리 완료로 간주, <code>Ctrl+C</code> 한 번 결과만으로 보장 선언, active production group offset reset, sink 중복을 지우기 전에 증거 삭제, “manual commit”이라는 말만으로 exactly-once 주장.</p>
+  <p><strong>Edge case:</strong> 한 poll batch를 병렬 처리하면 가장 큰 완료 offset이 아니라 partition별 연속 완료 frontier만 commit해야 한다. rebalance 뒤 옛 worker의 늦은 side effect도 fencing해야 한다. compacted topic·transaction marker 때문에 offset 숫자가 항상 record 개수와 같거나 연속이라고 가정하지 않는다.</p>
+  <p><strong>Version/engine 차이:</strong> 이 랩은 Apache Kafka 4.3.1 CLI와 KRaft 단일 broker 기준이다. Spring Kafka ack mode, Kafka Connect offset, Flink checkpoint는 상위 runtime이 commit 시점과 재시작 state를 소유하므로 동일 CLI 실험을 그대로 의미 매핑하지 말고 해당 engine의 checkpoint barrier·transaction 계약을 확인한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#166456">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffead4"><th style="padding:7px;border:1px solid #e8c7a4">증상</th><th style="padding:7px;border:1px solid #e8c7a4">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e8c7a4">가능한 가설</th><th style="padding:7px;border:1px solid #e8c7a4">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e8c7a4">rollback/복구</th><th style="padding:7px;border:1px solid #e8c7a4">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e8c7a4">DB 누락, Kafka record 존재</td><td style="padding:7px;border:1px solid #e8c7a4">event ID, partition/offset, committed offset, sink transaction log, crash/deploy 시각</td><td style="padding:7px;border:1px solid #e8c7a4">commit이 sink 처리보다 먼저 확정</td><td style="padding:7px;border:1px solid #e8c7a4">영향 partition·offset 범위 격리, 원본 보존</td><td style="padding:7px;border:1px solid #e8c7a4">별도 replay group과 검증 sink로 보정 후 병합</td><td style="padding:7px;border:1px solid #e8c7a4">운영 group을 즉시 earliest로 reset</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e8c7a4">중복 결제·알림</td><td style="padding:7px;border:1px solid #e8c7a4">idempotency key, API request/response, processed/committed offset, restart 횟수</td><td style="padding:7px;border:1px solid #e8c7a4">sink 성공 후 commit 전 crash 또는 response 유실</td><td style="padding:7px;border:1px solid #e8c7a4">consumer pause, operation ID별 결과 조회</td><td style="padding:7px;border:1px solid #e8c7a4">dedup/보상 transaction 후 안전 frontier 재개</td><td style="padding:7px;border:1px solid #e8c7a4">불확실한 API를 blind retry</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e8c7a4">lag 0인데 sink 지연</td><td style="padding:7px;border:1px solid #e8c7a4">poll position, worker queue depth/age, sink 완료 frontier, commit 시각</td><td style="padding:7px;border:1px solid #e8c7a4">worker 완료 전 auto/early commit</td><td style="padding:7px;border:1px solid #e8c7a4">새 poll pause, in-flight 상태 캡처</td><td style="padding:7px;border:1px solid #e8c7a4">안전 offset부터 idempotent replay</td><td style="padding:7px;border:1px solid #e8c7a4">lag 지표만 보고 backlog 없음 선언</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e8c7a4">offset reset 거부</td><td style="padding:7px;border:1px solid #e8c7a4">group state/members, assignment, target offset과 log start/end</td><td style="padding:7px;border:1px solid #e8c7a4">group active 또는 retention 밖 offset</td><td style="padding:7px;border:1px solid #e8c7a4">실습 consumer 종료 후 inactive 확인</td><td style="padding:7px;border:1px solid #e8c7a4">dry-run 결과 승인 뒤 실습 group만 execute</td><td style="padding:7px;border:1px solid #e8c7a4">production group에 강제 reset</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#166456">7. 35~40분 통합 랩: 누락 window와 중복 window를 분리 관찰</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측부터 적기</strong><br>
+  ① checkpoint=1, sink에 order-0 없음이면 재시작 후 order-0이 보일까? ② checkpoint=0, sink에 order-0 한 줄이면 재시작 후 append 결과는 몇 줄일까? ③ Kafka log의 order-0은 두 경우 모두 남아 있을까?</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker 실행 가능, 이 프로젝트의 공식 Apache Kafka 4.3.1 단일 broker KRaft 환경. 아래 명령은 <code>day20.delivery</code>와 <code>day20-*</code> 실습 group에만 실행한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#166456">Step 1 · 입력과 원본 증거 만들기</h3>
+  <code style="display:block;padding:10px;background:#102522;color:#e5f5f1;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day20.delivery --partitions 1 --replication-factor 1
+printf 'order-0\norder-1\norder-2\n' | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day20.delivery</code>
+  <p>원본을 group 없이 읽어 offset을 확인한다.</p>
+  <code style="display:block;padding:10px;background:#102522;color:#e5f5f1;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day20.delivery \
+  --partition 0 --offset earliest --max-messages 3 \
+  --property print.offset=true --property print.value=true</code>
+  <p><strong>예상:</strong> Offset:0/order-0부터 Offset:2/order-2까지 보인다. 이 명령은 group checkpoint를 만들지 않는다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#166456">Step 2 · 시나리오 A: commit 먼저, 처리 전 crash</h3>
+  <p>실제 application에서 offset 0을 poll한 뒤 next offset 1을 먼저 commit한 상태를 CLI reset으로 모사한다. group이 inactive일 때만 실행한다.</p>
+  <code style="display:block;padding:10px;background:#102522;color:#e5f5f1;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group day20-before \
+  --topic day20.delivery:0 --reset-offsets --to-offset 1 --execute
+rm -f /tmp/day20-before-sink.log</code>
+  <p><strong>실패 주입:</strong> sink append 명령을 실행하지 않는다. 이것이 commit 1 성공 직후, order-0 처리 전에 process가 죽은 상태다. 재시작을 모사해 같은 group으로 한 건만 읽는다.</p>
+  <code style="display:block;padding:10px;background:#102522;color:#e5f5f1;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day20.delivery \
+  --group day20-before --max-messages 1 \
+  --property print.offset=true --property print.value=true</code>
+  <p><strong>예상:</strong> 첫 출력은 offset 1/order-1이다. order-0은 Kafka log에 남지만 이 group의 기본 재시작 경로에서는 건너뛴다. 이것이 sink 관점의 at-most-once/loss window다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#166456">Step 3 · 시나리오 B: 처리 먼저, commit 전 crash</h3>
+  <p>새 group의 checkpoint를 0에 두고 order-0의 side effect를 먼저 기록한다.</p>
+  <code style="display:block;padding:10px;background:#102522;color:#e5f5f1;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group day20-after \
+  --topic day20.delivery:0 --reset-offsets --to-offset 0 --execute
+rm -f /tmp/day20-after-sink.log
+printf 'order-0\n' &gt;&gt; /tmp/day20-after-sink.log</code>
+  <p><strong>실패 주입:</strong> checkpoint를 1로 전진시키지 않고 crash했다고 가정한다. 재시작 consumer에서 offset 0을 다시 확인한 뒤 동일 side effect를 한 번 더 모사한다.</p>
+  <code style="display:block;padding:10px;background:#102522;color:#e5f5f1;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day20.delivery \
+  --group day20-after --max-messages 1 \
+  --property print.offset=true --property print.value=true
+printf 'order-0\n' &gt;&gt; /tmp/day20-after-sink.log
+nl -ba /tmp/day20-after-sink.log</code>
+  <p><strong>예상:</strong> offset 0/order-0이 재배달되고 ledger에는 같은 event가 두 줄이다. 이것이 at-least-once의 duplicate window다. console consumer의 종료 commit 동작과 timing은 구현·종료 방식에 영향을 받을 수 있으므로, 핵심 증거는 실행 전 명시한 checkpoint와 sink 결과다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#166456">Step 4 · 세 상태를 표로 대조</h3>
+  <code style="display:block;padding:10px;background:#102522;color:#e5f5f1;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group day20-before
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group day20-after
+wc -l /tmp/day20-before-sink.log /tmp/day20-after-sink.log 2&gt;/dev/null || true</code>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcefeb"><th style="padding:8px;border:1px solid #bad4ce">시나리오</th><th style="padding:8px;border:1px solid #bad4ce">crash 직전 checkpoint</th><th style="padding:8px;border:1px solid #bad4ce">sink</th><th style="padding:8px;border:1px solid #bad4ce">관찰 의미</th></tr>
+    <tr><td style="padding:8px;border:1px solid #bad4ce">A commit-first</td><td style="padding:8px;border:1px solid #bad4ce">1</td><td style="padding:8px;border:1px solid #bad4ce">order-0 없음</td><td style="padding:8px;border:1px solid #bad4ce">log는 보존, group replay는 skip</td></tr>
+    <tr><td style="padding:8px;border:1px solid #bad4ce">B process-first</td><td style="padding:8px;border:1px solid #bad4ce">0</td><td style="padding:8px;border:1px solid #bad4ce">order-0 두 줄</td><td style="padding:8px;border:1px solid #bad4ce">재배달, 비멱등 sink 중복</td></tr>
+  </table>
+
+  <p><strong>자주 나는 오류와 해결:</strong> reset에서 “group active”가 나오면 해당 consumer를 완전히 종료하고 describe로 <code>Empty</code>를 확인한다. 처음 만든 group이 없어 reset이 실패하면 <code>--to-earliest</code>로 초기 checkpoint를 만든 뒤 다시 실행한다. <code>TOPIC:PARTITION</code> 문법은 <code>day20.delivery:0</code>처럼 쓴다. 실험 출력이 예상과 다르면 명령을 반복하기 전에 group committed offset과 consumer 종료 시각을 캡처한다.</p>
+  <p><strong>Cleanup:</strong></p>
+  <code style="display:block;padding:10px;background:#102522;color:#e5f5f1;border-radius:7px;white-space:pre-wrap;word-break:break-all">rm -f /tmp/day20-before-sink.log /tmp/day20-after-sink.log
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day20.delivery
+make down</code>
+
+  <h2 style="margin:30px 0 12px;color:#166456">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>“유실” 범위:</strong> 시나리오 A에서 record bytes가 Kafka log에서 삭제된 것이 아니라 해당 group의 기본 replay 경로가 건너뛴 것이다.</li>
+    <li><strong>CLI reset의 역할:</strong> checkpoint 상태를 결정적으로 만드는 실험 도구다. application의 poll·commit 호출 순서를 대신 구현한 것은 아니다.</li>
+    <li><strong>graceful shutdown ≠ crash:</strong> console consumer가 종료 중 commit할 수 있다. 강제 실패 실험은 상태를 전후에 측정해야 한다.</li>
+    <li><strong>한 partition으로 인과성 고정:</strong> 여러 partition을 섞으면 출력 순서와 checkpoint가 독립이어서 처음 관찰하기 어렵다.</li>
+    <li><strong>append ledger는 비멱등:</strong> 중복을 눈에 보이게 만들기 위한 장치다. 실제 해법은 event ID unique/upsert 또는 transaction이다.</li>
+    <li><strong>offset reset은 파괴적 운영 변경:</strong> production에서는 영향 record 수·sink idempotency·rollback point·승인을 먼저 확보한다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#166456">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. “Kafka 메시지가 유실됐다”는 신고를 어떻게 조사합니까?</strong><br>
+  좋은 답변 구조: 유실 범위를 broker log와 sink 누락으로 분리 → topic/partition/offset·retention·committed offset·sink audit 수집 → commit-first crash, deserialization/DLQ, retention 가설 → 원본 보존·별도 replay group → idempotent 보정 → 운영 group blind reset 금지.</p>
+  <p><strong>Q2. 처리 후 commit이면 exactly-once입니까?</strong><br>
+  좋은 답변 구조: 요구하는 효과의 범위 정의 → sink 성공 후 commit 전 crash timeline → 재배달과 중복 → event ID unique/inbox로 수렴 → Kafka→Kafka transaction 대안 → 외부 API 결과 불확실성·비용·관측 설명.</p>
+  <p><strong>Q3. 초당 10만 건, 1%가 2초 걸리는 consumer의 commit 설계를 해보세요.</strong><br>
+  좋은 답변 구조: partition 수·ordering·허용 duplicate/RPO 가정 → poll thread와 worker 분리, pause/backpressure → partition별 contiguous frontier → <code>max.poll.interval.ms</code>와 batch 수치 추정 → rebalance fencing → dedup TTL/용량·commit latency·복구 시간 trade-off.</p>
+
+  <h2 style="margin:30px 0 12px;color:#166456">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#166456">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>offset 41까지 처리 완료했을 때 commit할 값과 이유는?</li><li>process→commit crash와 commit→process crash의 결과는?</li><li>병렬 worker에서 최대 완료 offset을 commit하면 안 되는 이유는?</li></ol>
+  <p style="padding:12px;background:#f1f6f5"><strong>짧은 정답:</strong> ① 다음 재시작 위치 42. ② 각각 중복 window와 sink 누락 window. ③ 앞 offset의 처리 gap을 건너뛰어 crash 후 누락시킬 수 있으므로 연속 완료 frontier만 commit한다.</p>
+  <h3 style="margin:16px 0 8px;color:#166456">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>시나리오 A에서 order-0은 정말 Kafka에서 삭제됐는가?</li><li>시나리오 B의 ledger 중복을 최종 상태 한 건으로 수렴시키는 두 방법은?</li><li>장애 조사 때 lag 외에 반드시 대조할 세 가지 상태는?</li></ol>
+  <p style="padding:12px;background:#f1f6f5"><strong>채점 기준:</strong> ① log에는 남고 group checkpoint가 skip한다고 설명(3점). ② event ID unique/upsert·inbox/dedup 또는 동일 효과의 transaction을 제시(3점). ③ log end/committed offset/sink completed evidence와 상태 소유자를 연결(4점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#166456">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html" style="color:#166456">KafkaConsumer 4.3.1 API</a> — position과 committed position, manual commit, 외부 offset 저장</li>
+    <li><a href="https://kafka.apache.org/43/generated/consumer_config.html" style="color:#166456">Apache Kafka 4.3 Consumer Configs</a> — auto commit·poll·isolation 설정</li>
+    <li><a href="https://kafka.apache.org/43/implementation/distribution/" style="color:#166456">Kafka Distribution</a> — group coordinator와 consumer offset tracking</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/ConsumerRecords.html" style="color:#166456">ConsumerRecords 4.3.1 API</a> — partition별 records와 nextOffsets</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#164e46;color:#fff;border-radius:10px"><strong>내일 예고 · Day 21</strong><br>회상: at-most/at-least/exactly-once 범위 구분 — 3분 안에 상태 소유자, crash window, 보장 범위와 대안을 그림 없이 방어한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>
