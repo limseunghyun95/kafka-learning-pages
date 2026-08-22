@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 21 · 회상: at-most/at-least/exactly-once 범위 구분</title>
+</head>
+<body style="margin:0;background:#f0f2f7;color:#182033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#f0f2f7"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d9dfeb;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#263a69;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#bdcbf2;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 3 / DAY 21 · RECALL &amp; DESIGN REVIEW</div>
+  <h1 style="margin:10px 0 8px;font-size:29px;line-height:1.28">at-most / at-least / exactly-once<br>범위 구분</h1>
+  <p style="margin:0;color:#e1e8ff">설정 암기가 아니라 효과의 경계·상태 소유자·crash window로 3분 안에 방어하기 · 복습 60분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#eef2ff;border-left:5px solid #526fbd;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Delivery semantics는 Kafka 전체에 붙이는 한 단어가 아니다. <strong>producer→log, log→consumer, consumer→sink</strong> 중 어느 경계에서, 어떤 실패를 허용하며, 어떤 효과를 몇 번 보이게 할지를 명시해야 한다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #d4daea"><strong>Semantic</strong></td><td style="padding:10px;border:1px solid #d4daea">시스템이 장애 상황까지 포함해 사용자에게 약속하는 의미. 설정값 자체가 아니라 관찰 가능한 결과의 계약이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4daea"><strong>Delivery</strong></td><td style="padding:10px;border:1px solid #d4daea">record bytes가 도착했다는 뜻과 업무 효과가 DB/API에 반영됐다는 뜻을 구분해야 한다. 면접에서는 무엇의 전달인지 먼저 묻는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4daea"><strong>At-most-once</strong></td><td style="padding:10px;border:1px solid #d4daea">효과가 최대 한 번이다. 중복을 피하는 대신 장애 창에서 0회가 될 수 있다. “정확히 한 번 이하”이지 “반드시 한 번”이 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4daea"><strong>At-least-once</strong></td><td style="padding:10px;border:1px solid #d4daea">효과를 적어도 한 번 시도한다. 누락을 줄이는 대신 성공 여부가 불확실한 요청을 재시도하면 두 번 이상 보일 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4daea"><strong>Exactly-once</strong></td><td style="padding:10px;border:1px solid #d4daea">정의한 범위에서 최종적으로 관찰되는 효과가 한 번인 계약. 물리적 실행이 반드시 한 번이라는 뜻은 아니며 재실행 후 멱등하게 수렴할 수도 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4daea"><strong>Scope</strong></td><td style="padding:10px;border:1px solid #d4daea">보장이 닫히는 경계. 한 producer session, Kafka topic들, 외부 DB 한 개, 고객 결제까지 범위가 커질수록 필요한 조정이 달라진다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4daea"><strong>Atomicity</strong></td><td style="padding:10px;border:1px solid #d4daea">여러 상태 변경이 모두 성공하거나 모두 실패하는 성질. input offset과 output record가 함께 commit되는 것이 예다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4daea"><strong>Idempotency</strong></td><td style="padding:10px;border:1px solid #d4daea">같은 식별자의 작업을 반복해도 최종 결과가 한 번 수행한 것과 같아지는 성질. retry를 안전하게 만드는 핵심 도구다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4daea"><strong>Transaction</strong></td><td style="padding:10px;border:1px solid #d4daea">여러 write의 원자적 경계를 만든다. Kafka transaction은 Kafka records와 consumer offsets를 묶지만 임의의 외부 API까지 자동 포함하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #d4daea"><strong>LSO</strong></td><td style="padding:10px;border:1px solid #d4daea">Last Stable Offset. open transaction 때문에 <code>read_committed</code> consumer가 안전하게 읽을 수 있는 끝 경계다. high watermark와 다를 수 있다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">2. 왜 중요한가</h2>
+  <p>“Kafka는 exactly-once예요”라는 문장은 위험하다. idempotent producer는 retry가 Kafka log에 중복 append되는 것을 막는 범위이고, transaction은 여러 Kafka partition write와 input offset을 묶는 범위다. consumer가 외부 결제 API를 호출하는 순간에는 다른 상태 소유자가 등장한다.</p>
+  <p>좋은 설계는 이름을 먼저 고르지 않는다. <strong>누락과 중복 중 무엇이 더 비싼가, business event ID가 있는가, sink가 transaction 또는 idempotency key를 지원하는가, 보장 실패 시 RPO·RTO는 얼마인가</strong>를 묻고 경계를 정한다. 대기업 면접에서 이 질문 순서를 제시하면 기능 사용자가 아니라 시스템 설계자로 보인다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">3. Architecture: 보장을 경계별로 분해하는 지도</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:27%;padding:12px;background:#304d94;color:#fff;border-radius:8px"><strong>1 · Producer</strong></td><td style="padding:12px;background:#eef2ff">business event 생성 → batch·sequence·retry</td></tr>
+    <tr><td colspan="2" align="center" style="color:#526fbd;font-weight:800">↓ producer→log 경계: acks, idempotence, timeout</td></tr>
+    <tr><td style="padding:12px;background:#304d94;color:#fff;border-radius:8px"><strong>2 · Kafka log</strong></td><td style="padding:12px;background:#eef2ff">partition append → ISR 복제 → committed record</td></tr>
+    <tr><td colspan="2" align="center" style="color:#526fbd;font-weight:800">↓ log→consumer 경계: fetch, isolation, position</td></tr>
+    <tr><td style="padding:12px;background:#304d94;color:#fff;border-radius:8px"><strong>3 · Consumer</strong></td><td style="padding:12px;background:#eef2ff">poll → deserialize → process → completed frontier</td></tr>
+    <tr><td colspan="2" align="center" style="color:#b06a25;font-weight:800">↓ consumer→sink 경계: side effect ↔ offset commit</td></tr>
+    <tr><td style="padding:12px;background:#7e4b20;color:#fff;border-radius:8px"><strong>4 · Sink</strong></td><td style="padding:12px;background:#fff4e7">DB/API/file 결과 + event ID/dedup state</td></tr>
+    <tr><td colspan="2" align="center" style="color:#27836f;font-weight:800">↓ 범위를 닫는 장치: atomic transaction 또는 idempotent convergence</td></tr>
+    <tr><td style="padding:12px;background:#196758;color:#fff;border-radius:8px"><strong>5 · Contract</strong></td><td style="padding:12px;background:#eaf8f4">어떤 실패에서도 최종 효과가 0/1/N회인지 검증</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>Producer 성공:</strong> send future 성공은 선택한 ack 조건의 충족이다. 고객 DB 반영까지 뜻하지 않는다.</li>
+    <li><strong>Log committed:</strong> ISR의 replicas가 적용한 record는 살아 있는 ISR replica가 있는 동안 보존되는 기준을 갖는다.</li>
+    <li><strong>Consumer poll:</strong> record 반환으로 position은 전진하지만 업무 완료와 committed offset은 별개다.</li>
+    <li><strong>Sink 성공:</strong> 외부 시스템의 transaction/response가 효과를 확정한다. response 유실 시 client는 결과를 모를 수 있다.</li>
+    <li><strong>Contract 검증:</strong> 각 화살표에서 crash를 넣고 재시작 위치·보이는 output·중복 억제 상태를 표로 증명한다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">4. CS 내부 동작: 세 보장의 정확한 차이</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#e1e7f7"><th style="padding:8px;border:1px solid #c4cee8">보장</th><th style="padding:8px;border:1px solid #c4cee8">순서·불변식</th><th style="padding:8px;border:1px solid #c4cee8">crash 결과</th><th style="padding:8px;border:1px solid #c4cee8">대가</th></tr>
+    <tr><td style="padding:8px;border:1px solid #c4cee8"><strong>At-most</strong></td><td style="padding:8px;border:1px solid #c4cee8">checkpoint 먼저, 처리 나중</td><td style="padding:8px;border:1px solid #c4cee8">처리 전 crash면 0회</td><td style="padding:8px;border:1px solid #c4cee8">누락 허용, 단순한 중복 제어</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c4cee8"><strong>At-least</strong></td><td style="padding:8px;border:1px solid #c4cee8">처리 먼저, 안전 frontier commit</td><td style="padding:8px;border:1px solid #c4cee8">commit 전 crash면 재처리</td><td style="padding:8px;border:1px solid #c4cee8">중복 억제·보상 필요</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c4cee8"><strong>Exactly</strong></td><td style="padding:8px;border:1px solid #c4cee8">효과+진행 위치 원자화 또는 동일 ID로 수렴</td><td style="padding:8px;border:1px solid #c4cee8">재실행해도 관찰 효과 1회</td><td style="padding:8px;border:1px solid #c4cee8">transaction/dedup 상태·운영 복잡도</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#304d94">Producer idempotence의 범위</h3>
+  <p>Kafka 4.3 producer는 충돌하는 설정이 없으면 idempotence가 기본 활성화된다. producer ID·partition별 sequence number를 broker가 추적해 retry된 batch의 중복 append를 막는다. 이 불변식은 같은 producer identity와 broker가 기억하는 sequence 범위에 대한 것이며, application이 같은 business event를 새 producer에서 두 번 <code>send</code>한 것을 자동 dedup하지 않는다.</p>
+  <p><code>acks=all</code>, retry, <code>max.in.flight.requests.per.connection≤5</code> 조건이 idempotence와 연결된다. timeout은 요청 실패와 결과 미확정을 구분하지 않으므로 business event ID는 여전히 필요하다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#304d94">Consumer offset의 범위</h3>
+  <p>consumer position은 다음 poll 위치이고 committed offset은 장애 후 복구 위치다. 처리 전 commit은 at-most-once 쪽으로, 처리 후 commit은 at-least-once 쪽으로 기운다. 하지만 보장은 “record 전달”과 “외부 효과” 중 무엇을 기준으로 측정하는지에 따라 달라진다. commit response 성공은 sink 성공을 증명하지 않는다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#304d94">Kafka transaction과 LSO</h3>
+  <p>Kafka→Kafka 처리에서는 output records와 input offsets를 같은 transaction에 넣을 수 있다. commit되면 둘 다 보이고 abort되면 <code>read_committed</code> consumer에 output이 보이지 않으며 input offset도 함께 전진하지 않는다. open transaction 뒤의 record는 LSO 때문에 잠시 보류될 수 있어 강한 가시성은 latency와 운영 비용을 가진다.</p>
+  <p><code>read_uncommitted</code>는 aborted transactional record도 볼 수 있으므로 producer transaction만 켜고 consumer isolation을 확인하지 않으면 end-to-end 계약이 닫히지 않는다. transaction marker도 offset을 차지하므로 offset gap을 유실로 오판하면 안 된다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#304d94">외부 sink: exactly-once는 협력 계약</h3>
+  <p>Kafka offset과 DB 결과를 같은 DB transaction에 저장하거나, event ID unique constraint로 재실행을 수렴시키는 것이 일반적이다. 전자는 해당 DB 안에서 원자성을 만들고 후자는 물리 실행이 여러 번이어도 최종 효과를 한 번으로 만든다. 이메일·결제처럼 외부 API가 있다면 provider idempotency key와 operation 조회, outbox/relay, 보상 상태 machine이 필요하다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">5. 실무 설계 판단: 이름보다 요구사항 순서</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#e1e7f7"><th align="left" style="padding:9px;border:1px solid #c4cee8">상황</th><th align="left" style="padding:9px;border:1px solid #c4cee8">권장 출발점</th><th align="left" style="padding:9px;border:1px solid #c4cee8">판단 근거·trade-off</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c4cee8">클릭 telemetry</td><td style="padding:9px;border:1px solid #c4cee8">at-least-once + 집계 시 dedup, 또는 명시한 loss budget</td><td style="padding:9px;border:1px solid #c4cee8">건별 정확성보다 처리량·비용이 중요할 수 있다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4cee8">주문 상태 DB</td><td style="padding:9px;border:1px solid #c4cee8">처리 후 commit + event ID unique/inbox</td><td style="padding:9px;border:1px solid #c4cee8">누락을 피하고 중복 재처리를 DB에서 수렴시킨다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4cee8">Kafka 파생 topic</td><td style="padding:9px;border:1px solid #c4cee8">transactional producer + offsets + read_committed</td><td style="padding:9px;border:1px solid #c4cee8">Kafka 내부 범위의 원자성. open transaction·state log 비용을 운영한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4cee8">결제 API</td><td style="padding:9px;border:1px solid #c4cee8">idempotency key + outbox + 결과 조회/보상</td><td style="padding:9px;border:1px solid #c4cee8">network timeout 뒤 결과가 불확실하므로 Kafka commit만으로 해결 불가.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> ADR 첫 줄에 “exactly-once” 대신 <em>input record ID별 주문 상태 전이는 최종 1회, 알림은 최대 2회 허용</em>처럼 효과와 범위를 쓴다. producer error rate, duplicate suppression count, transaction abort, LSO-HW gap, committed-vs-sink frontier를 함께 본다. chaos test에는 crash 지점과 기대 cardinality를 명시한다.</p>
+  <p><strong>Anti-pattern:</strong> idempotent producer를 end-to-end exactly-once로 확대 해석, <code>read_committed</code>만 켜고 output/offset transaction 누락, auto commit으로 worker queue 완료 추측, event ID 없이 비멱등 API 무한 retry, 중복 0이라는 정상 기간만 보고 계약 검증 완료 선언.</p>
+  <p><strong>Edge case:</strong> dedup TTL보다 늦은 replay, compaction 전 tombstone, transaction timeout, producer fencing, rebalance 후 stale worker, partial batch 처리, DLQ write 성공과 원본 commit 사이의 crash를 별도 설계한다.</p>
+  <p><strong>Version/engine 차이:</strong> Kafka Streams의 exactly-once processing, Kafka Connect connector별 exactly-once, Flink checkpoint는 각 runtime이 관리하는 state·sink capability가 다르다. 이름이 같아도 경계와 실패 모델을 공식 문서로 확인한다. ZooKeeper는 이 보장의 핵심 전제가 아니며 Kafka 4.x에서는 KRaft를 기본으로 본다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffead8"><th style="padding:7px;border:1px solid #e6c6aa">증상</th><th style="padding:7px;border:1px solid #e6c6aa">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e6c6aa">가능한 가설</th><th style="padding:7px;border:1px solid #e6c6aa">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e6c6aa">rollback/복구</th><th style="padding:7px;border:1px solid #e6c6aa">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e6c6aa">Kafka log 중복</td><td style="padding:7px;border:1px solid #e6c6aa">event ID, producer ID/epoch/sequence, retry·timeout, config</td><td style="padding:7px;border:1px solid #e6c6aa">idempotence 충돌 설정 또는 application 이중 send</td><td style="padding:7px;border:1px solid #e6c6aa">producer별 범위 격리, 원본 보존</td><td style="padding:7px;border:1px solid #e6c6aa">key 기반 보정·downstream dedup</td><td style="padding:7px;border:1px solid #e6c6aa">retention/compaction 즉시 변경</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e6c6aa">DB 중복, log 한 건</td><td style="padding:7px;border:1px solid #e6c6aa">topic/partition/offset, sink tx, commit 시각, restart</td><td style="padding:7px;border:1px solid #e6c6aa">처리 후 offset commit 전 crash</td><td style="padding:7px;border:1px solid #e6c6aa">consumer pause, event ID별 효과 대조</td><td style="padding:7px;border:1px solid #e6c6aa">dedup/보상 후 안전 frontier 재개</td><td style="padding:7px;border:1px solid #e6c6aa">group offset 임의 점프</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e6c6aa"><code>read_committed</code> 지연</td><td style="padding:7px;border:1px solid #e6c6aa">LSO/HW, open transaction age, txn ID, coordinator log</td><td style="padding:7px;border:1px solid #e6c6aa">긴/중단 transaction이 LSO 고정</td><td style="padding:7px;border:1px solid #e6c6aa">해당 txn producer·범위 확인</td><td style="padding:7px;border:1px solid #e6c6aa">안전한 abort/fencing 후 재처리</td><td style="padding:7px;border:1px solid #e6c6aa">isolation을 즉시 uncommitted로 완화</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e6c6aa">외부 API 결과 불명</td><td style="padding:7px;border:1px solid #e6c6aa">idempotency/operation ID, request·provider log, timeout</td><td style="padding:7px;border:1px solid #e6c6aa">server 성공 후 response 유실</td><td style="padding:7px;border:1px solid #e6c6aa">동일 ID로 상태 조회</td><td style="padding:7px;border:1px solid #e6c6aa">결과에 따라 commit 또는 보상</td><td style="padding:7px;border:1px solid #e6c6aa">새 ID로 blind retry</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">7. 30분 실습: 하나의 log에서 0회·N회·1회 수렴을 증명</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측</strong><br>
+  input이 event-0 하나일 때 checkpoint를 1로 먼저 옮기면 sink 행 수는? checkpoint 0에서 두 번 처리하면 append sink 행 수와 unique event 수는? “exactly-once”라고 부를 수 있는 범위는 어디까지인지 먼저 적는다.</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker 실행 가능, 공식 Kafka 4.3.1 단일 broker KRaft. 실습 전용 topic/group과 <code>/tmp/day21-*.log</code>만 사용한다.</p>
+  <h3 style="margin:20px 0 8px;color:#304d94">Step 1 · 한 record의 identity 고정</h3>
+  <code style="display:block;padding:10px;background:#131b31;color:#e8edff;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day21.semantics --partitions 1 --replication-factor 1
+printf 'event-0|order-900\n' | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day21.semantics</code>
+
+  <h3 style="margin:20px 0 8px;color:#304d94">Step 2 · At-most-once 모형: checkpoint 먼저</h3>
+  <code style="display:block;padding:10px;background:#131b31;color:#e8edff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group day21-at-most \
+  --topic day21.semantics:0 --reset-offsets --to-offset 1 --execute
+rm -f /tmp/day21-at-most.log</code>
+  <p><strong>실패 주입:</strong> sink write 전에 crash했다고 가정하고 같은 group으로 읽는다. 새 record가 없으므로 출력 없이 대기할 수 있어 <code>Ctrl+C</code>로 종료한다. Kafka에는 event-0이 있지만 sink는 0줄이다. 이는 해당 group→sink 범위의 누락이다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#304d94">Step 3 · At-least-once 모형: 처리 후 commit 전 crash</h3>
+  <code style="display:block;padding:10px;background:#131b31;color:#e8edff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group day21-at-least \
+  --topic day21.semantics:0 --reset-offsets --to-offset 0 --execute
+rm -f /tmp/day21-at-least.log
+printf 'event-0|order-900\n' &gt;&gt; /tmp/day21-at-least.log
+# commit 전에 crash → 같은 offset을 재처리했다고 모사
+printf 'event-0|order-900\n' &gt;&gt; /tmp/day21-at-least.log
+nl -ba /tmp/day21-at-least.log</code>
+  <p><strong>예상:</strong> 물리 처리 행은 2개다. retry는 성공했지만 append sink의 관찰 효과도 2회다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#304d94">Step 4 · Exactly-once effect 모형: ID로 수렴</h3>
+  <code style="display:block;padding:10px;background:#131b31;color:#e8edff;border-radius:7px;white-space:pre-wrap;word-break:break-all">cut -d'|' -f1 /tmp/day21-at-least.log | sort -u \
+  &gt; /tmp/day21-dedup-ids.log
+wc -l /tmp/day21-at-least.log /tmp/day21-dedup-ids.log
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group day21-at-least</code>
+  <p><strong>예상 관찰:</strong> 물리 시도는 2줄, unique event 효과는 1개다. <code>sort -u</code>는 원리를 보여주는 모형이지 production transaction은 아니다. 실제 DB에서는 unique constraint/inbox와 업무 update를 같은 transaction으로 묶는다.</p>
+  <p><strong>자주 나는 오류와 해결:</strong> group reset은 consumer가 active면 거부된다. consumer 종료 후 group state를 확인한다. topic이 이전 실행에서 남았다면 삭제 후 다시 만들거나 고유 이름을 쓴다. output 행 수와 unique event 수를 혼동하지 않는다. production group에는 이 reset 명령을 적용하지 않는다.</p>
+  <p><strong>Cleanup:</strong></p>
+  <code style="display:block;padding:10px;background:#131b31;color:#e8edff;border-radius:7px;white-space:pre-wrap;word-break:break-all">rm -f /tmp/day21-at-most.log /tmp/day21-at-least.log \
+  /tmp/day21-dedup-ids.log
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day21.semantics
+make down</code>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Exactly-once delivery와 effect 구분:</strong> 내부 재시도는 여러 번이어도 최종 효과가 한 번이면 계약을 만족할 수 있다.</li>
+    <li><strong>Producer idempotence 범위:</strong> retry duplicate를 막지 business-level 이중 publish를 막지 않는다.</li>
+    <li><strong>Transaction consumer 조건:</strong> downstream이 <code>read_committed</code>가 아니면 aborted output을 볼 수 있다.</li>
+    <li><strong>외부 sink 경계:</strong> Kafka transaction은 DB/API write를 자동 포함하지 않는다.</li>
+    <li><strong>Dedup 보관 기간:</strong> replay 가능 기간보다 TTL이 짧으면 오래된 event가 다시 효과를 낸다.</li>
+    <li><strong>정확성의 비용:</strong> transaction coordinator, marker, LSO 대기, dedup index, 복구 runbook이 필요하다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. Kafka의 exactly-once를 3분 안에 설명하세요.</strong><br>
+  좋은 답변 구조: 먼저 범위를 질문 → producer idempotence는 log append retry 범위 → Kafka transaction은 output records+input offsets 원자화 → read_committed/LSO → 외부 sink는 협력 필요 → idempotent DB/outbox 대안 → latency·운영 비용.</p>
+  <p><strong>Q2. 주문 시스템에서 at-most와 at-least 중 무엇을 선택합니까?</strong><br>
+  좋은 답변 구조: 누락·중복 비용과 보상 가능성 수치화 → 주문 누락이 더 비싸므로 처리 후 commit → event ID unique/inbox → crash별 replay → duplicate suppression·frontier 관측 → 결제 API idempotency key.</p>
+  <p><strong>Q3. exactly-once인데 중복이 관측됐습니다. 조사 순서는?</strong><br>
+  좋은 답변 구조: 주장 범위와 관찰 지점 확인 → log duplicate vs sink duplicate 분리 → producer sequence/txn ID·isolation·offset·sink ID 수집 → app 이중 send, read_uncommitted, commit-before/after crash, dedup TTL 가설 → pause·증거 보존 → 안전 replay/보상.</p>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#304d94">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>commit-first crash에서 record와 sink는 각각 어떤 상태인가?</li><li>process-first crash에서 중복이 생기는 이유는?</li><li>lag 0이 sink 완료를 증명하지 못하는 이유는?</li></ol>
+  <p style="padding:12px;background:#f2f4fa"><strong>짧은 정답:</strong> ① log에는 남지만 group checkpoint가 건너뛰어 sink는 누락될 수 있다. ② sink는 성공했지만 checkpoint가 뒤라 재배달된다. ③ lag는 log end와 committed offset 차이일 뿐 worker/sink 완료를 모른다.</p>
+  <h3 style="margin:16px 0 8px;color:#304d94">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>idempotent producer가 보장하지 않는 중복 한 가지는?</li><li>Kafka→Kafka transaction의 end-to-end 조건 세 가지는?</li><li>외부 DB exactly-once effect를 만드는 두 설계는?</li></ol>
+  <p style="padding:12px;background:#f2f4fa"><strong>채점 기준:</strong> ① application의 business event 이중 send를 제시(3점). ② output+offset 동일 transaction, commit/abort, downstream read_committed 또는 동등 조건(3점). ③ offset+결과 동일 DB transaction 또는 event ID unique/inbox로 재처리 수렴(4점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#304d94">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/design/design/" style="color:#304d94">Apache Kafka 4.3 Design · Message Delivery Semantics</a> — producer·consumer·transaction 보장 범위</li>
+    <li><a href="https://kafka.apache.org/43/generated/producer_config.html" style="color:#304d94">Apache Kafka 4.3 Producer Configs</a> — acks·retry·idempotence 조건</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html" style="color:#304d94">KafkaConsumer 4.3.1 API</a> — position·commit·read_committed·LSO</li>
+    <li><a href="https://kafka.apache.org/43/implementation/distribution/" style="color:#304d94">Kafka Distribution</a> — committed record와 group offset tracking</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#263a69;color:#fff;border-radius:10px"><strong>내일 예고 · Day 22 · Week 4</strong><br>leader, follower, ISR을 상태로 이해 — 복제 역할 이름을 외우지 않고 누가 write를 받고, 무엇을 따라가며, 언제 ISR 상태가 바뀌는지 추적한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>

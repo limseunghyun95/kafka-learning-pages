@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-21T09:00:17+09:00",
+  "updatedAt": "2026-08-22T09:10:53+09:00",
   "lessons": [
     {
       "day": 1,
@@ -185,6 +185,15 @@
       "path": "day-20.html",
       "kind": "lab",
       "publishedAt": "2026-08-21T09:00:17+09:00"
+    },
+    {
+      "day": 21,
+      "week": 3,
+      "title": "회상: at-most/at-least/exactly-once 범위 구분",
+      "summary": "producer→log, log→consumer, consumer→sink 경계를 분리해 세 delivery semantics의 상태 소유자·crash window·원자성·멱등성 범위를 면접과 실무 관점으로 복습합니다.",
+      "path": "day-21.html",
+      "kind": "review",
+      "publishedAt": "2026-08-22T09:10:53+09:00"
     }
   ]
 }
