@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-22T09:10:53+09:00",
+  "updatedAt": "2026-08-23T09:32:37+09:00",
   "lessons": [
     {
       "day": 1,
@@ -194,6 +194,15 @@
       "path": "day-21.html",
       "kind": "review",
       "publishedAt": "2026-08-22T09:10:53+09:00"
+    },
+    {
+      "day": 22,
+      "week": 4,
+      "title": "leader/follower fetch와 ISR",
+      "summary": "partition leader의 append 경로와 follower pull replication, ISR shrink/expand, KRaft metadata 전이, OS·network 병목 및 Kafka 4.x ELR 차이를 연결해 학습합니다.",
+      "path": "day-22.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-23T09:32:37+09:00"
     }
   ]
 }

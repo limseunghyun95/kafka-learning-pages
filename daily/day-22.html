@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 22 · leader/follower fetch와 ISR</title>
+</head>
+<body style="margin:0;background:#eef4f8;color:#172331;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef4f8"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d5e2ea;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#174d6b;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#a8d8ef;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 4 / DAY 22 · REPLICATION</div>
+  <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">leader/follower fetch와 ISR</h1>
+  <p style="margin:0;color:#dff2fb">복제본의 역할 이름이 아니라 pull loop·상태 전이·선출 자격으로 이해하기 · 이론 65분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#eaf6fb;border-left:5px solid #2684ad;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Producer write는 partition leader가 순서를 정하고, follower는 leader에게 반복적으로 fetch해 같은 log를 복제한다. <strong>ISR은 고정된 replica 목록이 아니라 현재 충분히 따라온 replica의 동적 집합</strong>이며, 안전한 write·leader election·consumer visibility의 기준에 관여한다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #cfe0e8"><strong>Replica</strong></td><td style="padding:10px;border:1px solid #cfe0e8">하나의 topic partition log를 가진 복제본. replication factor가 3이면 그 partition의 replica가 세 broker에 배치된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Leader replica</strong></td><td style="padding:10px;border:1px solid #cfe0e8">현재 partition의 쓰기 순서를 결정하는 replica. 일반 producer와 consumer 요청은 이 leader를 향한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Follower replica</strong></td><td style="padding:10px;border:1px solid #cfe0e8">leader log를 복제하는 replica. leader가 데이터를 push하는 것이 아니라 follower가 자신의 다음 offset을 담아 fetch한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Replication factor</strong></td><td style="padding:10px;border:1px solid #cfe0e8">partition에 할당된 전체 replica 수. 설정·assignment의 크기이며 현재 건강 상태가 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>ISR</strong></td><td style="padding:10px;border:1px solid #cfe0e8">In-Sync Replicas. leader를 포함해 현재 leader log를 충분히 따라오는 replica 집합. 장애·지연에 따라 줄고 회복하면 늘어난다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>LEO</strong></td><td style="padding:10px;border:1px solid #cfe0e8">Log End Offset. 각 replica log에서 다음에 append할 위치. 같은 partition이어도 복제 중에는 replica별 LEO가 다를 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>HW</strong></td><td style="padding:10px;border:1px solid #cfe0e8">High Watermark. 복제 안전성 때문에 일반 consumer에게 공개할 수 있는 경계. 단순 leader LEO와 다르다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Replica lag</strong></td><td style="padding:10px;border:1px solid #cfe0e8">follower가 leader보다 뒤처진 정도. bytes·offset·시간으로 볼 수 있으며 느린 disk/network/fetch thread가 원인이 될 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>KRaft controller</strong></td><td style="padding:10px;border:1px solid #cfe0e8">broker 등록, partition leader·ISR 같은 cluster metadata의 변경을 관리하는 controller quorum의 역할. record data path를 직접 운반하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>ELR</strong></td><td style="padding:10px;border:1px solid #cfe0e8">Eligible Leader Replicas. Kafka 4.x의 KIP-966 계열 기능으로, 엄격한 min ISR 조건 아래 안전성을 보존하며 선출 후보를 확장하는 별도 metadata 집합이다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">2. 왜 중요한가</h2>
+  <p><code>replication.factor=3</code>이라고 화면에 보인다는 이유만으로 지금 세 copy가 모두 안전하다고 말할 수 없다. 한 follower의 disk가 느리거나 network가 단절되면 assignment는 3인 채 ISR은 2 또는 1로 줄 수 있다. 이 차이를 모르면 under-replicated partition 경보를 무시하거나, 반대로 정상적인 leader 이동을 데이터 유실로 오판한다.</p>
+  <p>면접에서 “leader는 쓰고 follower는 복제한다”로 끝내면 얕다. 강한 답은 <strong>follower pull 경로, replica별 LEO, ISR 상태 전이의 증거, write 성공이 확정되는 지점, controller가 바꾸는 metadata, leader 장애 시 선출 후보</strong>를 연결하고 durability와 availability의 비용을 설명한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">3. Architecture: produce와 follower fetch의 두 경로</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:27%;padding:12px;background:#1f6688;color:#fff;border-radius:8px"><strong>1 · Producer</strong></td><td style="padding:12px;background:#eaf6fb">metadata로 P0 leader=B1 확인 → ProduceRequest(batch)</td></tr>
+    <tr><td colspan="2" align="center" style="color:#2684ad;font-weight:800">↓ DATA PATH: client → B1 leader</td></tr>
+    <tr><td style="padding:12px;background:#1f6688;color:#fff;border-radius:8px"><strong>2 · Leader B1</strong></td><td style="padding:12px;background:#eaf6fb">batch 검증 → P0 log에 순서대로 append → LEO 전진</td></tr>
+    <tr><td colspan="2" align="center" style="color:#55758a;font-weight:800">↑ REPLICA FETCH: B2/B3가 자신의 offset부터 요청</td></tr>
+    <tr><td style="padding:12px;background:#3b647a;color:#fff;border-radius:8px"><strong>3 · Followers</strong></td><td style="padding:12px;background:#edf3f6">B2·B3가 bytes를 받아 local log append → 각 LEO 보고</td></tr>
+    <tr><td colspan="2" align="center" style="color:#27836f;font-weight:800">↓ ISR의 replica들이 적용한 범위까지 commit/HW 전진</td></tr>
+    <tr><td style="padding:12px;background:#196758;color:#fff;border-radius:8px"><strong>4 · Ack/Fetch</strong></td><td style="padding:12px;background:#eaf8f4">acks 조건 충족 시 producer 응답, consumer는 안전한 공개 범위 fetch</td></tr>
+    <tr><td colspan="2" align="center" style="color:#b06a25;font-weight:800">↕ CONTROL PATH: ISR shrink/expand·leader change metadata</td></tr>
+    <tr><td style="padding:12px;background:#7e4b20;color:#fff;border-radius:8px"><strong>5 · Controller</strong></td><td style="padding:12px;background:#fff4e7">KRaft metadata log에 partition state 변경 기록 → brokers에 전파</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>Metadata:</strong> producer는 모든 replica에 쓰지 않고 현재 leader endpoint를 찾는다.</li>
+    <li><strong>Append:</strong> leader가 partition 내 순서의 단일 기준이다. page cache·segment에 batch가 append된다.</li>
+    <li><strong>Pull:</strong> follower fetcher가 “내 LEO부터” 요청하므로 backpressure가 자연스럽고 leader는 여러 follower 속도를 각각 관찰한다.</li>
+    <li><strong>Progress:</strong> follower가 fetch를 반복하며 따라오면 leader는 replica 상태를 갱신한다. 충분히 뒤처지면 ISR에서 제외하고 회복하면 다시 포함한다.</li>
+    <li><strong>Metadata transition:</strong> ISR/leader 변경은 KRaft controller가 cluster metadata로 확정·전파한다. data batch가 controller를 통과하는 것은 아니다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#1f6688">상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcecf3"><th align="left" style="padding:9px;border:1px solid #bfd5df">상태</th><th align="left" style="padding:9px;border:1px solid #bfd5df">소유자</th><th align="left" style="padding:9px;border:1px solid #bfd5df">핵심 불변식</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">Replica assignment</td><td style="padding:9px;border:1px solid #bfd5df">KRaft metadata</td><td style="padding:9px;border:1px solid #bfd5df">partition을 저장하도록 배정된 전체 broker 목록.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">Leader</td><td style="padding:9px;border:1px solid #bfd5df">partition metadata</td><td style="padding:9px;border:1px solid #bfd5df">한 epoch에서 write ordering authority는 하나다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">Replica LEO</td><td style="padding:9px;border:1px solid #bfd5df">각 broker local log</td><td style="padding:9px;border:1px solid #bfd5df">replica마다 다를 수 있고 fetch/apply로 단조 전진한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">ISR</td><td style="padding:9px;border:1px solid #bfd5df">leader 관찰 + controller metadata</td><td style="padding:9px;border:1px solid #bfd5df">현재 충분히 따라온 replica의 동적 선출·commit 집합.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">HW</td><td style="padding:9px;border:1px solid #bfd5df">partition replica state</td><td style="padding:9px;border:1px solid #bfd5df">복제 조건을 만족해 consumer에게 안전하게 공개할 경계.</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">왜 follower가 pull하는가</h3>
+  <p>Follower는 자신의 처리 속도에 맞춰 fetch하므로 leader가 follower별 push queue와 재전송 상태를 과도하게 관리하지 않아도 된다. fetch request에는 다음 필요한 offset이 포함되고 response는 연속 log bytes다. 이는 Kafka consumer fetch와 유사한 sequential I/O·batching 이점을 갖는다. 느린 follower는 request 주기와 LEO 진척으로 드러난다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">ISR state transition</h3>
+  <p>Replica가 assignment에 남아 있어도 fetch가 끊기거나 leader LEO를 충분히 따라오지 못한 상태가 <code>replica.lag.time.max.ms</code> 이상 지속되면 ISR에서 빠질 수 있다. 반대로 lagging replica가 leader의 최신 범위까지 따라잡고 조건을 만족하면 ISR에 다시 들어온다. ISR shrink는 데이터 삭제가 아니라 <strong>현재 동기화·선출 자격의 변화</strong>다.</p>
+  <p>상태 전이는 보통 <code>ISR 3 → 2 → 1</code>처럼 보이며, replication factor는 계속 3이다. ISR이 줄면 남은 replica가 더 적어 durability margin이 감소하고, <code>acks=all</code>과 <code>min.insync.replicas</code>에 따라 write availability가 달라진다. 세부 상호작용은 Day 24에서 수치로 다룬다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">Network·OS 비용</h3>
+  <p>복제는 broker 간 TCP, follower fetcher thread, leader network/request thread, page cache, disk append를 함께 소비한다. follower disk latency가 증가하면 fetch response를 받아도 local append 진척이 느려지고 replica lag가 커진다. 네트워크 포화·packet loss·broker GC pause도 같은 증상으로 보일 수 있으므로 ISR 결과만 보고 disk 장애로 단정하면 안 된다.</p>
+  <p>Replication factor를 늘리면 storage와 inter-broker network bytes가 비례해 늘고 leader가 관리할 fetch traffic도 증가한다. 대신 leader 장애 후 committed data를 가진 후보가 늘어난다. 이것이 분산 시스템의 durability·availability·cost trade-off다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">Kafka 4.x ELR 주의</h3>
+  <p>Kafka 4.0부터 ELR 기능이 제공되고 새 Kafka 4.1+ cluster에서는 기본 활성화되는 구성이 있다. ELR은 ISR과 같은 말이 아니다. 엄격한 min ISR 규칙으로 안전성이 확보된 특정 replica를 KRaft metadata에 별도 후보로 기록한다. 면접에서는 기본 ISR 모델을 설명한 뒤 “4.x에서는 ELR이 선출 후보를 보완하므로 cluster 설정과 공식 문서를 확인한다”고 범위를 명시하는 편이 정확하다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcecf3"><th align="left" style="padding:9px;border:1px solid #bfd5df">판단</th><th align="left" style="padding:9px;border:1px solid #bfd5df">권장 출발점</th><th align="left" style="padding:9px;border:1px solid #bfd5df">이유·trade-off</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">중요 production topic</td><td style="padding:9px;border:1px solid #bfd5df">RF 3, rack awareness, 다중 AZ 배치 검토</td><td style="padding:9px;border:1px solid #bfd5df">한 broker/AZ 장애가 replica 전체를 동시에 잃지 않게 한다. 비용·cross-AZ traffic 증가.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">ISR shrink 경보</td><td style="padding:9px;border:1px solid #bfd5df">leader/follower별 disk·network·fetch lag와 controller event 동시 수집</td><td style="padding:9px;border:1px solid #bfd5df">증상만으로 원인을 단정하지 않고 병목 계층을 분리한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">복구 우선순위</td><td style="padding:9px;border:1px solid #bfd5df">blast radius 제한 → healthy leader 보호 → lagging replica 회복</td><td style="padding:9px;border:1px solid #bfd5df">무리한 restart/reassignment가 leader까지 포화시키는 연쇄 장애를 막는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">용량 계획</td><td style="padding:9px;border:1px solid #bfd5df">steady state가 아니라 broker 1대 장애 시 network/disk headroom 계산</td><td style="padding:9px;border:1px solid #bfd5df">복구 fetch와 leader 이동이 동시에 발생하는 최악 구간을 버틴다.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> topic describe의 <code>Replicas</code>와 <code>Isr</code>를 별도 필드로 수집한다. under-replicated partitions, ISR shrink/expand rate, follower lag, replica fetcher throughput, disk latency, network saturation, broker registration/fencing event를 같은 timeline에 놓는다. 배포 전 broker 한 대 상실 시에도 min ISR과 SLO를 만족하는지 계산한다.</p>
+  <p><strong>Anti-pattern:</strong> RF=3을 현재 copy 3개 건강으로 해석, ISR shrink마다 모든 broker 동시 restart, follower lag 원인 확인 없이 throttling 해제, 복구 중 대규모 reassignment 병행, controller와 partition leader를 같은 역할로 설명.</p>
+  <p><strong>Edge case:</strong> low-throughput topic에서 fetch wait와 lag timeout의 관계, tiered storage follower bootstrap, disk 교체 후 대량 catch-up, preferred leader rebalance, ELR enablement·migration 상태, rack 정보 누락을 확인한다.</p>
+  <p><strong>Version/engine 차이:</strong> Kafka 4.3 KRaft와 ELR-aware 문서를 기준으로 한다. ZooKeeper 기반 legacy cluster의 controller metadata 저장·전파 경로는 다르지만 partition leader/follower data replication의 핵심 정신 모델은 유사하다. Managed Kafka는 일부 broker metrics/config를 감추므로 provider의 등가 지표를 매핑한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffead6"><th style="padding:7px;border:1px solid #e5c5a5">증상</th><th style="padding:7px;border:1px solid #e5c5a5">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e5c5a5">가능한 가설</th><th style="padding:7px;border:1px solid #e5c5a5">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e5c5a5">rollback/복구</th><th style="padding:7px;border:1px solid #e5c5a5">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">ISR 3→2</td><td style="padding:7px;border:1px solid #e5c5a5">topic describe, follower lag, fetch rate, disk latency, network, GC, controller event</td><td style="padding:7px;border:1px solid #e5c5a5">broker down, disk/network 포화, fetcher stall</td><td style="padding:7px;border:1px solid #e5c5a5">영향 broker·partition 격리, leader headroom 보호</td><td style="padding:7px;border:1px solid #e5c5a5">원인 제거 후 follower catch-up·ISR expand 확인</td><td style="padding:7px;border:1px solid #e5c5a5">cluster 전체 동시 restart</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">ISR 반복 출입</td><td style="padding:7px;border:1px solid #e5c5a5">shrink/expand rate, lag 시간 분포, fetch wait/timeout, traffic</td><td style="padding:7px;border:1px solid #e5c5a5">임계값 근처 jitter, 간헐 disk stall</td><td style="padding:7px;border:1px solid #e5c5a5">변경 중지, offending broker 자원 timeline 비교</td><td style="padding:7px;border:1px solid #e5c5a5">병목 해소·headroom 확보 후 임계값 재평가</td><td style="padding:7px;border:1px solid #e5c5a5">원인 없이 timeout만 확대</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">leader 없음</td><td style="padding:7px;border:1px solid #e5c5a5">leader/ISR/ELR, broker registration, fencing, election log</td><td style="padding:7px;border:1px solid #e5c5a5">모든 안전 후보 offline, election 진행</td><td style="padding:7px;border:1px solid #e5c5a5">안전 후보 복구와 metadata quorum 건강 확인</td><td style="padding:7px;border:1px solid #e5c5a5">ISR/ELR replica 우선 복귀·선출 확인</td><td style="padding:7px;border:1px solid #e5c5a5">증거 없이 unclean election 허용</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">복구 traffic 폭증</td><td style="padding:7px;border:1px solid #e5c5a5">replica fetch bytes, disk queue, leader request latency, throttle</td><td style="padding:7px;border:1px solid #e5c5a5">대량 catch-up이 client traffic 경쟁</td><td style="padding:7px;border:1px solid #e5c5a5">복구 동시성·속도 제한, SLO traffic 우선</td><td style="padding:7px;border:1px solid #e5c5a5">단계적 catch-up 후 throttle 원복</td><td style="padding:7px;border:1px solid #e5c5a5">모든 replica 무제한 동시 복구</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">7. 30분 실습: Replicas와 ISR을 다른 상태로 읽기</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측</strong><br>
+  현재 local cluster가 broker 1대라면 RF=1 topic의 Leader·Replicas·Isr은 무엇일까? RF=2 생성은 왜 실패할까? broker를 중지하면 “ISR이 0”이라는 결과를 받을까, 아니면 metadata를 물어볼 broker 자체가 없어질까?</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker 실행 가능, 공식 Kafka 4.3.1 단일 broker KRaft. 이 실습은 구조 읽기에 집중하며 실제 follower lag/ISR shrink는 Week 4 통합 랩에서 다중 broker로 관찰한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 1 · 단일 replica의 세 필드 확인</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day22.replication --partitions 1 --replication-factor 1
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic day22.replication</code>
+  <p><strong>예상:</strong> <code>Leader: 1</code>, <code>Replicas: 1</code>, <code>Isr: 1</code>처럼 같은 broker가 세 필드에 나타난다. 의미는 각각 현재 ordering authority, assignment, 현재 in-sync 집합으로 다르다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 2 · RF는 물리 broker 수를 넘을 수 없음</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create \
+  --topic day22.rf2-fail --partitions 1 --replication-factor 2</code>
+  <p><strong>실패 주입·예상:</strong> broker가 하나뿐이므로 replication factor 2를 만족할 수 없다는 오류가 난다. 같은 broker에 두 copy를 두는 방식은 broker failure domain을 분리하지 못하므로 Kafka replica assignment가 허용하지 않는다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 3 · log directory 관점 확인</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">printf 'r0\nr1\nr2\n' | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day22.replication
+docker compose exec broker /opt/kafka/bin/kafka-log-dirs.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --topic-list day22.replication</code>
+  <p><strong>예상 관찰:</strong> broker 1의 local replica path·size와 replica lag 정보가 보인다. RF=1 leader replica라 lag는 follower 비교 증거가 아니다. 다중 broker에서는 broker별 replica 상태를 비교해야 한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 4 · broker 중단과 관측 경계</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose stop broker
+docker compose ps
+docker compose start broker
+make status
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic day22.replication</code>
+  <p><strong>예상:</strong> broker가 멈춘 동안에는 질의 endpoint가 없어 describe 자체가 실패한다. 다시 시작하면 RF=1 replica가 leader이자 ISR로 복구된다. 이것은 고가용성 실험이 아니라 단일 broker 구성의 한계를 증명한다.</p>
+  <p><strong>자주 나는 오류와 해결:</strong> startup 직후 connection 오류는 <code>make status</code>가 healthy가 될 때까지 기다린다. RF2 생성 실패 topic은 생성되지 않았으므로 cleanup에서 없어도 정상이다. broker ID 출력은 compose 설정을 기준으로 달라질 수 있으니 숫자 자체보다 세 필드 관계를 본다.</p>
+  <p><strong>Cleanup:</strong></p>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day22.replication
+make down</code>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>RF ≠ ISR 크기:</strong> RF는 assignment, ISR은 현재 건강한 동적 집합이다.</li>
+    <li><strong>Follower는 standby read replica가 아님:</strong> 일반 consumer read를 분산하는 역할로 단순 해석하지 않는다.</li>
+    <li><strong>ISR 제외 ≠ replica 삭제:</strong> follower log와 assignment는 남고 catch-up 후 재진입할 수 있다.</li>
+    <li><strong>Controller ≠ data leader:</strong> controller는 metadata control path, partition leader는 record data path를 담당한다.</li>
+    <li><strong>Leader LEO ≠ consumer visibility:</strong> 복제 안전 경계 HW를 구분해야 한다.</li>
+    <li><strong>ISR 모델만으로 4.x 선출을 단정 금지:</strong> ELR 활성화 여부와 metadata를 확인한다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. Kafka replication data path를 설명하세요.</strong><br>
+  좋은 답변 구조: partition leader가 ordering 소유 → producer는 leader에 batch write → follower가 next offset으로 pull → local append·LEO 보고 → ISR commit/HW → ack·consumer visibility → network/disk 병목과 batching 비용.</p>
+  <p><strong>Q2. RF=3인데 ISR=2입니다. 데이터가 유실된 건가요?</strong><br>
+  좋은 답변 구조: assignment와 runtime state 구분 → 즉시 유실 단정 금지 → leader/ISR/LEO·HW·lag·controller event 수집 → broker/disk/network/GC 가설 → min ISR·acks에 따른 write 결과 → follower 안전 복구 → unclean election 금지.</p>
+  <p><strong>Q3. 3 replicas로 broker 한 대 장애를 견디는 설계를 하세요.</strong><br>
+  좋은 답변 구조: failure domain/AZ 가정 → RF3 rack-aware 배치 → acks=all·min ISR2 → 정상/1대/2대 장애 표 → durability와 write availability trade-off → 장애 시 headroom·catch-up throttle → Kafka 4.x ELR 설정 확인.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#1f6688">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>idempotent producer가 닫는 중복 범위는?</li><li>Kafka→Kafka exactly-once의 세 조건은?</li><li>외부 DB 효과를 1회로 수렴시키는 두 방법은?</li></ol>
+  <p style="padding:12px;background:#f2f6f8"><strong>짧은 정답:</strong> ① producer retry의 log 중복 append. ② output records+input offsets 동일 transaction, commit/abort, downstream read_committed. ③ 결과+offset 동일 DB transaction 또는 event ID unique/inbox로 멱등 수렴.</p>
+  <h3 style="margin:16px 0 8px;color:#1f6688">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>Follower가 push 대신 fetch하는 구조의 장점은?</li><li>RF=3, Replicas=[1,2,3], ISR=[1,2]에서 broker 3의 상태를 설명하라.</li><li>ISR shrink 때 가장 먼저 함께 볼 OS/network 증거는?</li></ol>
+  <p style="padding:12px;background:#f2f6f8"><strong>채점 기준:</strong> ① follower 속도 기반 backpressure·offset 기반 연속 복제(3점). ② assignment에는 남지만 현재 충분히 따라오지 못해 ISR/기본 선출 집합 밖임을 설명(3점). ③ follower lag/fetch rate, disk latency·queue, network saturation/loss, GC와 controller event를 timeline으로 제시(4점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/design/design/" style="color:#1f6688">Apache Kafka 4.3 Design · Replicated Logs</a> — leader, follower, ISR, commit 모델</li>
+    <li><a href="https://kafka.apache.org/43/generated/kafka_config.html" style="color:#1f6688">Apache Kafka 4.3 Broker Configs</a> — replica fetch·lag·min ISR 설정</li>
+    <li><a href="https://kafka.apache.org/43/operations/basic-kafka-operations/" style="color:#1f6688">Basic Kafka Operations</a> — topic describe·replica·leadership 운영</li>
+    <li><a href="https://kafka.apache.org/43/operations/eligible-leader-replicas/" style="color:#1f6688">Eligible Leader Replicas</a> — Kafka 4.x ELR 동작과 선출 순서</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#174d6b;color:#fff;border-radius:10px"><strong>내일 예고 · Day 23</strong><br>LEO, HW, leader epoch — replica별 log 끝과 consumer 공개 경계, leader 교체 세대를 숫자 timeline으로 연결한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>
