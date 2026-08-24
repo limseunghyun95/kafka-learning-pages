@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 23 · LEO, HW, leader epoch</title>
+</head>
+<body style="margin:0;background:#eef4f8;color:#172331;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef4f8"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d5e2ea;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#174d6b;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#a8d8ef;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 4 / DAY 23 · CONSISTENCY</div>
+  <h1 style="margin:10px 0 8px;font-size:30px;line-height:1.25">LEO, HW, leader epoch</h1>
+  <p style="margin:0;color:#dff2fb">log의 끝·안전 공개 경계·leader 세대를 하나의 장애 복구 모델로 연결하기 · 이론 70분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#eaf6fb;border-left:5px solid #2684ad;border-radius:10px"><strong>한 줄 요약</strong><br>
+  <strong>LEO</strong>는 replica마다 다른 “다음 append 위치”, <strong>HW</strong>는 복제 조건을 만족해 일반 consumer가 읽을 수 있는 안전 경계, <strong>leader epoch</strong>는 leader가 바뀔 때 증가하는 세대 번호다. 세 값을 함께 봐야 “어디까지 존재하고, 어디까지 확정됐으며, 어느 leader의 기록인가”를 답할 수 있다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #cfe0e8"><strong>Offset</strong></td><td style="padding:10px;border:1px solid #cfe0e8">partition 안 record의 위치를 가리키는 증가하는 정수. 이 자료에서 경계값 105는 “offset 105가 존재한다”가 아니라 “다음 위치가 105이므로 0~104가 존재한다”는 뜻이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Replica</strong></td><td style="padding:10px;border:1px solid #cfe0e8">하나의 partition log 사본. leader와 follower 각각이 local log와 local end를 가진다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>LEO</strong></td><td style="padding:10px;border:1px solid #cfe0e8">Log End Offset. 해당 replica에서 다음 record가 append될 위치. partition 공통값이 아니라 replica-local 값이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>HW</strong></td><td style="padding:10px;border:1px solid #cfe0e8">High Watermark. 복제 안전 조건을 만족한 log의 상한 경계. 일반 consumer는 offset이 HW보다 작은 record만 읽는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Leader epoch</strong></td><td style="padding:10px;border:1px solid #cfe0e8">partition leader 세대 번호. leader가 새로 선출되면 증가하며, 오래된 metadata를 가진 client·replica를 fencing하고 서로 다른 tail을 비교하는 기준이 된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Fencing</strong></td><td style="padding:10px;border:1px solid #cfe0e8">낡은 세대의 주체가 계속 명령하지 못하게 거부하는 안전 장치. 울타리 밖으로 밀어낸다는 뜻이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>ISR</strong></td><td style="padding:10px;border:1px solid #cfe0e8">In-Sync Replicas. leader를 충분히 따라온 replica의 동적 집합. HW 전진과 안전한 leader 후보 판단에 관여한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Truncation</strong></td><td style="padding:10px;border:1px solid #cfe0e8">새 leader의 역사와 충돌하는 follower tail을 공통 지점까지 잘라내는 복구. 임의 데이터 삭제가 아니라 하나의 순서를 회복하기 위한 상태 전이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>LSO</strong></td><td style="padding:10px;border:1px solid #cfe0e8">Last Stable Offset. 진행 중 transaction 때문에 <code>read_committed</code> consumer가 넘지 못하는 경계. HW와 다른 축이며 보통 <code>LSO ≤ HW ≤ LEO</code>로 생각한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Control path</strong></td><td style="padding:10px;border:1px solid #cfe0e8">KRaft controller가 leader·epoch·ISR metadata를 확정해 전파하는 길. record bytes가 흐르는 data path와 구분한다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">2. 왜 중요한가</h2>
+  <p>“leader에 record가 append됐다”는 사실만으로 consumer가 읽을 수 있거나 장애 뒤 살아남는다고 단정할 수 없다. leader LEO가 105여도 HW가 101이면 offset 101~104는 아직 leader에만 있거나 일부 replica에만 있어 일반 consumer에게 공개되지 않는다. 이 구간에서 leader가 죽으면 새 leader의 안전한 역사에 맞춰 tail이 잘릴 수 있다.</p>
+  <p>반대로 HW만 보면 누가 현재 ordering authority인지 알 수 없다. network partition으로 오래된 leader가 살아 있다고 착각할 때 leader epoch가 낡은 요청을 거부하지 않으면 두 leader가 동시에 쓰는 split-brain 위험이 생긴다. Kafka는 <strong>offset 경계와 epoch 세대</strong>를 조합해 하나의 partition history를 유지한다.</p>
+  <p>면접에서 강한 답은 숫자를 정확히 쓴다. “LEO는 마지막 offset”이라고 뭉개지 않고 next-offset convention을 선언하고, <strong>상태 소유자 → 불변식 → 성공 확정 시점 → failure window → 복구 truncation → 비용</strong> 순으로 설명한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">3. Architecture: append에서 epoch 기반 복구까지</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:27%;padding:12px;background:#1f6688;color:#fff;border-radius:8px"><strong>1 · Producer</strong></td><td style="padding:12px;background:#eaf6fb">epoch 7의 leader B1에 ProduceRequest → batch append</td></tr>
+    <tr><td colspan="2" align="center" style="color:#2684ad;font-weight:800">&#8595; DATA PATH · B1 LEO 101 → 105</td></tr>
+    <tr><td style="padding:12px;background:#3b647a;color:#fff;border-radius:8px"><strong>2 · Followers</strong></td><td style="padding:12px;background:#edf3f6">B2 LEO=103, B3 LEO=101에서 각자 FetchRequest</td></tr>
+    <tr><td colspan="2" align="center" style="color:#27836f;font-weight:800">&#8595; 공통 복제 경계 · HW=101, offsets &lt; 101 공개</td></tr>
+    <tr><td style="padding:12px;background:#196758;color:#fff;border-radius:8px"><strong>3 · Consumer</strong></td><td style="padding:12px;background:#eaf8f4">HW까지만 fetch. leader에만 있는 101~104는 아직 숨김</td></tr>
+    <tr><td colspan="2" align="center" style="color:#b06a25;font-weight:800">&#8595; B1 장애 · CONTROL PATH에서 B2 선출, epoch 8</td></tr>
+    <tr><td style="padding:12px;background:#7e4b20;color:#fff;border-radius:8px"><strong>4 · KRaft</strong></td><td style="padding:12px;background:#fff4e7">leader=B2, leaderEpoch=8 metadata 확정·전파</td></tr>
+    <tr><td colspan="2" align="center" style="color:#8051a8;font-weight:800">&#8595; OffsetForLeaderEpoch · 공통 역사 끝을 질의</td></tr>
+    <tr><td style="padding:12px;background:#5f4080;color:#fff;border-radius:8px"><strong>5 · Recovery</strong></td><td style="padding:12px;background:#f4ecfb">낡거나 divergent한 tail을 안전 지점까지 truncate → epoch 8 leader에서 다시 fetch</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>Append:</strong> epoch 7 leader B1이 새 batch의 partition 순서를 정한다. leader local LEO는 가장 먼저 전진할 수 있다.</li>
+    <li><strong>Replication:</strong> followers는 자신의 LEO를 next fetch offset으로 보내 연속 bytes를 복제한다. 따라서 한 순간에 LEO가 서로 다를 수 있다.</li>
+    <li><strong>Visibility:</strong> leader는 ISR replica들의 진척을 관찰해 HW를 전진시킨다. 예시는 next-offset convention이므로 HW=101이면 offset 100까지 공개된다.</li>
+    <li><strong>Election:</strong> B1 장애를 KRaft controller가 처리해 B2를 새 leader로 정하고 leader epoch를 8로 올린다. clients는 새 metadata를 받아야 한다.</li>
+    <li><strong>Reconciliation:</strong> 복귀 replica는 epoch별 end offset을 비교한다. 자기 tail이 새 leader history와 충돌하면 공통 지점까지 truncate하고 다시 fetch한다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#1f6688">상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcecf3"><th align="left" style="padding:9px;border:1px solid #bfd5df">상태</th><th align="left" style="padding:9px;border:1px solid #bfd5df">소유자</th><th align="left" style="padding:9px;border:1px solid #bfd5df">핵심 불변식</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">LEO</td><td style="padding:9px;border:1px solid #bfd5df">각 replica local log</td><td style="padding:9px;border:1px solid #bfd5df">next append 위치다. 정상 append 중 단조 증가하지만 recovery truncation에서는 뒤로 갈 수 있다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">HW</td><td style="padding:9px;border:1px solid #bfd5df">leader가 계산·replica에 전파하는 partition state</td><td style="padding:9px;border:1px solid #bfd5df">offset &lt; HW 범위는 현재 복제 규칙상 안전 공개 범위다. HW는 LEO를 넘지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">Leader epoch</td><td style="padding:9px;border:1px solid #bfd5df">KRaft partition metadata + replica epoch cache</td><td style="padding:9px;border:1px solid #bfd5df">새 leader 세대마다 증가한다. 작은 current epoch 요청은 fenced된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">Epoch start/end</td><td style="padding:9px;border:1px solid #bfd5df">leader epoch sequence</td><td style="padding:9px;border:1px solid #bfd5df">각 epoch가 담당한 offset 구간을 비교해 공통 history와 truncate 지점을 찾는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">Committed consumer offset</td><td style="padding:9px;border:1px solid #bfd5df">consumer group coordinator</td><td style="padding:9px;border:1px solid #bfd5df">처리 재시작 위치다. log 복제 경계 HW와 목적·소유자가 다르다.</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">LEO: 마지막 record가 아니라 다음 칸</h3>
+  <p>offset 0~104가 local log에 있으면 LEO는 105다. 이 정의를 쓰면 log 길이와 range 계산이 자연스럽다. follower는 <code>fetchOffset=105</code>로 “105부터 달라”고 요청한다. 운영 도구가 <code>logEndOffset=105</code>를 보여줄 때 record 105가 이미 있다는 뜻으로 해석하면 lag를 1씩 틀리게 계산한다.</p>
+  <p>LEO는 replica-local이다. B1=105, B2=103, B3=101이면 B2는 두 record, B3는 네 record 뒤처져 있다. 단, offset 차이만으로 시간·bytes 비용은 알 수 없다. 큰 batch 하나와 작은 records 수천 개가 다른 비용을 만들므로 bytes lag, fetch latency, disk queue를 함께 본다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">HW: “존재”와 “안전하게 보임”을 분리</h3>
+  <p>Leader append는 local 존재를 만들고 follower replication은 failure domain을 넘는 안전성을 만든다. Kafka는 이 둘 사이를 HW로 구분한다. 일반 read-uncommitted consumer도 HW를 넘는 leader-only tail을 읽지 않으므로, 읽은 record가 곧 leader failover로 사라지는 현상을 막는다.</p>
+  <p>Follower fetch response는 data뿐 아니라 leader HW도 전달한다. follower가 local LEO까지 append했다고 즉시 동일 HW를 아는 것은 아니며 fetch round-trip을 거쳐 state가 전파된다. 이 때문에 아주 짧은 시점에는 leader와 follower가 관찰한 HW가 다를 수 있다. 분산 시스템에서는 값뿐 아니라 <strong>누가 언제 관찰했는지</strong>가 중요하다.</p>
+  <p>Kafka 4.x ELR이 활성화되면 strict min ISR 규칙 때문에 ISR 크기가 <code>min.insync.replicas</code>보다 작을 때 data partition HW가 전진하지 않는 동작이 중요해진다. 이 안전성으로 일부 non-ISR replica도 eligible leader로 추적할 수 있다. 그러므로 “HW는 무조건 현재 ISR LEO의 단순 최솟값”이라는 한 줄 공식은 version·feature 조건을 놓친다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">Leader epoch: term과 log history</h3>
+  <p>Leader epoch는 Raft의 term과 비슷한 세대 개념이지만 data partition replication은 KRaft metadata quorum 자체와 동일한 log가 아니다. KRaft controller가 partition leader·epoch metadata를 관리하고, 각 broker는 실제 record log와 epoch별 offset history를 관리한다. control plane의 epoch가 data plane의 낡은 주체를 fencing한다.</p>
+  <p><code>OffsetForLeaderEpoch</code> request에는 현재 알고 있는 leader epoch와 조회할 epoch가 들어간다. broker는 current epoch가 작으면 <code>FENCED_LEADER_EPOCH</code>, 더 크면 <code>UNKNOWN_LEADER_EPOCH</code>로 잘못된 세대를 드러낼 수 있고, 조회 epoch의 end offset을 응답한다. Follower는 이를 자기 log와 비교해 divergence가 시작된 위치를 찾고 truncate한다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">숫자 timeline: 성공 확정과 failure window</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dcecf3"><th style="padding:7px;border:1px solid #bfd5df">시점</th><th style="padding:7px;border:1px solid #bfd5df">epoch/leader</th><th style="padding:7px;border:1px solid #bfd5df">LEO(B1/B2/B3)</th><th style="padding:7px;border:1px solid #bfd5df">HW</th><th style="padding:7px;border:1px solid #bfd5df">의미</th></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df">T0</td><td style="padding:7px;border:1px solid #bfd5df">7 / B1</td><td style="padding:7px;border:1px solid #bfd5df">101/101/101</td><td style="padding:7px;border:1px solid #bfd5df">101</td><td style="padding:7px;border:1px solid #bfd5df">offset 0~100 공통·공개</td></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df">T1</td><td style="padding:7px;border:1px solid #bfd5df">7 / B1</td><td style="padding:7px;border:1px solid #bfd5df">105/103/101</td><td style="padding:7px;border:1px solid #bfd5df">101</td><td style="padding:7px;border:1px solid #bfd5df">101~104 leader tail, 아직 공개 금지</td></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df">T2</td><td style="padding:7px;border:1px solid #bfd5df">7 / B1</td><td style="padding:7px;border:1px solid #bfd5df">105/105/105</td><td style="padding:7px;border:1px solid #bfd5df">105</td><td style="padding:7px;border:1px solid #bfd5df">복제 조건 충족, offsets &lt;105 공개</td></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df">T3</td><td style="padding:7px;border:1px solid #bfd5df">8 / B2</td><td style="padding:7px;border:1px solid #bfd5df">offline/105/105</td><td style="padding:7px;border:1px solid #bfd5df">105</td><td style="padding:7px;border:1px solid #bfd5df">새 leader metadata로 old epoch fencing</td></tr>
+  </table>
+  <p><strong>Producer 성공 시점:</strong> 정확한 ack 확정은 <code>acks</code>, ISR, <code>min.insync.replicas</code>, ELR 활성화 조건에 의존하며 Day 24에서 깊게 다룬다. 오늘의 핵심은 local append(LEO 전진), consumer visibility(HW 전진), leader authority(epoch 전진)가 서로 다른 사건이라는 점이다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">OS·network 비용</h3>
+  <p>LEO 전진은 batch append가 page cache와 log segment에 반영되는 hot path다. HW 전진은 follower fetch round-trip, inter-broker TCP, follower disk/page cache append, leader의 replica progress 추적을 기다린다. 따라서 producer latency가 늘고 HW-LEO gap이 벌어질 때 CPU만 보지 말고 network retransmission, socket buffer, fetch latency, disk await, I/O queue, GC pause를 같은 timeline에 둔다.</p>
+  <p>Epoch change 자체는 metadata record로 작지만 뒤따르는 비용은 클 수 있다. clients metadata refresh, leader cache miss, follower truncation, replica catch-up, page cache 냉각이 동시에 발생한다. 잦은 leader flap은 작은 control event가 큰 data-path tail latency를 만드는 전형적인 연쇄 장애다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcecf3"><th align="left" style="padding:9px;border:1px solid #bfd5df">판단</th><th align="left" style="padding:9px;border:1px solid #bfd5df">권장 출발점</th><th align="left" style="padding:9px;border:1px solid #bfd5df">이유·trade-off</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">Lag 정의</td><td style="padding:9px;border:1px solid #bfd5df">consumer lag, replica LEO lag, HW-LEO gap을 이름부터 분리</td><td style="padding:9px;border:1px solid #bfd5df">서로 다른 상태 소유자와 장애 원인을 한 숫자로 섞지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">SLO 경보</td><td style="padding:9px;border:1px solid #bfd5df">HW 정체 + ISR/UnderMinISR + request latency 조합</td><td style="padding:9px;border:1px solid #bfd5df">단순 LEO 증가만으로 안전한 처리 가능성을 오판하지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">Leader 이동</td><td style="padding:9px;border:1px solid #bfd5df">epoch 증가·election rate·offline partition과 client error 동시 관찰</td><td style="padding:9px;border:1px solid #bfd5df">계획 이동과 장애 flap을 구분하고 blast radius를 계산한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">복구</td><td style="padding:9px;border:1px solid #bfd5df">truncate 전 partition·epoch·end offset 증거 보존</td><td style="padding:9px;border:1px solid #bfd5df">자동 복구를 방해하지 않으면서 유실 여부와 원인을 사후 설명할 수 있다.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> dashboard에 leader LEO, follower LEO 또는 replica lag, HW 관련 fetch/lag, ISR 크기, UnderReplicatedPartitions, UnderMinIsrPartitionCount, leader election, offline partitions를 동일 partition·broker·시간 축으로 연결한다. runbook에는 모든 offset이 next-position인지 last-record인지 명시한다. 장애 전후 topic describe와 broker/controller log를 보존한다.</p>
+  <p><strong>Anti-pattern:</strong> LEO를 committed offset이라고 부르기, consumer lag을 replication lag으로 해석, HW=leader LEO라고 가정, epoch 증가를 데이터 유실 자체로 단정, follower tail 파일을 수동 삭제해 “복구”, 모든 lag에 timeout 확대부터 적용.</p>
+  <p><strong>Edge case:</strong> transaction topic에서는 <code>read_committed</code> visibility가 HW가 아니라 LSO에도 제한된다. log retention으로 log start offset이 올라간 경우 epoch end와 비교할 수 있는 범위가 달라질 수 있다. remote/tiered storage는 local log size만으로 전체 history를 판단하지 못한다. preferred leader 이동은 정상적인 epoch 증가를 만들 수 있다.</p>
+  <p><strong>Version/engine 차이:</strong> 이 자료는 Kafka 4.3 KRaft와 ELR-aware 운영을 기준으로 한다. ELR은 Kafka 4.0부터 제공되고 새 4.1+ cluster에서 기본 활성화될 수 있으므로 feature level과 cluster/topic <code>min.insync.replicas</code>를 확인한다. ZooKeeper legacy는 controller metadata 경로가 다르며, managed service는 epoch cache·HW를 직접 노출하지 않을 수 있어 provider의 equivalent metrics와 broker logs를 매핑한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffead6"><th style="padding:7px;border:1px solid #e5c5a5">증상</th><th style="padding:7px;border:1px solid #e5c5a5">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e5c5a5">가능한 가설</th><th style="padding:7px;border:1px solid #e5c5a5">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e5c5a5">rollback/복구</th><th style="padding:7px;border:1px solid #e5c5a5">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">LEO 증가, consumer에 새 record 안 보임</td><td style="padding:7px;border:1px solid #e5c5a5">leader/follower LEO, HW gap, ISR, UnderMinISR, fetch latency</td><td style="padding:7px;border:1px solid #e5c5a5">replication 지연, min ISR 미달로 HW 정체</td><td style="padding:7px;border:1px solid #e5c5a5">영향 partition 격리, healthy leader 자원 보호</td><td style="padding:7px;border:1px solid #e5c5a5">follower 원인 제거 후 HW 전진·visibility 확인</td><td style="padding:7px;border:1px solid #e5c5a5">consumer offset 강제 이동</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">FENCED_LEADER_EPOCH 반복</td><td style="padding:7px;border:1px solid #e5c5a5">client metadata age, partition epoch, election rate, controller log</td><td style="padding:7px;border:1px solid #e5c5a5">stale metadata, leader flap, network partition</td><td style="padding:7px;border:1px solid #e5c5a5">metadata refresh 경로와 controller 건강 확인</td><td style="padding:7px;border:1px solid #e5c5a5">network 안정화 후 client 재시도·epoch 수렴 확인</td><td style="padding:7px;border:1px solid #e5c5a5">모든 broker 동시 restart</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">Leader election 뒤 log가 짧아짐</td><td style="padding:7px;border:1px solid #e5c5a5">전후 epoch, HW/LEO, ISR/ELR, ack 설정, broker log</td><td style="padding:7px;border:1px solid #e5c5a5">uncommitted divergent tail truncation 또는 unsafe election</td><td style="padding:7px;border:1px solid #e5c5a5">쓰기 억제, 증거 snapshot, 안전 leader 확인</td><td style="padding:7px;border:1px solid #e5c5a5">committed 범위 검증 후 producer replay·downstream 대사</td><td style="padding:7px;border:1px solid #e5c5a5">log 파일 수동 합치기</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">HW-LEO gap 급증</td><td style="padding:7px;border:1px solid #e5c5a5">replica fetch bytes/latency, disk await, network loss, GC, throttle</td><td style="padding:7px;border:1px solid #e5c5a5">follower disk/network stall, 복구 traffic 경쟁</td><td style="padding:7px;border:1px solid #e5c5a5">원인 broker와 workload 제한, client SLO traffic 보호</td><td style="padding:7px;border:1px solid #e5c5a5">단계적 catch-up 후 throttle 원복</td><td style="padding:7px;border:1px solid #e5c5a5">증거 없이 lag timeout 확대</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">7. 30분 실습: next-offset 경계를 직접 검증</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측</strong><br>
+  빈 partition의 earliest와 latest는 둘 다 0이다. record 5개를 쓰면 latest는 5이고 실제 마지막 record offset은 4다. offset 2부터 2개를 읽으면 어떤 offset이 출력될까? broker 재시작 뒤 latest는 유지될까?</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker, 공식 Kafka 4.3.1 단일 broker KRaft. RF=1이라 follower divergence와 HW-LEO gap은 만들 수 없다. 대신 CLI가 보여주는 LEO의 경계 정의를 재현하고, 다중 replica 사고 실험으로 HW를 계산한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 1 · 빈 log의 두 경계</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day23.offsets --partitions 1 --replication-factor 1
+docker compose exec broker /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 --topic day23.offsets --time -2
+docker compose exec broker /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 --topic day23.offsets --time -1</code>
+  <p><strong>예상:</strong> earliest(<code>-2</code>)와 latest(<code>-1</code>) 모두 <code>day23.offsets:0:0</code>. 아직 record가 없어 next append 위치가 0이다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 2 · 5개 append 후 LEO 확인</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">printf 'e0\ne1\ne2\ne3\ne4\n' | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day23.offsets
+docker compose exec broker /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 --topic day23.offsets --time -1</code>
+  <p><strong>예상:</strong> latest가 5다. 존재하는 offsets는 0~4이며 LEO는 다음 위치 5다. 출력값을 “마지막 offset 5”라고 기록하면 off-by-one 버그다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 3 · 특정 offset부터 읽기</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day23.offsets \
+  --partition 0 --offset 2 --max-messages 2 \
+  --property print.offset=true --property print.value=true</code>
+  <p><strong>예상:</strong> offset 2의 <code>e2</code>, offset 3의 <code>e3</code>가 출력된다. consumer position은 다음에 읽을 4가 된다. 이 position, committed offset, broker LEO는 값이 우연히 같아도 소유자와 의미가 다르다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 4 · 실패 주입과 복구</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose stop broker
+docker compose start broker
+make status
+docker compose exec broker /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 --topic day23.offsets --time -1</code>
+  <p><strong>예상:</strong> health가 돌아온 뒤 latest는 5다. RF=1이므로 leader 교체나 follower truncation을 증명한 것은 아니다. persistent local log의 end가 재시작 뒤 복구된 것만 증명한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 5 · 종이 위 다중 replica 실험</h3>
+  <p>B1/B2/B3가 모두 ISR이고 next-offset LEO가 105/103/101이라면 현재 공통 복제 범위는 offsets &lt;101이다. 기본 정신 모델에서 HW는 101을 넘을 수 없다. B3가 105까지 따라오고 복제 조건이 충족되면 HW는 105로 전진한다. 이후 B1이 죽고 B2가 epoch 8 leader가 되면 B1이 복귀할 때 current epoch 7 요청은 fenced되고 epoch history에 따라 tail을 검증한다.</p>
+  <p><strong>자주 나는 오류와 해결:</strong> startup 직후 connection 오류는 <code>make status</code>가 healthy가 될 때까지 기다린다. 출력의 broker ID는 환경에 따라 다르다. <code>kafka-get-offsets.sh</code>가 없으면 image version이 프로젝트 기준 4.3.1인지 확인한다. 단일 broker 결과로 “HW=LEO는 항상 성립”이라 일반화하지 않는다.</p>
+  <p><strong>Cleanup:</strong></p>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day23.offsets
+make down</code>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>LEO는 마지막 record offset이 아니다:</strong> 다음 append 위치이므로 last offset은 보통 LEO-1이다.</li>
+    <li><strong>LEO는 partition 공통값이 아니다:</strong> 복제 중 replica마다 다르다.</li>
+    <li><strong>HW는 consumer committed offset이 아니다:</strong> 전자는 broker 복제 경계, 후자는 group 재시작 위치다.</li>
+    <li><strong>HW만으로 transaction visibility가 끝나지 않는다:</strong> <code>read_committed</code>에는 LSO가 추가된다.</li>
+    <li><strong>Epoch 증가 ≠ 유실:</strong> leader 이동의 세대 변화다. 유실 여부는 HW·ack·선출 후보·truncation 증거로 판단한다.</li>
+    <li><strong>Truncation ≠ 항상 장애:</strong> divergent uncommitted tail을 제거해 단일 history를 복구하는 정상 절차일 수 있다.</li>
+    <li><strong>HW 단순 최솟값 공식 주의:</strong> ISR 변화, min ISR, Kafka 4.x ELR 조건을 포함해 설명한다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. LEO와 HW가 왜 둘 다 필요한가요?</strong><br>
+  좋은 답변 구조: next-offset convention 선언 → replica-local append progress와 cluster-safe visibility 분리 → B1/B2/B3 수치 예시 → consumer가 HW 미만만 읽는 이유 → leader failure window → latency·durability trade-off → transaction이면 LSO 추가.</p>
+  <p><strong>Q2. Leader epoch가 데이터 유실을 어떻게 막나요?</strong><br>
+  좋은 답변 구조: leader authority 세대 → KRaft controller가 새 leader·epoch 확정 → stale current epoch fencing → OffsetForLeaderEpoch로 epoch end 조회 → divergent follower tail truncate → 단일 partition history 회복 → unsafe election은 별도 위험이라고 경계.</p>
+  <p><strong>Q3. Producer latency가 늘고 consumer는 새 record를 못 봅니다. 진단하세요.</strong><br>
+  좋은 답변 구조: SLO와 영향 partition 수 확인 → leader/follower LEO와 HW gap → ISR·UnderMinISR·acks 조건 → fetch/network/disk/GC 증거 → 안전한 workload 제한 → follower catch-up과 HW 전진 확인 → replay·rollback → timeout만 늘리지 않기.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#1f6688">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>RF=3과 ISR=2는 각각 무엇을 뜻하는가?</li><li>Follower가 leader에게 pull fetch하는 장점은?</li><li>ISR shrink 때 controller와 partition leader의 역할은 어떻게 다른가?</li></ol>
+  <p style="padding:12px;background:#f2f6f8"><strong>짧은 정답:</strong> ① RF는 assignment 크기, ISR은 현재 충분히 동기화된 동적 집합. ② follower 속도 기반 backpressure와 offset 기반 연속 batch 복제. ③ leader가 replica 진척을 관찰하고 KRaft controller가 ISR/leader metadata 전이를 확정·전파한다.</p>
+  <h3 style="margin:16px 0 8px;color:#1f6688">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>Offsets 0~9가 있으면 LEO는 얼마이며 왜 그런가?</li><li>B1/B2/B3 LEO가 105/103/101이고 모두 ISR일 때 HW 상한 경계를 설명하라.</li><li>Old leader가 돌아왔을 때 leader epoch와 OffsetForLeaderEpoch가 하는 일을 설명하라.</li></ol>
+  <p style="padding:12px;background:#f2f6f8"><strong>채점 기준:</strong> ① 다음 append 위치 10과 off-by-one 설명(2점). ② next-offset convention으로 offsets &lt;101 공통, HW는 101을 넘지 못한다고 설명하되 feature 조건을 명시(4점). ③ stale epoch fencing, epoch end 비교, divergent tail truncation, 새 leader fetch까지 연결(4점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/design/design/" style="color:#1f6688">Apache Kafka 4.3 Design · Replication</a> — leader/follower log, ISR, committed visibility의 공식 정신 모델</li>
+    <li><a href="https://kafka.apache.org/43/design/protocol/" style="color:#1f6688">Apache Kafka 4.3 Protocol</a> — Metadata의 leader epoch와 OffsetForLeaderEpoch request/response</li>
+    <li><a href="https://kafka.apache.org/43/operations/monitoring/" style="color:#1f6688">Apache Kafka 4.3 Monitoring</a> — under-replicated, under-min-ISR, fetch·lag 지표</li>
+    <li><a href="https://kafka.apache.org/43/operations/eligible-leader-replicas/" style="color:#1f6688">Eligible Leader Replicas</a> — Kafka 4.x strict min ISR, HW, ELR 선출 의미</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#174d6b;color:#fff;border-radius:10px"><strong>내일 예고 · Day 24</strong><br><code style="color:#fff">acks=all + min.insync.replicas</code> — 어떤 replica가 어느 시점까지 복제해야 producer 성공을 반환하는지, RF=3 장애 표로 durability와 write availability를 계산한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>
