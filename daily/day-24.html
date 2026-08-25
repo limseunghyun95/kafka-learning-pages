@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 24 · acks=all + min.insync.replicas</title>
+</head>
+<body style="margin:0;background:#eef4f8;color:#172331;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef4f8"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d5e2ea;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#174d6b;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#a8d8ef;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 4 / DAY 24 · DURABILITY</div>
+  <h1 style="margin:10px 0 8px;font-size:29px;line-height:1.25">acks=all + min.insync.replicas</h1>
+  <p style="margin:0;color:#dff2fb">성공 응답의 조건과 쓰기 중단 정책을 RF=3 장애 표로 방어하기 · 이론 70분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#eaf6fb;border-left:5px solid #2684ad;border-radius:10px"><strong>한 줄 요약</strong><br>
+  <code>acks=all</code>은 leader가 <strong>현재 ISR 전체의 복제</strong>를 기다리는 producer 요청 조건이고, <code>min.insync.replicas</code>는 ISR이 이 수보다 작으면 그 쓰기를 거부하는 <strong>최소 안전선</strong>이다. RF=3·min ISR=2라면 한 replica 장애까지 쓰되, 두 번째 replica를 잃으면 가용성을 포기하고 acknowledged record의 내구성을 지킨다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #cfe0e8"><strong>Acknowledgment</strong></td><td style="padding:10px;border:1px solid #cfe0e8">요청을 받았고 요구 조건까지 처리했다는 응답. 줄여서 ack라고 한다. TCP 전송 성공, broker local append, replica 복제 성공은 서로 다른 ack 단계다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>acks</strong></td><td style="padding:10px;border:1px solid #cfe0e8">Producer가 ProduceRequest를 완료로 판단하기 위해 broker에 요구하는 응답 수준. 현재 공식 값은 <code>0</code>, <code>1</code>, <code>all</code>(또는 <code>-1</code>)이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Replication factor</strong></td><td style="padding:10px;border:1px solid #cfe0e8">RF. Partition에 배정된 전체 replica 수. RF=3은 세 copy의 배치 계획이지 현재 세 copy가 모두 동기화됐다는 뜻이 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>ISR</strong></td><td style="padding:10px;border:1px solid #cfe0e8">In-Sync Replicas. 현재 leader를 충분히 따라온 동적 replica 집합. Leader도 ISR 구성원으로 센다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>min ISR</strong></td><td style="padding:10px;border:1px solid #cfe0e8"><code>min.insync.replicas</code>의 줄임말. <code>acks=all</code> 쓰기를 허용할 최소 ISR 크기다. “몇 개만 ack 받으면 된다”가 아니라 admission floor다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>HW</strong></td><td style="padding:10px;border:1px solid #cfe0e8">High Watermark. 복제 안전 조건을 만족해 consumer에게 공개 가능한 next-offset 경계. Leader LEO와 다르다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Durability</strong></td><td style="padding:10px;border:1px solid #cfe0e8">성공했다고 답한 데이터가 장애 뒤에도 남는 성질. “디스크에 썼다” 하나가 아니라 실패 domain과 동시에 잃을 수 있는 copy를 포함해 정의한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Availability</strong></td><td style="padding:10px;border:1px solid #cfe0e8">요청을 받아 성공 또는 유효한 응답을 계속 제공하는 성질. min ISR을 높이면 특정 장애에서 write availability를 의도적으로 포기할 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>Retriable error</strong></td><td style="padding:10px;border:1px solid #cfe0e8">재시도하면 성공할 수 있는 일시 오류. 하지만 첫 시도의 결과가 불명확할 수 있으므로 idempotence 없이 무작정 재시도하면 중복 위험이 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cfe0e8"><strong>ELR</strong></td><td style="padding:10px;border:1px solid #cfe0e8">Eligible Leader Replicas. Kafka 4.x에서 strict min ISR 안전성을 이용해 일부 non-ISR replica를 안전한 선출 후보로 추적하는 기능.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">2. 왜 중요한가</h2>
+  <p><code>acks=all</code>만 켜고 <code>min.insync.replicas=1</code>을 그대로 두면 ISR이 leader 하나로 줄어든 상태에서도 쓰기가 성공할 수 있다. 그 직후 마지막 최신 leader를 잃으면 acknowledged record를 가진 살아 있는 replica가 없을 수 있다. 반대로 min ISR을 RF와 같게 두면 하나의 느린 replica만으로도 쓰기가 오래 중단된다.</p>
+  <p>따라서 두 설정은 성능 숫자가 아니라 <strong>어떤 장애까지 성공을 약속할 것인지 정하는 정책</strong>이다. RF=3·min ISR=2는 “한 replica 장애 때는 두 ISR 모두에 복제해 계속 쓰고, ISR이 하나가 되면 쓰기를 거부한다”는 선택이다. 이는 모든 workload의 정답이 아니라 흔한 production 출발점이다.</p>
+  <p>면접에서는 “acks all이면 안전합니다”로 끝내면 부족하다. 요구 failure domain, ISR 전이, pre/post append 오류, timeout의 unknown outcome, idempotent retry, consumer visibility, cross-AZ 비용까지 설명해야 설계 판단을 했다는 인상을 준다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">3. Architecture: ProduceRequest가 성공하기까지</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:27%;padding:12px;background:#1f6688;color:#fff;border-radius:8px"><strong>1 · Producer</strong></td><td style="padding:12px;background:#eaf6fb">batch + <code>requiredAcks=-1</code> → P0 leader B1</td></tr>
+    <tr><td colspan="2" align="center" style="color:#2684ad;font-weight:800">&#8595; DATA PATH · ProduceRequest</td></tr>
+    <tr><td style="padding:12px;background:#3b647a;color:#fff;border-radius:8px"><strong>2 · Pre-check</strong></td><td style="padding:12px;background:#edf3f6">현재 ISR 크기 ≥ min ISR인가? 아니면 append 전 거부</td></tr>
+    <tr><td colspan="2" align="center" style="color:#27836f;font-weight:800">&#8595; Leader local append · LEO 전진</td></tr>
+    <tr><td style="padding:12px;background:#196758;color:#fff;border-radius:8px"><strong>3 · Replicate</strong></td><td style="padding:12px;background:#eaf8f4">B2·B3 follower fetch → local append → progress 보고</td></tr>
+    <tr><td colspan="2" align="center" style="color:#8051a8;font-weight:800">&#8595; 현재 ISR 전체 복제 + min ISR 조건 유지</td></tr>
+    <tr><td style="padding:12px;background:#5f4080;color:#fff;border-radius:8px"><strong>4 · Commit</strong></td><td style="padding:12px;background:#f4ecfb">HW가 batch 뒤로 전진 → ProduceResponse success</td></tr>
+    <tr><td colspan="2" align="center" style="color:#b06a25;font-weight:800">&#8596; CONTROL PATH · ISR shrink/expand·leader epoch</td></tr>
+    <tr><td style="padding:12px;background:#7e4b20;color:#fff;border-radius:8px"><strong>5 · KRaft</strong></td><td style="padding:12px;background:#fff4e7">Controller가 ISR·leader metadata 전이를 확정·전파</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>Client contract:</strong> producer Sender는 batch를 현재 partition leader에 보내고 response를 기다린다. <code>acks=all</code>은 broker가 요구 복제 조건 전에 success를 반환하지 못하게 한다.</li>
+    <li><strong>Admission:</strong> leader는 append 전 ISR 크기가 min ISR보다 작은지 검사한다. 미달이면 <code>NotEnoughReplicas</code> 계열 오류로 쓰기를 받지 않는다.</li>
+    <li><strong>Append and pull:</strong> leader가 local log에 append한 뒤 followers가 fetch한다. min ISR=2라고 해서 ISR=3일 때 둘만 복제하고 끝나는 것이 아니다. 공식 4.3 문서상 <code>acks=all</code>은 ISR 전체를 기다린다.</li>
+    <li><strong>State change:</strong> 대기 중 ISR이 바뀔 수 있다. 미달이 append 뒤 발견되면 <code>NotEnoughReplicasAfterAppend</code>처럼 “local append는 있었지만 성공 확정은 안 됨”을 나타내는 오류가 가능하다.</li>
+    <li><strong>Success:</strong> 요구 복제가 완료돼 HW가 batch 뒤로 전진하고 min ISR 조건이 유지될 때 success response가 돌아온다. 응답 packet 유실 시 server 성공과 client timeout이 동시에 가능하므로 결과는 다시 불명확해질 수 있다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#1f6688">상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcecf3"><th align="left" style="padding:9px;border:1px solid #bfd5df">상태</th><th align="left" style="padding:9px;border:1px solid #bfd5df">소유자</th><th align="left" style="padding:9px;border:1px solid #bfd5df">불변식·의미</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df"><code>acks</code></td><td style="padding:9px;border:1px solid #bfd5df">Producer config·request</td><td style="padding:9px;border:1px solid #bfd5df">Client가 어떤 broker 완료 조건을 요구하는지 정한다. Server의 replica 수를 만들지는 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">min ISR</td><td style="padding:9px;border:1px solid #bfd5df">Cluster default 또는 topic override</td><td style="padding:9px;border:1px solid #bfd5df"><code>acks=all</code> 쓰기를 허용할 최소 ISR 크기. Topic override가 server default보다 우선한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">ISR</td><td style="padding:9px;border:1px solid #bfd5df">Leader 관찰 + KRaft metadata</td><td style="padding:9px;border:1px solid #bfd5df">동적 runtime 상태. RF와 달리 장애·lag에 따라 줄고 늘어난다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">LEO/HW</td><td style="padding:9px;border:1px solid #bfd5df">Replica log·partition state</td><td style="padding:9px;border:1px solid #bfd5df">Local 존재와 안전 공개 경계를 분리한다. Success와 visibility를 숫자로 검증한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">Sequence number</td><td style="padding:9px;border:1px solid #bfd5df">Idempotent producer + broker</td><td style="padding:9px;border:1px solid #bfd5df">응답 유실 뒤 동일 batch retry를 중복 append하지 않게 식별한다.</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">acks 0·1·all의 정확한 경계</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dcecf3"><th style="padding:7px;border:1px solid #bfd5df">값</th><th style="padding:7px;border:1px solid #bfd5df">Producer 완료 시점</th><th style="padding:7px;border:1px solid #bfd5df">주요 failure window</th><th style="padding:7px;border:1px solid #bfd5df">용도 판단</th></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df"><code>0</code></td><td style="padding:7px;border:1px solid #bfd5df">socket buffer에 넣고 server ack를 기다리지 않음</td><td style="padding:7px;border:1px solid #bfd5df">broker가 받았는지도 모름, client retry 근거 없음</td><td style="padding:7px;border:1px solid #bfd5df">손실 허용 telemetry 등 매우 제한적</td></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df"><code>1</code></td><td style="padding:7px;border:1px solid #bfd5df">Leader local log append 뒤</td><td style="padding:7px;border:1px solid #bfd5df">Follower 복제 전 leader 장애로 acked record 유실 가능</td><td style="padding:7px;border:1px solid #bfd5df">복제 내구성보다 latency를 우선할 때만</td></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df"><code>all</code></td><td style="padding:7px;border:1px solid #bfd5df">ISR 전체가 복제하고 min ISR 조건 충족</td><td style="padding:7px;border:1px solid #bfd5df">응답 유실의 unknown outcome, 모든 안전 copy 동시 상실</td><td style="padding:7px;border:1px solid #bfd5df">중요 production data의 기본 출발점</td></tr>
+  </table>
+  <p><strong>오해 교정:</strong> min ISR=2는 <code>acks=all</code>이 “아무 두 replica만 기다린다”는 뜻이 아니다. ISR=3이면 세 ISR 모두의 복제를 기다린다. min ISR은 ISR이 2 아래로 내려갔을 때 아예 쓰기를 거부하는 하한선이다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">RF=3, min ISR=2 장애 행렬</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dcecf3"><th style="padding:7px;border:1px solid #bfd5df">현재 ISR</th><th style="padding:7px;border:1px solid #bfd5df">acks=all 결과</th><th style="padding:7px;border:1px solid #bfd5df">기다리는 replica</th><th style="padding:7px;border:1px solid #bfd5df">해석</th></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df">[B1,B2,B3]</td><td style="padding:7px;border:1px solid #bfd5df">성공 가능</td><td style="padding:7px;border:1px solid #bfd5df">세 ISR 전체</td><td style="padding:7px;border:1px solid #bfd5df">가장 높은 copy margin, 가장 느린 ISR이 tail latency에 영향</td></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df">[B1,B2]</td><td style="padding:7px;border:1px solid #bfd5df">성공 가능</td><td style="padding:7px;border:1px solid #bfd5df">두 ISR 전체</td><td style="padding:7px;border:1px solid #bfd5df">한 replica 장애를 견디며 write availability 유지</td></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df">[B1]</td><td style="padding:7px;border:1px solid #bfd5df">거부</td><td style="padding:7px;border:1px solid #bfd5df">min ISR 미달</td><td style="padding:7px;border:1px solid #bfd5df">데이터 안전성을 위해 write availability 포기</td></tr>
+    <tr><td style="padding:7px;border:1px solid #bfd5df">[]</td><td style="padding:7px;border:1px solid #bfd5df">Leader 없음</td><td style="padding:7px;border:1px solid #bfd5df">없음</td><td style="padding:7px;border:1px solid #bfd5df">Read/write 불가, 안전 후보 복구 필요</td></tr>
+  </table>
+  <p>Broker가 죽었다고 ISR이 즉시 줄어드는 것은 아니다. Failure detector와 <code>replica.lag.time.max.ms</code>, controller state 전이 동안 request가 대기하거나 timeout될 수 있다. ISR이 3→2로 확정된 뒤에는 남은 두 ISR로 성공할 수 있지만, 그 사이의 latency spike를 장애 행렬에 포함해야 한다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">오류가 말해 주는 failure window</h3>
+  <p><strong>NotEnoughReplicas:</strong> append 전 현재 ISR이 min ISR보다 작다는 검사에 걸린 경우다. 해당 시도의 batch가 leader log에 append되지 않았다고 추론할 수 있다. <strong>NotEnoughReplicasAfterAppend:</strong> append 후 낮은 ISR이 발견된 retriable 오류다. Local append는 이미 일어났을 수 있으므로 결과를 “무조건 실패·미기록”으로 취급하면 안 된다.</p>
+  <p><strong>Timeout·disconnect:</strong> broker가 성공 조건을 만족하고 response를 보냈지만 packet이 사라졌을 수도 있고, 복제가 끝나지 않았을 수도 있다. Client 관점에서는 unknown outcome이다. Kafka producer idempotence는 PID·epoch·partition sequence로 같은 batch retry의 broker-log 중복을 막는다. 다만 외부 DB side effect까지 자동으로 exactly-once가 되는 것은 아니다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">OS·network·분산 시스템 비용</h3>
+  <p><code>acks=all</code> latency는 leader local append만이 아니라 ISR follower의 fetch round-trip, inter-broker TCP, follower page cache append, leader progress 관찰까지 포함한다. 가장 느린 ISR의 disk await·network loss·GC pause가 p99를 끌어올릴 수 있다. Lagging follower를 ISR에서 빼면 latency는 회복되지만 copy margin은 줄어든다.</p>
+  <p>min ISR은 consensus quorum 그 자체가 아니다. RF=3·min ISR=2에서는 수치상 과반이지만 RF=5·min ISR=2는 과반이 아니다. 또한 replica 두 개가 같은 rack이나 power domain에 있으면 “두 copy”가 한 장애로 동시에 사라진다. 수량 threshold와 failure-domain diversity를 별도로 설계한다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#1f6688">Kafka 4.x ELR의 strict min ISR</h3>
+  <p>Kafka 4.0부터 ELR이 제공되고 새 Kafka 4.1+ cluster에서는 기본 활성화되는 구성이 있다. ELR 활성화 시 ISR 크기가 min ISR보다 작으면 data partition HW가 전진하지 않는 strict min ISR 규칙이 핵심이다. 그 안전성 덕분에 controller가 일부 non-ISR replica를 ELR로 추적할 수 있다. Kafka 4.3 운영에서는 feature level과 cluster/topic min ISR 적용 위치를 확인한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcecf3"><th align="left" style="padding:9px;border:1px solid #bfd5df">요구사항</th><th align="left" style="padding:9px;border:1px solid #bfd5df">권장 출발점</th><th align="left" style="padding:9px;border:1px solid #bfd5df">판단 근거·trade-off</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">중요 event stream</td><td style="padding:9px;border:1px solid #bfd5df">RF=3, min ISR=2, acks=all, idempotence</td><td style="padding:9px;border:1px solid #bfd5df">한 replica 장애 중 쓰기, 두 번째 상실 시 안전 중단. Storage·cross-AZ latency 증가.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">최저 latency 우선</td><td style="padding:9px;border:1px solid #bfd5df">유실 비용 수치화 후 acks=1 검토</td><td style="padding:9px;border:1px solid #bfd5df">Leader failover window의 acknowledged loss를 명시적으로 수용해야 한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">다중 AZ</td><td style="padding:9px;border:1px solid #bfd5df">rack-aware RF 배치 + AZ 장애 행렬</td><td style="padding:9px;border:1px solid #bfd5df">min ISR은 replica 개수만 세며 서로 다른 AZ를 자동 보증하지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd5df">장애 복구</td><td style="padding:9px;border:1px solid #bfd5df">min ISR 임시 하향보다 replica 복구 우선</td><td style="padding:9px;border:1px solid #bfd5df">하향은 write를 살리지만 최신 단일 copy 상실 시 acknowledged loss 위험을 높인다.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> Topic 중요도별 RF·min ISR·acks 정책을 코드와 review 대상으로 관리한다. Producer에서 idempotence, delivery timeout, request timeout, retry를 함께 검토한다. UnderMinIsrPartitionCount, AtMinIsrPartitionCount, UnderReplicatedPartitions, ISR shrink rate, produce request latency·error rate, disk/network를 같은 dashboard에 둔다. 정기 chaos test로 broker/AZ 하나 상실 시 예상 행렬을 검증한다.</p>
+  <p><strong>Anti-pattern:</strong> 모든 topic에 RF3만 적용하고 min ISR default 1 방치, 장애 때 증거 없이 min ISR을 1로 낮추기, <code>acks=all</code>을 “모든 assigned replica 영구 보존”으로 설명, <code>acks=1</code>에서 min ISR이 동일한 보호를 준다고 기대, timeout을 확정 실패로 취급해 non-idempotent retry.</p>
+  <p><strong>Edge case:</strong> ISR shrink 전후 in-flight request, follower가 매우 느리지만 아직 ISR인 구간, topic override와 cluster default 충돌, RF보다 큰 min ISR 오설정, transaction/internal topic의 별도 min ISR, rack 정보 누락, managed service가 broker-level 설정을 감추는 경우를 확인한다.</p>
+  <p><strong>Version/engine 차이:</strong> Kafka 4.3 producer의 <code>acks</code> 유효값은 <code>0</code>, <code>1</code>, <code>all/-1</code>이다. 다른 ack 모드를 제안하는 미채택 KIP를 현재 기능처럼 쓰지 않는다. ELR 활성화 시 min ISR의 cluster-level 관리와 HW 규칙이 달라질 수 있으므로 공식 4.3 ELR 문서를 우선한다. ZooKeeper legacy는 control path가 다르다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffead6"><th style="padding:7px;border:1px solid #e5c5a5">증상</th><th style="padding:7px;border:1px solid #e5c5a5">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e5c5a5">가능한 가설</th><th style="padding:7px;border:1px solid #e5c5a5">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e5c5a5">rollback/복구</th><th style="padding:7px;border:1px solid #e5c5a5">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">NotEnoughReplicas 급증</td><td style="padding:7px;border:1px solid #e5c5a5">topic RF/minISR/ISR, UnderMinISR, broker 상태, controller event</td><td style="padding:7px;border:1px solid #e5c5a5">ISR이 append 전 이미 min ISR 미달</td><td style="padding:7px;border:1px solid #e5c5a5">영향 topic 격리, healthy replica·leader 보호</td><td style="padding:7px;border:1px solid #e5c5a5">replica 복구 후 ISR·HW·produce success 확인</td><td style="padding:7px;border:1px solid #e5c5a5">즉시 min ISR 하향</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">AfterAppend/timeout 반복</td><td style="padding:7px;border:1px solid #e5c5a5">error 종류, idempotence, sequence log, HW/LEO, request timeline</td><td style="padding:7px;border:1px solid #e5c5a5">append 후 ISR 감소, ack response 유실</td><td style="padding:7px;border:1px solid #e5c5a5">non-idempotent 재시도 중지, event ID 증거 보존</td><td style="padding:7px;border:1px solid #e5c5a5">idempotent retry 또는 key 기반 대사·replay</td><td style="padding:7px;border:1px solid #e5c5a5">확정 미기록으로 단정</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">p99 produce latency 급증</td><td style="padding:7px;border:1px solid #e5c5a5">ISR별 lag, fetch latency, disk await, network loss, GC</td><td style="padding:7px;border:1px solid #e5c5a5">느린 ISR이 acks=all 완료를 지연</td><td style="padding:7px;border:1px solid #e5c5a5">영향 broker workload 제한, SLO traffic 보호</td><td style="padding:7px;border:1px solid #e5c5a5">병목 제거·catch-up 후 throttle 원복</td><td style="padding:7px;border:1px solid #e5c5a5">acks=1로 즉시 변경</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">장애 중 쓰기 0건</td><td style="padding:7px;border:1px solid #e5c5a5">ISR/minISR, offline partitions, ELR, AZ별 broker, backlog</td><td style="padding:7px;border:1px solid #e5c5a5">안전 중단 정책이 정상 작동, 또는 모든 leader 후보 상실</td><td style="padding:7px;border:1px solid #e5c5a5">RTO·RPO 확인, 안전 replica부터 복구</td><td style="padding:7px;border:1px solid #e5c5a5">ISR 회복 뒤 producer buffer·upstream replay</td><td style="padding:7px;border:1px solid #e5c5a5">unclean election·min ISR1 동시 적용</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">7. 30분 실습: min ISR이 쓰기를 멈추는 순간</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측</strong><br>
+  RF=1 topic에 min ISR=2를 설정하고 <code>acks=all</code>로 보내면 leader는 local append를 할까, append 전에 거부할까? min ISR을 1로 돌리면 같은 producer 조건에서 무엇이 달라질까?</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker, 공식 Kafka 4.3.1 단일 broker KRaft. 이 실습은 의도적인 RF&lt;min ISR 오설정으로 pre-append 거부를 빠르게 관찰한다. Production에서는 이런 구성을 만들지 않는다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 1 · RF=1, min ISR=2 topic</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day24.minisr --partitions 1 --replication-factor 1 \
+  --config min.insync.replicas=2
+docker compose exec broker /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 --entity-type topics \
+  --entity-name day24.minisr --describe</code>
+  <p><strong>예상:</strong> Topic override에 <code>min.insync.replicas=2</code>가 보인다. 현재 Apache Kafka는 이 위험한 불일치가 구성될 수 있으므로 CI policy에서 <code>1 ≤ min ISR ≤ RF</code>를 별도로 검사하는 것이 안전하다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 2 · 실패 주입: acks=all produce</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">printf 'must-fail\n' | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day24.minisr \
+  --producer-property acks=all \
+  --producer-property delivery.timeout.ms=5000 \
+  --producer-property request.timeout.ms=3000</code>
+  <p><strong>예상:</strong> ISR은 leader 하나뿐이라 min ISR 2를 만족하지 못하고 <code>NOT_ENOUGH_REPLICAS</code> 또는 이에 대응하는 producer exception이 난다. 짧은 delivery timeout은 실습이 기본 재시도로 오래 멈추는 것을 제한한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 3 · 안전선과 RF를 일치시켜 성공</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 --entity-type topics \
+  --entity-name day24.minisr --alter \
+  --add-config min.insync.replicas=1
+printf 'now-succeeds\n' | docker compose exec -T broker \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day24.minisr \
+  --producer-property acks=all
+docker compose exec broker /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 --topic day24.minisr --time -1</code>
+  <p><strong>예상:</strong> 두 번째 record는 성공하고 latest offset 경계는 1이다. 실패한 첫 batch가 append 전 거부됐다는 증거다. 단일 replica 성공은 고가용성이나 broker 장애 내구성을 의미하지 않는다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#1f6688">Step 4 · 설정·상태·요청을 함께 기록</h3>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic day24.minisr
+docker compose exec broker /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 --entity-type topics \
+  --entity-name day24.minisr --describe</code>
+  <p><strong>관찰:</strong> <code>Replicas</code>, <code>Isr</code>, topic min ISR을 한 화면에 적고 producer의 acks를 별도 기록한다. 셋 중 하나라도 빠지면 write 결과를 재현할 수 없다.</p>
+  <p><strong>자주 나는 오류와 해결:</strong> Startup 직후 connection 오류는 <code>make status</code>가 healthy가 될 때까지 기다린다. Console producer가 몇 초 재시도하는 것은 retriable 오류이기 때문이다. Topic이 이전 실행에서 남았다면 config describe로 현재 값을 확인한다. Managed Kafka가 RF&lt;min ISR을 미리 거부한다면 engine guardrail 차이이며, RF=3 test cluster에서 ISR을 1로 줄여 같은 원리를 검증한다.</p>
+  <p><strong>Cleanup:</strong></p>
+  <code style="display:block;padding:10px;background:#102331;color:#e6f5fb;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day24.minisr
+make down</code>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>all ≠ all assigned replicas:</strong> 현재 ISR 전체다. Out-of-sync replica까지 무조건 기다리는 것은 아니다.</li>
+    <li><strong>min ISR ≠ ack 개수:</strong> 쓰기를 허용할 ISR 하한이며, ISR이 더 크면 <code>acks=all</code>은 그 전체를 기다린다.</li>
+    <li><strong>RF ≠ 현재 copy 수:</strong> RF는 assignment, ISR은 runtime health다.</li>
+    <li><strong>acks=1 + min ISR2 ≠ 같은 보호:</strong> min ISR의 producer 쓰기 거부 계약은 <code>acks=all</code>과 함께 쓸 때 성립한다.</li>
+    <li><strong>Timeout ≠ 확정 실패:</strong> append·commit 후 response만 유실될 수 있다. Idempotent retry와 event ID 대사가 필요하다.</li>
+    <li><strong>두 replicas ≠ 두 AZ:</strong> Rack-aware 배치 없이 failure-domain 내구성을 보장하지 못한다.</li>
+    <li><strong>Min ISR 하향은 성능 튜닝이 아님:</strong> 장애 중 RPO를 바꾸는 위험 승인이다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. RF=3, min ISR=2, acks=all의 장애별 결과를 설명하세요.</strong><br>
+  좋은 답변 구조: failure domain 가정 → ISR3에서 세 replica 대기 → ISR2에서 두 replica로 성공 → ISR1에서 pre/post append 오류와 write 중단 → HW·visibility → 한 replica 복구 → durability/availability·latency 비용.</p>
+  <p><strong>Q2. min ISR=2면 왜 acks=all이 ISR 세 개를 기다리나요?</strong><br>
+  좋은 답변 구조: acks는 완료 조건, min ISR은 admission floor로 상태 소유자 분리 → 공식 4.3 의미 → 느린 ISR이 latency에 미치는 영향 → ISR shrink가 2 이상이면 계속 → 2 미만이면 거부 → min ISR 개수만 기다리는 미채택 제안과 구분.</p>
+  <p><strong>Q3. Producer timeout 뒤 같은 event를 재시도해도 되나요?</strong><br>
+  좋은 답변 구조: unknown outcome 선언 → error·correlation timeline·HW/LEO 수집 → idempotence PID/sequence 범위 → 같은 producer session retry → 외부 side effect는 event ID·unique key·transactional outbox → delivery timeout과 backpressure → 대사·replay 계획.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#1f6688">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>Offsets 0~9가 있는 replica의 LEO는?</li><li>HW와 consumer committed offset의 차이는?</li><li>Old leader가 돌아왔을 때 leader epoch가 하는 일은?</li></ol>
+  <p style="padding:12px;background:#f2f6f8"><strong>짧은 정답:</strong> ① 다음 append 위치 10. ② HW는 broker 복제 안전 공개 경계, committed offset은 group 재시작 위치. ③ stale epoch를 fencing하고 epoch end를 비교해 divergent tail을 truncate한 뒤 새 leader history로 수렴시킨다.</p>
+  <h3 style="margin:16px 0 8px;color:#1f6688">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>ISR=3, min ISR=2에서 acks=all은 몇 replica를 기다리는가?</li><li>NotEnoughReplicas와 AfterAppend 오류의 결과 확실성 차이는?</li><li>RF=3·min ISR=2가 보장하지 않는 두 가지는?</li></ol>
+  <p style="padding:12px;background:#f2f6f8"><strong>채점 기준:</strong> ① 현재 ISR 전체 3개, min ISR은 하한임을 설명(3점). ② append 전 거부와 append 뒤 unknown outcome·idempotent retry를 구분(4점). ③ 예: 모든 assigned replica 영구 보존, 서로 다른 AZ 배치, 외부 sink exactly-once 중 두 개 제시(3점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#1f6688">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/generated/producer_config.html" style="color:#1f6688">Apache Kafka 4.3 Producer Configs</a> — acks 유효값·default와 idempotence 조건</li>
+    <li><a href="https://kafka.apache.org/43/configuration/topic-configs/" style="color:#1f6688">Apache Kafka 4.3 Topic Configs</a> — min.insync.replicas, ISR 전체 ack, 오류·visibility</li>
+    <li><a href="https://kafka.apache.org/43/operations/monitoring/" style="color:#1f6688">Apache Kafka 4.3 Monitoring</a> — UnderMinISR·AtMinISR·replication·producer 지표</li>
+    <li><a href="https://kafka.apache.org/43/operations/eligible-leader-replicas/" style="color:#1f6688">Eligible Leader Replicas</a> — Kafka 4.x strict min ISR와 HW·leader 후보</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#174d6b;color:#fff;border-radius:10px"><strong>내일 예고 · Day 25</strong><br>Leader election과 unclean election 위험 — leader가 사라졌을 때 어떤 replica를 고르면 데이터가 보존되고, availability를 위해 언제 RPO를 희생하는지 epoch·ISR·ELR로 판단한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>

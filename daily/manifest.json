@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-24T09:07:28+09:00",
+  "updatedAt": "2026-08-25T09:00:42+09:00",
   "lessons": [
     {
       "day": 1,
@@ -212,6 +212,15 @@
       "path": "day-23.html",
       "kind": "lesson",
       "publishedAt": "2026-08-24T09:07:28+09:00"
+    },
+    {
+      "day": 24,
+      "week": 4,
+      "title": "acks=all + min.insync.replicas",
+      "summary": "acks=all 완료 조건과 min ISR admission floor를 RF=3 장애 행렬, HW·ISR state transition, retriable error·unknown outcome·idempotent retry까지 연결합니다.",
+      "path": "day-24.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-25T09:00:42+09:00"
     }
   ]
 }
