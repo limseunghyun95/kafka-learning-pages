@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-25T09:00:42+09:00",
+  "updatedAt": "2026-08-26T09:09:21+09:00",
   "lessons": [
     {
       "day": 1,
@@ -221,6 +221,15 @@
       "path": "day-24.html",
       "kind": "lesson",
       "publishedAt": "2026-08-25T09:00:42+09:00"
+    },
+    {
+      "day": 25,
+      "week": 4,
+      "title": "leader election과 unclean election 위험",
+      "summary": "KRaft controller의 안전 후보 선택과 leader epoch fencing, Kafka 4.x ELR, unclean election의 offset 손실 창을 RPO·RTO·장애 대응까지 연결합니다.",
+      "path": "day-25.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-26T09:09:21+09:00"
     }
   ]
 }

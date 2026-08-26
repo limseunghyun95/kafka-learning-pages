@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 25 · leader election과 unclean election 위험</title>
+</head>
+<body style="margin:0;background:#f0f3f8;color:#192333;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#f0f3f8"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d5deea;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#233f67;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#b8d3ff;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 4 / DAY 25 · REPLICATION</div>
+  <h1 style="margin:10px 0 8px;font-size:29px;line-height:1.25">leader election과 unclean election 위험</h1>
+  <p style="margin:0;color:#e5efff">안전 후보·epoch·ELR·유실 구간으로 failover를 설명하기 · 이론 75분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#edf4ff;border-left:5px solid #3d73bd;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Leader election은 단순히 살아 있는 replica 하나를 고르는 일이 아니다. <strong>확정된 log prefix를 가진 후보</strong>를 새 leader로 선택하고 epoch를 올려 과거 leader를 fencing하는 상태 전이다. 안전 후보가 없을 때 non-ISR replica를 고르는 unclean election은 RTO를 줄이는 대신 그 replica가 가지지 못한 record를 영구 포기하는 명시적 RPO 결정이다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #ccd9e8"><strong>Leader</strong></td><td style="padding:10px;border:1px solid #ccd9e8">한 partition의 현재 쓰기·읽기 기준 replica. Producer와 consumer는 controller가 아니라 partition leader의 broker와 data path를 만든다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #ccd9e8"><strong>Election</strong></td><td style="padding:10px;border:1px solid #ccd9e8">후보 중 하나를 새 권한자로 확정하는 선출. Kafka에서는 KRaft active controller가 partition metadata 상태 전이를 결정한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #ccd9e8"><strong>ISR</strong></td><td style="padding:10px;border:1px solid #ccd9e8">In-Sync Replicas. 현재 leader의 committed history를 충분히 따라온 동적 집합. 일반적인 clean election의 첫 후보군이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #ccd9e8"><strong>ELR</strong></td><td style="padding:10px;border:1px solid #ccd9e8">Eligible Leader Replicas. Kafka 4.x의 strict min ISR 규칙 덕분에 일부 non-ISR replica도 안전 후보가 될 수 있어 controller가 별도로 추적하는 집합이다. 임의의 stale replica와 같지 않다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #ccd9e8"><strong>Leader epoch</strong></td><td style="padding:10px;border:1px solid #ccd9e8">Partition leader 세대를 나타내는 단조 증가 번호. 새 선출 때 증가하며 과거 세대의 요청·log tail을 식별하고 fencing하는 논리 시계다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #ccd9e8"><strong>Fencing</strong></td><td style="padding:10px;border:1px solid #ccd9e8">오래된 권한자가 계속 쓰는 것을 막는 조치. Network partition으로 old leader가 살아 있어도 낮은 epoch의 권한을 거부해 split-brain write를 막는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #ccd9e8"><strong>LEO / HW</strong></td><td style="padding:10px;border:1px solid #ccd9e8">Log End Offset은 replica별 다음 append 위치, High Watermark는 안전하게 공개할 수 있는 next-offset 경계다. LEO가 크다는 사실만으로 안전 후보는 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #ccd9e8"><strong>Clean election</strong></td><td style="padding:10px;border:1px solid #ccd9e8">Committed prefix를 보존하는 후보를 선택하는 선출. Kafka 4.x에서는 ISR 우선, feature 조건을 만족하면 ELR도 안전 후보가 될 수 있다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #ccd9e8"><strong>Unclean election</strong></td><td style="padding:10px;border:1px solid #ccd9e8">안전 후보가 없을 때 ISR 밖의 뒤처진 replica를 last resort leader로 선택하는 선출. 빠른 복구와 data loss를 맞바꾼다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #ccd9e8"><strong>RPO / RTO</strong></td><td style="padding:10px;border:1px solid #ccd9e8">Recovery Point Objective는 허용 가능한 유실 시점, Recovery Time Objective는 허용 가능한 복구 시간. Unclean election은 RTO를 줄이기 위해 RPO를 악화시키는 결정이다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">2. 왜 중요한가</h2>
+  <p>Leader 장애 자체는 흔하다. 문제는 새 leader가 무엇을 알고 있느냐다. RF=3 partition에서 B1·B2가 offset 119까지 가졌지만 B3가 111까지만 가졌다고 하자. B1·B2가 동시에 사라진 뒤 B3를 leader로 세우면 service는 빨리 살아나지만 B3에 없는 offsets 112~119는 새 history에 존재하지 않는다. 나중에 B1이 돌아와도 더 긴 tail을 합치는 것이 아니라 현재 leader history에 맞춰 divergent tail을 버려야 한다.</p>
+  <p>그래서 “replica가 하나 살아 있으니 복구 가능”과 “성공 응답을 받은 record가 보존된다”는 다른 주장이다. 전자는 availability, 후자는 durability다. 면접과 장애 대응에서는 후보의 LEO만 보지 말고 ISR·ELR·HW·leader epoch·failure domain을 함께 설명해야 한다.</p>
+  <p>Kafka 4.3에서 <code>unclean.leader.election.enable</code>의 기본값은 <code>false</code>다. 이것은 안전 후보가 없으면 partition을 offline 상태로 남겨 data loss보다 가용성 중단을 선택한다는 뜻이다. 이를 켜는 행위는 단순한 설정 변경이 아니라 “얼마나 잃을 수 있는지, 어디서 재생할지, 누가 승인했는지”가 필요한 사고 대응 결정이다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">3. Architecture: leader 실패에서 새 epoch까지</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:27%;padding:12px;background:#294f83;color:#fff;border-radius:8px"><strong>1 · Detect</strong></td><td style="padding:12px;background:#edf4ff">B1 heartbeat/session 실패 → controller가 broker를 fenced로 판단</td></tr>
+    <tr><td colspan="2" align="center" style="color:#3d73bd;font-weight:800">&#8595; CONTROL PATH · broker registration / partition state</td></tr>
+    <tr><td style="padding:12px;background:#49657e;color:#fff;border-radius:8px"><strong>2 · Inspect</strong></td><td style="padding:12px;background:#eef3f7">P0: leader=B1, epoch=7, ISR=[B1,B2], ELR·fence 상태 확인</td></tr>
+    <tr><td colspan="2" align="center" style="color:#27836f;font-weight:800">&#8595; SAFE CANDIDATE · ISR → unfenced ELR → unfenced last-known leader</td></tr>
+    <tr><td style="padding:12px;background:#196758;color:#fff;border-radius:8px"><strong>3 · Elect</strong></td><td style="padding:12px;background:#eaf8f4">B2를 leader로 선택, leader epoch 7→8</td></tr>
+    <tr><td colspan="2" align="center" style="color:#8051a8;font-weight:800">&#8595; COMMIT · PartitionRecord를 KRaft metadata log에 확정</td></tr>
+    <tr><td style="padding:12px;background:#5f4080;color:#fff;border-radius:8px"><strong>4 · Apply</strong></td><td style="padding:12px;background:#f4ecfb">Broker가 metadata 적용, B2가 epoch 8 leader 역할 수락</td></tr>
+    <tr><td colspan="2" align="center" style="color:#b06a25;font-weight:800">&#8595; DATA PATH RESUME · client metadata refresh</td></tr>
+    <tr><td style="padding:12px;background:#7e4b20;color:#fff;border-radius:8px"><strong>5 · Serve</strong></td><td style="padding:12px;background:#fff4e7">Producer·consumer → B2, 복귀한 B1은 epoch 8 history로 수렴</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>Failure detection:</strong> Controller는 broker heartbeat와 registration epoch를 바탕으로 B1이 더는 현재 권한을 행사할 수 없다고 판단한다. Packet 하나가 늦었다고 즉시 죽은 것으로 단정하지 않으므로 detection timeout 동안 client latency와 retry가 발생한다.</li>
+    <li><strong>State lookup:</strong> Controller는 data record를 읽어 후보를 고르는 것이 아니라 KRaft metadata의 leader·ISR·ELR·fence 상태를 사용한다. Record bytes는 broker log에 남고 control path와 data path는 분리된다.</li>
+    <li><strong>Candidate order:</strong> Kafka 4.3 공식 ELR 문서의 순서는 ISR이 비어 있지 않으면 ISR, 다음은 unfenced ELR, 다음은 unfenced last-known leader다. ELR은 strict min ISR 때문에 committed prefix가 안전하다고 추론 가능한 후보이지 아무 non-ISR replica가 아니다.</li>
+    <li><strong>Authority commit:</strong> 새 leader와 증가한 epoch가 metadata log에 확정된다. 이 시점이 cluster의 새 권한 근거이며 broker들은 이를 적용해 stale leader를 fencing한다.</li>
+    <li><strong>Client recovery:</strong> Client가 stale metadata로 B1에 보내면 leader 관련 오류를 받고 metadata를 갱신해 B2로 재시도한다. 새 leader 선출 완료와 모든 client 정상화는 같은 시점이 아니다.</li>
+  </ol>
+
+  <h3 style="margin:24px 0 8px;color:#294f83">안전 후보가 없을 때의 두 갈래</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dde8f5"><th style="padding:9px;border:1px solid #c4d3e3">정책</th><th style="padding:9px;border:1px solid #c4d3e3">상태 전이</th><th style="padding:9px;border:1px solid #c4d3e3">얻는 것</th><th style="padding:9px;border:1px solid #c4d3e3">잃는 것</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3"><code>unclean=false</code></td><td style="padding:9px;border:1px solid #c4d3e3">P0 leader 없음·offline 유지</td><td style="padding:9px;border:1px solid #c4d3e3">Committed history 보존</td><td style="padding:9px;border:1px solid #c4d3e3">Read/write availability, RTO</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3"><code>unclean=true</code></td><td style="padding:9px;border:1px solid #c4d3e3">Stale non-ISR B3를 새 leader로 선택</td><td style="padding:9px;border:1px solid #c4d3e3">Service 복구 속도</td><td style="padding:9px;border:1px solid #c4d3e3">B3에 없는 record, RPO</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#294f83">상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dde8f5"><th align="left" style="padding:9px;border:1px solid #c4d3e3">상태</th><th align="left" style="padding:9px;border:1px solid #c4d3e3">소유자</th><th align="left" style="padding:9px;border:1px solid #c4d3e3">불변식·검증 질문</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3">Record bytes·LEO</td><td style="padding:9px;border:1px solid #c4d3e3">각 broker replica log</td><td style="padding:9px;border:1px solid #c4d3e3">Replica별 local 사실이다. 더 큰 LEO가 더 최신 committed history라는 보장은 없다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3">Leader·ISR·ELR·epoch</td><td style="padding:9px;border:1px solid #c4d3e3">KRaft controller + metadata log</td><td style="padding:9px;border:1px solid #c4d3e3">모든 broker가 같은 권한 순서를 적용해야 한다. Election마다 leader epoch는 증가한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3">HW</td><td style="padding:9px;border:1px solid #c4d3e3">Partition replication state</td><td style="padding:9px;border:1px solid #c4d3e3">안전 후보는 committed prefix를 포함해야 한다. Unclean 선출은 이 불변식을 의도적으로 포기할 수 있다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3">Broker fencing</td><td style="padding:9px;border:1px solid #c4d3e3">Controller authority·broker epoch</td><td style="padding:9px;border:1px solid #c4d3e3">동일 partition epoch에 복수 write authority를 허용하지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3">Client metadata</td><td style="padding:9px;border:1px solid #c4d3e3">각 producer·consumer cache</td><td style="padding:9px;border:1px solid #c4d3e3">일시적으로 stale할 수 있으므로 error→refresh→retry 흐름이 정상 protocol 일부다.</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#294f83">숫자로 보는 data loss window</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dde8f5"><th style="padding:8px;border:1px solid #c4d3e3">시점</th><th style="padding:8px;border:1px solid #c4d3e3">B1</th><th style="padding:8px;border:1px solid #c4d3e3">B2</th><th style="padding:8px;border:1px solid #c4d3e3">B3</th><th style="padding:8px;border:1px solid #c4d3e3">의미</th></tr>
+    <tr><td style="padding:8px;border:1px solid #c4d3e3">Epoch 7</td><td style="padding:8px;border:1px solid #c4d3e3">Leader LEO=120</td><td style="padding:8px;border:1px solid #c4d3e3">ISR LEO=120</td><td style="padding:8px;border:1px solid #c4d3e3">Non-ISR LEO=112</td><td style="padding:8px;border:1px solid #c4d3e3">Offsets 0~119와 0~111의 차이</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c4d3e3">B1 장애</td><td style="padding:8px;border:1px solid #c4d3e3">offline</td><td style="padding:8px;border:1px solid #c4d3e3">Clean leader, epoch 8</td><td style="padding:8px;border:1px solid #c4d3e3">catch-up</td><td style="padding:8px;border:1px solid #c4d3e3">B2가 prefix를 보존하므로 loss 없음</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c4d3e3">B1+B2 장애</td><td style="padding:8px;border:1px solid #c4d3e3">offline</td><td style="padding:8px;border:1px solid #c4d3e3">offline</td><td style="padding:8px;border:1px solid #c4d3e3">Unclean leader, epoch 9</td><td style="padding:8px;border:1px solid #c4d3e3">Offsets 112~119를 새 history에서 잃을 수 있음</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c4d3e3">B1 복귀</td><td style="padding:8px;border:1px solid #c4d3e3">Divergent tail 보유</td><td style="padding:8px;border:1px solid #c4d3e3">offline</td><td style="padding:8px;border:1px solid #c4d3e3">Current leader</td><td style="padding:8px;border:1px solid #c4d3e3">B1의 더 긴 tail은 승자가 아니며 epoch 9 history로 truncate·수렴</td></tr>
+  </table>
+  <p><strong>경계 계산:</strong> LEO는 next-offset이다. B3 LEO가 112라면 보유한 마지막 offset은 111이고, 이전 안전 history가 119까지였다면 잠재 유실 구간은 112~119, 최대 8 records다. 실제 손실은 당시 HW·ack 설정·ELR 상태를 확인해야 확정할 수 있다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#294f83">왜 더 긴 old leader log를 합치지 않는가</h3>
+  <p>두 replica의 log tail이 갈라진 뒤 record를 합치면 동일 offset에 서로 다른 record가 생기고 partition ordering이 깨진다. Kafka는 새 epoch의 leader history를 단일 진실로 정한다. 복귀 replica는 leader epoch cache와 end offset을 비교해 공통 prefix 뒤의 divergent tail을 truncate하고 follower fetch로 다시 채운다. 이 규칙이 deterministic convergence를 주지만, unclean election에서 버린 tail을 자동 복구해 주지는 않는다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#294f83">ELR은 unclean election의 다른 이름이 아니다</h3>
+  <p>Kafka 4.0부터 ELR이 제공되고 새 Kafka 4.1+ cluster에서는 기본 활성화된다. Strict min ISR에서는 ISR 크기가 min ISR보다 작으면 HW가 전진하지 않는다. 따라서 ISR에서 빠졌더라도 특정 시점의 committed prefix를 잃지 않은 replica를 controller가 ELR로 추적할 수 있다. 공식 4.3 선출 순서는 ISR → unfenced ELR → unfenced last-known leader다. ELR 후보는 안전성 근거가 있지만, 임의의 stale non-ISR 후보를 허용하는 unclean election은 data loss를 감수한다.</p>
+  <p>Feature level, upgrade 이력, cluster/topic min ISR 변경으로 ELR 상태가 달라질 수 있다. 특히 min ISR 변경은 ELR state 정리에 영향을 주므로 사고 중 “설정 하나만 낮추기”가 후보 상태까지 바꿀 수 있음을 고려한다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#294f83">성공 시점·failure window·비용</h3>
+  <p><strong>Election 성공</strong>은 controller가 새 leader·epoch metadata를 합의하고 broker가 이를 적용해 새 leader 역할을 수락할 수 있을 때다. <strong>Service 복구</strong>는 client metadata refresh와 retry까지 끝난 뒤다. 이 둘 사이에는 stale leader error, request timeout, producer unknown outcome, consumer fetch 재연결이 존재한다.</p>
+  <p>Failure detector timeout을 짧게 하면 RTO는 줄지만 일시 network jitter를 broker 장애로 오판해 election churn을 늘릴 수 있다. 길게 하면 false positive는 줄지만 offline partition 시간이 늘어난다. Election 자체보다 disk stall, controller event queue, metadata propagation, client DNS·connection 재수립이 tail latency를 좌우할 수 있다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dde8f5"><th align="left" style="padding:9px;border:1px solid #c4d3e3">상황</th><th align="left" style="padding:9px;border:1px solid #c4d3e3">권장 판단</th><th align="left" style="padding:9px;border:1px solid #c4d3e3">근거·trade-off</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3">결제·원장·CDC</td><td style="padding:9px;border:1px solid #c4d3e3">Unclean false, RF3+, min ISR2+, rack-aware</td><td style="padding:9px;border:1px solid #c4d3e3">짧은 중단보다 acknowledged event 유실 비용이 크다. Upstream replay도 정확히 검증해야 한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3">재생 가능한 telemetry</td><td style="padding:9px;border:1px solid #c4d3e3">Business RPO 수치화 후 topic별 예외 검토</td><td style="padding:9px;border:1px solid #c4d3e3">Source of truth가 남고 유실 window를 계산·재수집할 수 있을 때만 RTO 우선이 가능하다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3">안전 후보 없음</td><td style="padding:9px;border:1px solid #c4d3e3">Healthy ISR/ELR 복구를 1순위로</td><td style="padding:9px;border:1px solid #c4d3e3">Broker 전원·network·disk를 복구하면 data loss 없이 leader가 생길 수 있다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c4d3e3">불가피한 unclean</td><td style="padding:9px;border:1px solid #c4d3e3">증거 snapshot→승인→단일 topic→대사·replay</td><td style="padding:9px;border:1px solid #c4d3e3">Blast radius와 잠재 손실 offset·시간을 먼저 고정해야 복구 후 보정할 수 있다.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> Topic별 owner, RF/min ISR/unclean 정책, 허용 RPO·RTO, source-of-truth와 replay runbook을 코드로 관리한다. <code>OfflinePartitionsCount</code>, <code>LeaderElectionRateAndTimeMs</code>, <code>UncleanLeaderElectionsPerSec</code>, <code>ElectionFromEligibleLeaderReplicasPerSec</code>, ISR shrink, controller event queue, broker heartbeat·disk·network를 같은 timeline으로 본다. Unclean election rate의 정상 목표는 0이다.</p>
+  <p><strong>선행 증거:</strong> Topic describe의 leader·replicas·ISR·ELR, replica별 LEO/HW와 leader epoch, 마지막 성공 produce offset·timestamp, controller/broker log, broker fence 상태, rack/AZ, upstream source offset을 보존한다. 설정 변경 전에 loss lower/upper bound를 문서화한다.</p>
+  <p><strong>Anti-pattern:</strong> Offline partition 수를 빨리 0으로 만들려고 cluster-wide unclean을 켜기, min ISR 하향과 unclean enable을 동시에 수행하기, 모든 broker를 함께 재시작하기, stale replica log를 삭제하기, RF=3이면 세 copy가 모두 최신이라고 가정하기, KRaft controller leader와 data partition leader를 혼동하기.</p>
+  <p><strong>Edge case:</strong> Controller quorum은 건강하지만 특정 partition만 leader가 없을 수 있다. 반대로 controller quorum 장애는 새 election을 막아도 이미 알려진 data leader가 잠시 요청을 처리할 수 있다. Rack label 누락, 같은 AZ의 replica 집중, remote tier에 segment가 있다는 사실, compacted topic의 key history, transaction marker는 leader eligibility를 대신하지 않는다.</p>
+  <p><strong>Version/engine:</strong> 이 자료는 Kafka 4.3 KRaft 기준이다. 새 Kafka 4.1+ cluster의 ELR 기본 활성화와 upgrade cluster의 feature level은 다를 수 있다. KRaft에서 unclean 설정을 동적으로 켜면 periodic unclean election thread까지 기본 5분을 기다릴 수 있어, 즉시 필요하면 공식 CLI의 unclean election을 별도로 실행한다. ZooKeeper 방식은 legacy 비교에만 둔다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffead6"><th style="padding:7px;border:1px solid #e5c5a5">증상</th><th style="padding:7px;border:1px solid #e5c5a5">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e5c5a5">가능한 가설</th><th style="padding:7px;border:1px solid #e5c5a5">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e5c5a5">rollback/복구</th><th style="padding:7px;border:1px solid #e5c5a5">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">Offline partition 증가</td><td style="padding:7px;border:1px solid #e5c5a5">Leader/ISR/ELR, broker fence, controller log, rack/AZ</td><td style="padding:7px;border:1px solid #e5c5a5">안전 후보 모두 offline, controller 전이 지연</td><td style="padding:7px;border:1px solid #e5c5a5">최신 ISR/ELR broker의 network·disk부터 복구</td><td style="padding:7px;border:1px solid #e5c5a5">Clean leader 후 HW·client success 확인</td><td style="padding:7px;border:1px solid #e5c5a5">Cluster-wide unclean enable</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">Election 반복·latency spike</td><td style="padding:7px;border:1px solid #e5c5a5">Election rate, heartbeat, GC, disk await, packet loss, epochs</td><td style="padding:7px;border:1px solid #e5c5a5">Flapping broker, false failure detection, controller backlog</td><td style="padding:7px;border:1px solid #e5c5a5">불안정 broker 격리·traffic 보호, 증거 보존</td><td style="padding:7px;border:1px solid #e5c5a5">원인 제거 후 ISR catch-up·preferred balance</td><td style="padding:7px;border:1px solid #e5c5a5">Timeout만 무작정 확대</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">Unclean election 발생</td><td style="padding:7px;border:1px solid #e5c5a5">Unclean metric, old/new LEO·HW·epoch, last ack, source offset</td><td style="padding:7px;border:1px solid #e5c5a5">안전 후보 소실 뒤 stale replica 승격</td><td style="padding:7px;border:1px solid #e5c5a5">추가 write 제한, 잠재 손실 offset·시간 확정</td><td style="padding:7px;border:1px solid #e5c5a5">Source 대사·idempotent replay·consumer 검증</td><td style="padding:7px;border:1px solid #e5c5a5">Old log를 임의 merge</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">복귀 broker가 truncate</td><td style="padding:7px;border:1px solid #e5c5a5">Leader epoch cache, truncation log, segment backup, offsets</td><td style="padding:7px;border:1px solid #e5c5a5">Unclean 후 divergent tail 수렴</td><td style="padding:7px;border:1px solid #e5c5a5">Affected partition freeze·forensic copy·owner 통지</td><td style="padding:7px;border:1px solid #e5c5a5">Authoritative source에서 missing range replay</td><td style="padding:7px;border:1px solid #e5c5a5">Broker log directory 삭제</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">7. 30분 실습: leader가 없을 때 후보의 의미</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측</strong><br>
+  RF=1 partition의 유일한 broker를 멈추면 다른 leader가 선출될까? Preferred election은 data loss를 만들까? <code>unclean=false</code> override는 단일 broker 복구 동작을 어떻게 바꿀까?</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker, 공식 Kafka 4.3.1 단일 broker KRaft. 단일 broker에서는 clean/unclean 다중 replica 비교를 재현할 수 없다. 오늘은 “후보가 없으면 election도 없다”와 config·leader 상태를 관찰하고, Week 4 통합 랩에서 3-broker failure injection으로 확장한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#294f83">Step 1 · Topic과 안전 정책 고정</h3>
+  <code style="display:block;padding:10px;background:#112437;color:#edf6ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day25.election --partitions 1 --replication-factor 1 \
+  --config unclean.leader.election.enable=false
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic day25.election
+docker compose exec broker /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 --entity-type topics \
+  --entity-name day25.election --describe</code>
+  <p><strong>예상:</strong> Leader·Replicas·Isr가 모두 broker 1을 가리키고 topic override가 <code>false</code>다. RF=1이므로 안전한 대체 후보는 0개다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#294f83">Step 2 · Preferred election은 안전한 재배치 요청</h3>
+  <code style="display:block;padding:10px;background:#112437;color:#edf6ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-leader-election.sh \
+  --bootstrap-server localhost:9092 --election-type preferred \
+  --topic day25.election --partition 0</code>
+  <p><strong>예상:</strong> 이미 preferred replica가 leader이므로 실질 변경이 없거나 election이 성공했다는 결과가 나온다. 이 명령은 stale non-ISR를 강제로 고르는 unclean 명령이 아니다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#294f83">Step 3 · 실패 주입: 유일한 후보 중단</h3>
+  <code style="display:block;padding:10px;background:#112437;color:#edf6ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose stop broker
+docker compose ps</code>
+  <p><strong>예상:</strong> 대체 replica도, controller·broker process도 없으므로 partition은 서비스를 제공하지 못한다. Unclean election은 없는 replica를 만들어 내지 않는다. RF와 failure domain이 먼저다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#294f83">Step 4 · 같은 log를 가진 broker 복구</h3>
+  <code style="display:block;padding:10px;background:#112437;color:#edf6ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose start broker
+make status
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic day25.election</code>
+  <p><strong>예상:</strong> 기존 local log와 metadata를 가진 broker가 healthy가 되면 leader·ISR가 다시 보인다. 이것은 stale non-ISR 승격이 아니라 같은 replica 복구다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#294f83">Step 5 · 종이 failure injection으로 손실 계산</h3>
+  <p>B1/B2 LEO=120, B3 LEO=112, 이전 leader epoch=7을 적는다. B1만 죽으면 B2 clean leader epoch=8, B1·B2가 모두 죽고 B3가 unclean leader가 되면 epoch=9다. 실행 전에 “보존 마지막 offset=111, 잠재 손실=112~119, 8 records”를 계산한다. 이 계산을 실제 incident의 replica LEO/HW와 대조하는 것이 실습 목표다.</p>
+  <p><strong>자주 나는 오류와 해결:</strong> Startup 직후 connection refused는 <code>make status</code>가 healthy일 때까지 기다린다. Preferred election 결과가 “no election needed”여도 정상이다. Topic이 남아 있으면 config describe로 override를 확인한다. 단일 broker 결과를 RF=3의 clean/unclean 실험으로 과장하지 않는다.</p>
+  <p><strong>Cleanup:</strong></p>
+  <code style="display:block;padding:10px;background:#112437;color:#edf6ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day25.election
+make down</code>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>LEO가 가장 큼 ≠ 안전 후보:</strong> Divergent uncommitted tail일 수 있다. ISR·ELR·HW·epoch가 근거다.</li>
+    <li><strong>ELR ≠ arbitrary non-ISR:</strong> Strict min ISR가 준 안전성으로 controller가 추적한 후보다.</li>
+    <li><strong>Election 완료 ≠ client 정상화:</strong> Metadata refresh·TCP 재연결·retry가 남는다.</li>
+    <li><strong>Unclean election ≠ 복구:</strong> 가용성을 위해 history 일부를 포기하는 새 기준점 생성이다.</li>
+    <li><strong>Old leader의 긴 tail ≠ 복원 원본:</strong> 새 epoch와 충돌하면 truncate 대상이다. 별도 source-of-truth로 대사한다.</li>
+    <li><strong>RF3 ≠ AZ3:</strong> Rack-aware 배치와 실제 장애 domain을 확인한다.</li>
+    <li><strong>Controller leader ≠ partition leader:</strong> 전자는 metadata control path, 후자는 record data path를 담당한다.</li>
+    <li><strong>Dynamic enable ≠ 즉시 election:</strong> KRaft periodic thread 지연이 있어 즉시 실행은 별도 CLI와 승인 절차가 필요하다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. RF=3 partition leader가 죽었을 때 election 전체를 설명하세요.</strong><br>
+  좋은 답변 구조: failure domain·heartbeat 가정 → controller의 leader/ISR/ELR/fence 조회 → ISR 우선 후보 선택 → PartitionRecord·epoch 증가 합의 → broker 적용·old leader fencing → client metadata refresh → RTO와 controller/network/disk 지표 → 후보가 없을 때 안전 중단.</p>
+  <p><strong>Q2. Unclean election을 켜 달라는 장애 요청을 받으면 어떻게 판단합니까?</strong><br>
+  좋은 답변 구조: Business RPO/RTO·topic 중요도 확인 → ISR/ELR·replica별 LEO/HW/epoch와 source-of-truth 수집 → 잠재 손실 offset·시간 계산 → 안전 replica 복구 대안 → topic 단위 승인·blast radius → unclean 후 write 제한 → 대사·idempotent replay·rollback 계획.</p>
+  <p><strong>Q3. Kafka 4.x ELR은 왜 non-ISR인데도 clean 후보가 될 수 있나요?</strong><br>
+  좋은 답변 구조: ISR·min ISR·HW 정의 → strict min ISR에서 ISR 미달 시 HW가 전진하지 않는 불변식 → controller의 ELR 추적 → ISR→ELR→last-known leader 순서 → arbitrary stale replica와 구분 → feature level·min ISR 변경 edge case → ELR metric과 운영 검증.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#294f83">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>ISR=3, min ISR=2에서 <code>acks=all</code>은 몇 replica를 기다리는가?</li><li><code>NotEnoughReplicas</code>와 <code>NotEnoughReplicasAfterAppend</code>의 failure window 차이는?</li><li>RF=3·min ISR=2가 서로 다른 AZ의 두 copy를 보장하지 않는 이유는?</li></ol>
+  <p style="padding:12px;background:#f2f6f9"><strong>짧은 정답:</strong> ① 현재 ISR 전체 3개이며 min ISR은 admission floor다. ② 전자는 append 전 거부, 후자는 local append 뒤 안전 조건 미달이라 결과가 불명확할 수 있다. ③ Min ISR은 개수만 세고 rack/AZ placement는 별도 rack-aware assignment가 담당한다.</p>
+  <h3 style="margin:16px 0 8px;color:#294f83">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>Clean election에서 leader epoch는 왜 증가해야 하는가?</li><li>B1/B2 LEO=120, B3 LEO=112에서 B3 unclean 선출 시 잠재 손실 offset은?</li><li>ELR과 unclean non-ISR replica의 가장 중요한 차이는?</li></ol>
+  <p style="padding:12px;background:#f2f6f9"><strong>채점 기준:</strong> ① 새 authority 순서를 확정하고 stale leader/request를 fencing하며 divergent log를 수렴시킨다고 설명(3점). ② B3는 0~111을 보유하므로 112~119, 최대 8 records라고 next-offset까지 계산(3점). ③ ELR은 strict min ISR 근거로 controller가 추적한 안전 후보이고 unclean 후보는 committed prefix 보장이 없어 data loss가 가능하다고 구분(4점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#294f83">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/operations/eligible-leader-replicas/" style="color:#294f83">Apache Kafka 4.3 Eligible Leader Replicas</a> — strict min ISR, ELR 상태와 공식 leader 선택 순서</li>
+    <li><a href="https://kafka.apache.org/43/configuration/topic-configs/" style="color:#294f83">Apache Kafka 4.3 Topic Configs</a> — unclean election 의미·기본값과 KRaft 동적 적용 주의</li>
+    <li><a href="https://kafka.apache.org/43/operations/basic-kafka-operations/" style="color:#294f83">Apache Kafka 4.3 Basic Operations</a> — preferred leader election CLI와 rack-aware 배치</li>
+    <li><a href="https://kafka.apache.org/43/operations/monitoring/" style="color:#294f83">Apache Kafka 4.3 Monitoring</a> — clean·unclean·ELR election 지표</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#233f67;color:#fff;border-radius:10px"><strong>내일 예고 · Day 26</strong><br>KRaft metadata log·quorum·controller 역할 — record data path와 metadata control path를 분리하고, quorum 합의·active controller·broker fencing의 성공 시점과 장애 창을 추적한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>
