@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-26T09:09:21+09:00",
+  "updatedAt": "2026-08-27T09:08:02+09:00",
   "lessons": [
     {
       "day": 1,
@@ -230,6 +230,15 @@
       "path": "day-25.html",
       "kind": "lesson",
       "publishedAt": "2026-08-26T09:09:21+09:00"
+    },
+    {
+      "day": 26,
+      "week": 4,
+      "title": "KRaft metadata log·quorum·controller 역할",
+      "summary": "관리 요청이 KRaft metadata record로 직렬화되고 controller voter 과반에 commit된 뒤 broker image에 적용되는 흐름을 장애·운영 관점까지 연결합니다.",
+      "path": "day-26.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-27T09:08:02+09:00"
     }
   ]
 }

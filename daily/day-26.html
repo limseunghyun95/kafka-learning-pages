@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 26 · KRaft metadata log·quorum·controller 역할</title>
+</head>
+<body style="margin:0;background:#eef3f2;color:#182727;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#eef3f2"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d2dfdc;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#184f4b;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#aee3da;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 4 / DAY 26 · KRAFT CONTROL PLANE</div>
+  <h1 style="margin:10px 0 8px;font-size:29px;line-height:1.25">KRaft metadata log·quorum·controller 역할</h1>
+  <p style="margin:0;color:#def7f2">관리 요청이 합의된 metadata가 되어 broker에 적용되기까지 · 이론 80분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#eaf7f4;border-left:5px solid #2d887d;border-radius:10px"><strong>한 줄 요약</strong><br>
+  KRaft는 topic·partition·broker registration·leader/ISR 같은 cluster metadata를 <strong>단일 replicated metadata log</strong>에 기록한다. Controller voter 과반수가 record를 복제해 metadata high watermark가 전진한 뒤에야 변경은 committed가 되며, active controller는 결정을 직렬화하고 broker는 committed delta를 적용한다. Record data는 이 경로를 지나지 않는다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #c9dcd8"><strong>Metadata</strong></td><td style="padding:10px;border:1px solid #c9dcd8">데이터 자체가 아니라 데이터를 찾고 운영하기 위한 정보. Topic ID·partition assignment·leader·ISR·broker endpoint·config·ACL 등이 해당한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>Control plane</strong></td><td style="padding:10px;border:1px solid #c9dcd8">누가 leader인지, 어디에 replica를 둘지 같은 규칙과 상태를 결정하는 경로. Producer record가 흐르는 data plane과 구분한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>Data plane</strong></td><td style="padding:10px;border:1px solid #c9dcd8">Producer→partition leader→follower, partition leader→consumer로 실제 event bytes가 이동하는 경로. Controller가 매 record를 중계하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>KRaft</strong></td><td style="padding:10px;border:1px solid #c9dcd8">Kafka Raft Metadata mode. ZooKeeper 없이 Kafka controller들이 자체 Raft 계열 protocol로 metadata log를 합의한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>Quorum</strong></td><td style="padding:10px;border:1px solid #c9dcd8">결정을 확정하기 위해 필요한 투표 집합. Voter가 3개면 과반 2개, 5개면 과반 3개가 필요하다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>Voter</strong></td><td style="padding:10px;border:1px solid #c9dcd8">Metadata quorum election에 투표하고 active controller 후보가 될 수 있는 controller replica.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>Observer</strong></td><td style="padding:10px;border:1px solid #c9dcd8">Metadata log를 fetch하지만 투표하거나 quorum leader가 되지 않는 replica. KRaft broker는 metadata를 따라가는 observer 역할을 한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>Active controller</strong></td><td style="padding:10px;border:1px solid #c9dcd8">현재 metadata quorum leader이자 cluster metadata mutation을 직렬화하는 단 하나의 controller. 나머지 controllers는 hot standby다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>Metadata record</strong></td><td style="padding:10px;border:1px solid #c9dcd8">TopicRecord·PartitionRecord·BrokerRegistrationRecord처럼 하나의 상태 변경을 표현하는 append-only log entry.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>HW / LEO</strong></td><td style="padding:10px;border:1px solid #c9dcd8">Metadata high watermark는 voter 과반수에 복제돼 committed인 next-offset 경계, log end offset은 replica별 local append 끝이다. Data partition의 ISR 기반 HW와 이름은 같지만 commit 규칙은 다르다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>Metadata image</strong></td><td style="padding:10px;border:1px solid #c9dcd8">Snapshot과 committed deltas를 적용해 만든 특정 offset 시점의 전체 cluster metadata view.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dcd8"><strong>Fencing</strong></td><td style="padding:10px;border:1px solid #c9dcd8">낡거나 준비되지 않은 broker/controller가 권한을 행사하지 못하게 막는 것. Broker epoch·controller epoch가 zombie process를 구분한다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">2. 왜 중요한가</h2>
+  <p>Kafka cluster에서 topic 생성, partition leader 교체, ISR 변경, broker 등록은 모든 node가 같은 순서로 보아야 한다. B1은 P0 leader가 B2라고 보고 B3은 B4라고 보면 producer routing과 replica truncation이 충돌한다. 그래서 metadata는 단순 cache가 아니라 <strong>cluster 전체 권한의 순서</strong>다.</p>
+  <p>KRaft는 이 순서를 <code>__cluster_metadata-0</code>이라는 내부 metadata partition의 record log로 만든다. Active controller가 mutation을 검증하고 append하며 controller voter 과반이 복제하면 high watermark가 전진한다. Committed record를 controller·broker가 같은 순서로 적용하므로 동일한 metadata image로 수렴한다.</p>
+  <p>면접에서는 “KRaft가 ZooKeeper를 없앴다”로 끝내면 얕다. Admin 요청 성공 시점, active controller의 uncommitted future state, quorum 과반 상실 시 가능한 것과 불가능한 것, broker heartbeat와 metadata fetch의 분리, snapshot recovery, data path가 계속될 수 있는 경계를 설명해야 한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">3. Architecture: CreateTopics가 committed metadata가 되기까지</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:28%;padding:12px;background:#236a64;color:#fff;border-radius:8px"><strong>1 · Admin client</strong></td><td style="padding:12px;background:#eaf7f4"><code>CreateTopics(orders, P=6, RF=3)</code> → bootstrap broker</td></tr>
+    <tr><td colspan="2" align="center" style="color:#2d887d;font-weight:800">&#8595; CONTROL PATH · request forwarding / active controller discovery</td></tr>
+    <tr><td style="padding:12px;background:#3f6e6a;color:#fff;border-radius:8px"><strong>2 · Controller</strong></td><td style="padding:12px;background:#edf5f4">Validate name·quota·placement → TopicRecord + PartitionRecords</td></tr>
+    <tr><td colspan="2" align="center" style="color:#355e9c;font-weight:800">&#8595; APPEND · metadata leader local LEO advances, not yet committed</td></tr>
+    <tr><td style="padding:12px;background:#34598d;color:#fff;border-radius:8px"><strong>3 · Voters</strong></td><td style="padding:12px;background:#edf2fa">Standby controllers pull Fetch → local append·persist → majority progress</td></tr>
+    <tr><td colspan="2" align="center" style="color:#8051a8;font-weight:800">&#8595; QUORUM COMMIT · metadata HW passes the batch</td></tr>
+    <tr><td style="padding:12px;background:#65437e;color:#fff;border-radius:8px"><strong>4 · Apply</strong></td><td style="padding:12px;background:#f4edfa">Committed deltas → controller metadata image → response success</td></tr>
+    <tr><td colspan="2" align="center" style="color:#a76523;font-weight:800">&#8595; PROPAGATE · brokers observe/fetch committed metadata</td></tr>
+    <tr><td style="padding:12px;background:#85531f;color:#fff;border-radius:8px"><strong>5 · Brokers</strong></td><td style="padding:12px;background:#fff4e7">MetadataDelta→MetadataImage 적용, replicas·leaders 준비</td></tr>
+    <tr><td colspan="2" align="center" style="color:#a52f44;font-weight:800">&#8595; DATA PATH · producer record bytes bypass controllers</td></tr>
+    <tr><td style="padding:12px;background:#862c3e;color:#fff;border-radius:8px"><strong>6 · Clients</strong></td><td style="padding:12px;background:#fff0f2">Metadata refresh → partition leader broker로 produce/fetch</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>접수:</strong> AdminClient는 broker endpoint로 요청할 수 있고, broker는 active controller에 mutation을 전달한다. Non-active controller는 현재 권한자가 아니므로 직접 결정을 확정하지 않는다.</li>
+    <li><strong>검증과 직렬화:</strong> Active controller는 committed image와 아직 commit 대기 중인 in-memory state를 고려해 중복 topic·quota·replica placement를 판단한다. 여러 mutation을 하나의 순서로 만든다.</li>
+    <li><strong>Local append ≠ 성공:</strong> Controller leader의 LEO가 전진해도 아직 과반 복제가 아니면 uncommitted다. 이때 leader가 죽으면 새 leader가 그 tail을 버릴 수 있다.</li>
+    <li><strong>Quorum commit:</strong> Voter 과반수가 해당 offset까지 복제해 metadata HW가 batch 뒤로 전진해야 durability가 생긴다. KIP-595의 protocol은 quorum log append를 local disk에 동기화한 뒤 인정하도록 설계한다.</li>
+    <li><strong>Apply와 응답:</strong> Committed record를 state machine에 적용해 metadata image가 전진하고 요청 결과가 성공으로 확정된다. 응답 packet이 유실되면 server commit과 client timeout이 동시에 가능하다.</li>
+    <li><strong>Broker propagation:</strong> Broker는 observer로 committed metadata를 fetch해 delta를 local image에 적용한다. Admin 성공 직후 모든 broker가 같은 offset까지 적용했다는 뜻은 아니므로 짧은 propagation lag가 가능하다.</li>
+    <li><strong>Data path 분리:</strong> 이후 producer batch와 consumer fetch는 partition leader broker로 직접 간다. Controller quorum은 record마다 hot path에 끼지 않는다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#236a64">상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcece9"><th align="left" style="padding:9px;border:1px solid #bfd6d1">상태</th><th align="left" style="padding:9px;border:1px solid #bfd6d1">권위 있는 소유자</th><th align="left" style="padding:9px;border:1px solid #bfd6d1">불변식·검증 질문</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Quorum leader·epoch</td><td style="padding:9px;border:1px solid #bfd6d1">Controller voters의 Raft state</td><td style="padding:9px;border:1px solid #bfd6d1">한 epoch에는 active controller 하나. Candidate는 과반 vote를 얻어야 leader가 된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Metadata log</td><td style="padding:9px;border:1px solid #bfd6d1">각 controller replica disk</td><td style="padding:9px;border:1px solid #bfd6d1">Offset+epoch 순서가 동일해야 하고 committed prefix는 새 leader에서 보존된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Metadata HW</td><td style="padding:9px;border:1px solid #bfd6d1">Quorum replication progress</td><td style="padding:9px;border:1px solid #bfd6d1">Voter 과반에 복제된 next-offset 경계. Data partition ISR HW와 계산법이 다르다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Controller image</td><td style="padding:9px;border:1px solid #bfd6d1">Committed records를 적용한 controller state machine</td><td style="padding:9px;border:1px solid #bfd6d1">Committed offset까지만 외부에 확정된 사실이다. Active controller는 uncommitted future state도 별도로 추적한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Broker registration·epoch</td><td style="padding:9px;border:1px solid #bfd6d1">Metadata log + active controller</td><td style="padding:9px;border:1px solid #bfd6d1">같은 broker ID의 오래된 incarnation은 더 높은 broker epoch로 fencing된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Broker liveness lease</td><td style="padding:9px;border:1px solid #bfd6d1">Active controller heartbeat state</td><td style="padding:9px;border:1px solid #bfd6d1">Heartbeat가 session timeout을 넘기면 broker를 fenced로 전이한다. Registration과 일시 liveness를 구분한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Broker metadata image</td><td style="padding:9px;border:1px solid #bfd6d1">각 broker MetadataLoader·Publisher</td><td style="padding:9px;border:1px solid #bfd6d1">Committed delta만 순서대로 적용하고 last-applied offset으로 controller와 lag를 측정한다.</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#236a64">Quorum 수학: 왜 2N+1인가</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dcece9"><th style="padding:8px;border:1px solid #bfd6d1">Voters</th><th style="padding:8px;border:1px solid #bfd6d1">Commit·election 과반</th><th style="padding:8px;border:1px solid #bfd6d1">동시 실패 허용</th><th style="padding:8px;border:1px solid #bfd6d1">판단</th></tr>
+    <tr><td style="padding:8px;border:1px solid #bfd6d1">1</td><td style="padding:8px;border:1px solid #bfd6d1">1</td><td style="padding:8px;border:1px solid #bfd6d1">0</td><td style="padding:8px;border:1px solid #bfd6d1">로컬 개발. Process 중단 즉시 control plane down.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #bfd6d1">2</td><td style="padding:8px;border:1px solid #bfd6d1">2</td><td style="padding:8px;border:1px solid #bfd6d1">0</td><td style="padding:8px;border:1px solid #bfd6d1">한 node만 잃어도 과반 불가. HA 이점 없음.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #bfd6d1">3</td><td style="padding:8px;border:1px solid #bfd6d1">2</td><td style="padding:8px;border:1px solid #bfd6d1">1</td><td style="padding:8px;border:1px solid #bfd6d1">한 controller 장애를 견디는 흔한 production 출발점.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #bfd6d1">5</td><td style="padding:8px;border:1px solid #bfd6d1">3</td><td style="padding:8px;border:1px solid #bfd6d1">2</td><td style="padding:8px;border:1px solid #bfd6d1">더 큰 failure budget, 더 높은 운영·network 비용.</td></tr>
+  </table>
+  <p>어떤 두 과반 집합도 최소 한 voter를 공유한다. 이 교집합과 epoch/vote 규칙이 서로 다른 두 leader가 같은 epoch의 committed history를 만들지 못하게 한다. 공식 4.3 운영 문서는 N개 동시 controller 실패를 견디려면 <code>2N+1</code> controllers가 필요하다고 설명한다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#236a64">Data partition ISR와 metadata quorum은 다르다</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dcece9"><th style="padding:8px;border:1px solid #bfd6d1">비교</th><th style="padding:8px;border:1px solid #bfd6d1">Data partition</th><th style="padding:8px;border:1px solid #bfd6d1">Metadata partition</th></tr>
+    <tr><td style="padding:8px;border:1px solid #bfd6d1">내용</td><td style="padding:8px;border:1px solid #bfd6d1">사용자 event record</td><td style="padding:8px;border:1px solid #bfd6d1">Topic·partition·broker·config state changes</td></tr>
+    <tr><td style="padding:8px;border:1px solid #bfd6d1">Replica 역할</td><td style="padding:8px;border:1px solid #bfd6d1">Leader + ISR followers</td><td style="padding:8px;border:1px solid #bfd6d1">Raft leader + voters; brokers are observers</td></tr>
+    <tr><td style="padding:8px;border:1px solid #bfd6d1">Commit</td><td style="padding:8px;border:1px solid #bfd6d1">ISR/min ISR·acks 정책</td><td style="padding:8px;border:1px solid #bfd6d1">Voter majority replication</td></tr>
+    <tr><td style="padding:8px;border:1px solid #bfd6d1">Leader 선택</td><td style="padding:8px;border:1px solid #bfd6d1">Active controller가 partition metadata 변경</td><td style="padding:8px;border:1px solid #bfd6d1">Voters가 자체 election·vote</td></tr>
+    <tr><td style="padding:8px;border:1px solid #bfd6d1">Hot path</td><td style="padding:8px;border:1px solid #bfd6d1">Producer·consumer throughput 경로</td><td style="padding:8px;border:1px solid #bfd6d1">관리·failure state transition 경로</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#236a64">Broker registration·heartbeat·metadata fetch</h3>
+  <p>Broker가 시작하면 active controller에 등록하고 incarnation ID와 broker epoch로 현재 process를 식별한다. 시작 직후에는 log recovery와 metadata catch-up이 끝나지 않았으므로 fenced 상태가 안전하다. Broker는 heartbeat에서 현재 metadata offset과 준비 상태를 보내고, controller는 metadata가 충분히 최신이며 recovery가 끝난 broker만 unfence한다.</p>
+  <p>Heartbeat는 liveness lease, metadata fetch는 state replication이라는 서로 다른 책임이다. Kafka 4.3 broker config의 기본은 <code>broker.heartbeat.interval.ms=2000</code>, <code>broker.session.timeout.ms=9000</code>이다. 한두 packet 지연을 즉시 장애로 오판하지 않으면서 약 9초 lease 안에 failure를 탐지한다. 이 값은 network jitter·GC pause·controller load와 함께 판단한다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#236a64">Snapshot·delta·recovery 비용</h3>
+  <p>Metadata log는 변경 이력이라 시간이 갈수록 길어진다. Controller는 특정 committed offset까지의 전체 image를 snapshot으로 만들어 과거 deltas를 압축한다. 새 controller는 snapshot을 읽고 그 이후 log suffix만 replay해 현재 image를 복원한다. Snapshot은 각 replica가 local로 생성할 수 있으며 생성 시점은 달라도 같은 committed state를 재구성해야 한다.</p>
+  <p>Snapshot 생성은 user topic의 compaction policy와 다르며, 파일을 임의 삭제하는 운영 작업이 아니다. <code>kafka-dump-log.sh --cluster-metadata-decoder</code>와 metadata shell은 forensic 도구이고 production에서 live metadata 파일을 수정하는 도구가 아니다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#236a64">성공 시점과 다섯 failure window</h3>
+  <ol style="padding-left:22px">
+    <li><strong>Forward 전:</strong> Bootstrap broker가 active controller를 모르거나 election 중이면 request가 재시도·timeout될 수 있다. Metadata는 바뀌지 않았다.</li>
+    <li><strong>Append 전:</strong> Validation·quota·authorization 오류면 record가 없다. Client는 원인을 수정해 새 요청을 보낸다.</li>
+    <li><strong>Append 후 commit 전:</strong> Active controller local tail에만 있으면 leader failover 때 truncate 가능하다. Client 관점 outcome은 미확정이다.</li>
+    <li><strong>Commit 후 response 전:</strong> Metadata HW는 전진했지만 response가 유실될 수 있다. Retry는 이미 존재하는 topic/config를 발견할 수 있으므로 request identity·desired state로 멱등하게 처리한다.</li>
+    <li><strong>Commit 후 broker apply 전:</strong> Controller는 성공했지만 일부 broker의 last-applied offset이 뒤일 수 있다. Stale metadata error를 짧게 재시도하고 apply lag·error를 확인한다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dcece9"><th align="left" style="padding:9px;border:1px solid #bfd6d1">결정</th><th align="left" style="padding:9px;border:1px solid #bfd6d1">권장 출발점</th><th align="left" style="padding:9px;border:1px solid #bfd6d1">이유·trade-off</th></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Controller 수</td><td style="padding:9px;border:1px solid #bfd6d1">최소 3, 요구 failure N이면 2N+1</td><td style="padding:9px;border:1px solid #bfd6d1">과반 안전성과 가용성. Voter 증가는 cross-node commit·운영 비용도 늘린다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Process roles</td><td style="padding:9px;border:1px solid #bfd6d1">Production은 dedicated controller</td><td style="padding:9px;border:1px solid #bfd6d1">Broker data I/O·GC와 controller election·event queue failure domain을 분리. Combined는 개발에 편리.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Placement</td><td style="padding:9px;border:1px solid #bfd6d1">한 region의 서로 다른 AZ·power domain</td><td style="padding:9px;border:1px solid #bfd6d1">한 AZ 상실을 견디되 quorum RTT를 과도한 장거리 network에 묶지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Disk</td><td style="padding:9px;border:1px solid #bfd6d1">Metadata log 전용 용량·latency·backup 관찰</td><td style="padding:9px;border:1px solid #bfd6d1">작은 byte volume이라도 fsync stall은 전체 control plane latency로 확대된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #bfd6d1">Automation</td><td style="padding:9px;border:1px solid #bfd6d1">Desired-state·request ID·post-condition 검증</td><td style="padding:9px;border:1px solid #bfd6d1">Commit 후 response 유실에서 blind retry·중복 mutation을 줄인다.</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> <code>kafka-metadata-quorum.sh describe --status</code>와 <code>--replication</code>을 runbook 첫 단계에 둔다. CurrentLeader·CurrentEpoch·HW·LEO·MaxFollowerLag, ActiveControllerCount, controller EventQueueTime/ProcessingTime, LastCommittedRecordOffset, LastAppliedRecordOffset/Lag, MetadataErrorCount, broker MetadataLoad/ApplyErrorCount, FencedBrokerCount를 같은 dashboard와 timeline으로 본다.</p>
+  <p><strong>배포:</strong> Controller와 broker listener·security를 분리하고 <code>controller.listener.names</code>, <code>controller.quorum.bootstrap.servers</code>, cluster ID, node/directory ID를 구성 관리한다. Kafka 4.3 dynamic quorum에서는 controller를 먼저 provision·catch-up한 뒤 add하고, remove-controller로 membership에서 제거한 뒤 종료한다. Old static <code>controller.quorum.voters</code>와 dynamic bootstrap 방식을 혼용하지 않는다.</p>
+  <p><strong>Anti-pattern:</strong> 2-controller quorum을 HA라 부르기, production combined mode에 broker I/O를 무제한 싣기, 과반 장애에서 broker 전체 재시작, metadata directory 삭제·복사로 cluster를 임의 복구, controller HW와 data partition HW 혼동, Admin timeout을 확정 실패로 보고 다른 이름의 topic 생성.</p>
+  <p><strong>Edge case:</strong> Active controller 하나만 죽고 voter 과반이 살아 있으면 hot standby가 새 leader가 될 수 있다. 반대로 controller 과반이 없으면 metadata mutation·partition leader election·broker fencing 전이는 멈추지만, 이미 leader와 metadata를 적용한 broker의 기존 data path는 잠시 계속될 수 있다. 따라서 “Kafka 전체 down” 또는 “아무 영향 없음”으로 단정하지 않고 mutation 필요 여부를 분리한다.</p>
+  <p><strong>Version/engine:</strong> 이 자료는 Kafka 4.3.1 KRaft 기준이다. Kafka 4.3은 dynamic controller quorum과 <code>controller.quorum.bootstrap.servers</code>를 지원하며, static voter 설정은 legacy 방식으로 설명된다. ZooKeeper는 Kafka 3.9가 마지막 migration bridge이고 Kafka 4.x 기본 운영 모델이 아니다. Managed service는 controller를 숨길 수 있으므로 provider가 노출하는 동등 지표·SLA를 확인한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffead6"><th style="padding:7px;border:1px solid #e5c5a5">증상</th><th style="padding:7px;border:1px solid #e5c5a5">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e5c5a5">가능한 가설</th><th style="padding:7px;border:1px solid #e5c5a5">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e5c5a5">rollback/복구</th><th style="padding:7px;border:1px solid #e5c5a5">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">Topic 생성·삭제 timeout</td><td style="padding:7px;border:1px solid #e5c5a5">Quorum leader/epoch/HW/lag, request ID, topic 존재, controller log</td><td style="padding:7px;border:1px solid #e5c5a5">Election 중, commit 후 response 유실, event queue 지연</td><td style="padding:7px;border:1px solid #e5c5a5">Desired state 조회 후 멱등 retry</td><td style="padding:7px;border:1px solid #e5c5a5">Committed 결과면 수용, 미commit이면 동일 spec 재요청</td><td style="padding:7px;border:1px solid #e5c5a5">다른 이름으로 중복 생성</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">CurrentLeader=-1 반복</td><td style="padding:7px;border:1px solid #e5c5a5">Voters 연결, current epoch/vote, election·fetch timeout, clock/network</td><td style="padding:7px;border:1px solid #e5c5a5">과반 단절, gridlocked election, controller crash loop</td><td style="padding:7px;border:1px solid #e5c5a5">과반 network·process·disk부터 복구</td><td style="padding:7px;border:1px solid #e5c5a5">Leader·HW 안정화 후 mutation 재개</td><td style="padding:7px;border:1px solid #e5c5a5">모든 controllers 동시 재시작</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">HW 정체·follower lag 증가</td><td style="padding:7px;border:1px solid #e5c5a5">Replica LEO/lag/time, disk fsync, network RTT/loss, GC, CPU</td><td style="padding:7px;border:1px solid #e5c5a5">느린 voter, metadata disk stall, cross-AZ network 문제</td><td style="padding:7px;border:1px solid #e5c5a5">Healthy majority 보호·mutation rate 제한</td><td style="padding:7px;border:1px solid #e5c5a5">병목 제거 후 lag 0·HW 전진 확인</td><td style="padding:7px;border:1px solid #e5c5a5">Metadata log 파일 삭제</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">Broker fenced 급증</td><td style="padding:7px;border:1px solid #e5c5a5">Heartbeat timeout, metadata offset/apply lag, broker epoch, GC/network</td><td style="padding:7px;border:1px solid #e5c5a5">Broker lease 만료, metadata catch-up 실패, stale incarnation</td><td style="padding:7px;border:1px solid #e5c5a5">Broker recovery·metadata apply 상태 확인</td><td style="padding:7px;border:1px solid #e5c5a5">Caught-up 후 controller unfence·leader 재배치</td><td style="padding:7px;border:1px solid #e5c5a5">Broker ID 중복 기동</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e5c5a5">Metadata apply error</td><td style="padding:7px;border:1px solid #e5c5a5">Load/ApplyErrorCount, last-applied vs committed, stack trace, snapshot/log offset</td><td style="padding:7px;border:1px solid #e5c5a5">Corrupt local file, incompatible feature, disk/full permission</td><td style="padding:7px;border:1px solid #e5c5a5">Node 격리·forensic copy·healthy quorum 보존</td><td style="padding:7px;border:1px solid #e5c5a5">공식 recovery 절차로 snapshot+suffix 재동기화</td><td style="padding:7px;border:1px solid #e5c5a5">Live file 수동 편집</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">7. 30분 실습: metadata quorum·record·복구 관찰</h2>
+  <div style="padding:14px;background:#fff7dc;border-left:5px solid #d8a322;border-radius:8px"><strong>실행 전 예측</strong><br>
+  Topic 하나를 만들면 metadata quorum의 LEO와 HW는 증가할까? 단일 combined node를 멈춘 동안 새 metadata mutation이 가능할까? 재시작 뒤 cluster ID와 committed HW는 유지될까?</div>
+  <p><strong>사전 조건:</strong> 저장소 루트, Docker, 공식 Apache Kafka 4.3.1 image. 이 환경은 broker+controller combined mode의 voter 1개라 production HA를 재현하지 않는다. 대신 metadata quorum의 상태·record와 과반 1/1의 한계를 관찰한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236a64">Step 1 · Baseline quorum 상태</h3>
+  <code style="display:block;padding:10px;background:#102b2a;color:#e9fbf7;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+make ps
+docker compose exec broker /opt/kafka/bin/kafka-metadata-quorum.sh \
+  --bootstrap-server localhost:9092 describe --status
+docker compose exec broker /opt/kafka/bin/kafka-metadata-quorum.sh \
+  --bootstrap-server localhost:9092 describe --replication</code>
+  <p><strong>예상:</strong> LeaderId, LeaderEpoch, HighWatermark, CurrentVoters와 replica의 LogEndOffset·Lag가 보인다. Combined single node에서는 voter와 active controller가 같은 process이며 과반은 1개다. 숫자를 메모한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236a64">Step 2 · Metadata mutation과 HW 전진</h3>
+  <code style="display:block;padding:10px;background:#102b2a;color:#e9fbf7;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day26.metadata --partitions 2 --replication-factor 1
+docker compose exec broker /opt/kafka/bin/kafka-metadata-quorum.sh \
+  --bootstrap-server localhost:9092 describe --status</code>
+  <p><strong>예상:</strong> Topic 생성은 TopicRecord 하나만이 아니라 topic identity와 각 partition assignment/leader를 표현하는 여러 records를 만들 수 있다. 따라서 HW·LEO 증가는 topic 수 1과 반드시 같지 않다. HW가 LEO를 따라간 시점에 mutation이 committed다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236a64">Step 3 · Metadata log를 read-only decode</h3>
+  <code style="display:block;padding:10px;background:#102b2a;color:#e9fbf7;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-dump-log.sh \
+  --cluster-metadata-decoder \
+  --files /tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log \
+  | grep -E 'TopicRecord|PartitionRecord' | tail -20</code>
+  <p><strong>예상:</strong> <code>day26.metadata</code>의 TopicRecord와 두 partition에 대응하는 PartitionRecord가 보인다. Segment가 이미 roll되었다면 status만 확인하고 해당 metadata directory의 최신 <code>.log</code> 파일 경로를 찾아 같은 read-only decoder에 넣는다. 파일을 수정하지 않는다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236a64">Step 4 · 실패 주입: quorum 1/1 중단</h3>
+  <code style="display:block;padding:10px;background:#102b2a;color:#e9fbf7;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose stop broker
+make ps</code>
+  <p><strong>예상:</strong> 유일한 controller voter와 broker가 모두 내려가므로 metadata mutation도 data path도 불가능하다. 이는 combined single-node 실습의 한계이며, 3-controller production에서는 한 voter 장애에도 남은 2개가 과반을 유지한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236a64">Step 5 · Recovery와 불변식 확인</h3>
+  <code style="display:block;padding:10px;background:#102b2a;color:#e9fbf7;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose start broker
+make ps
+docker compose exec broker /opt/kafka/bin/kafka-metadata-quorum.sh \
+  --bootstrap-server localhost:9092 describe --status
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic day26.metadata</code>
+  <p><strong>예상:</strong> Healthcheck가 준비된 뒤 같은 ClusterId와 topic이 남고 HW가 이전 committed 경계보다 뒤로 가지 않는다. LeaderEpoch는 재선출 때문에 증가할 수 있다. ClusterId·HW·topic presence를 복구 불변식으로 기록한다.</p>
+  <p><strong>자주 나는 오류와 해결:</strong> Startup 직후 connection refused는 <code>make ps</code>에서 healthy가 될 때까지 잠시 기다린다. Metadata segment 0 경로가 없으면 volume·metadata directory와 실제 segment 이름을 확인한다. Decoder output이 많으면 grep은 표시만 줄이는 것이며 원본을 바꾸지 않는다. <code>make down</code>은 volume을 삭제하지 않지만 <code>down -v</code>는 상태를 제거하므로 실습 중 사용하지 않는다.</p>
+  <p><strong>Cleanup:</strong></p>
+  <code style="display:block;padding:10px;background:#102b2a;color:#e9fbf7;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day26.metadata
+make down</code>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Active controller ≠ partition leader:</strong> 전자는 metadata control plane, 후자는 특정 user partition data plane의 권한자다.</li>
+    <li><strong>Metadata HW ≠ data HW:</strong> 전자는 controller voter 과반, 후자는 data replica ISR/min ISR 규칙으로 전진한다.</li>
+    <li><strong>Leader local append ≠ commit:</strong> Metadata HW가 지나기 전 record는 failover에서 사라질 수 있다.</li>
+    <li><strong>Admin success ≠ 모든 broker 적용 완료:</strong> Broker last-applied offset의 짧은 lag를 구분한다.</li>
+    <li><strong>Controller quorum loss ≠ 즉시 모든 produce 중단:</strong> 기존 leader data path는 잠시 가능하지만 새 election·mutation은 불가능할 수 있다.</li>
+    <li><strong>2 controllers ≠ 1 failure HA:</strong> 과반 2가 모두 살아야 하므로 실패 허용은 0이다.</li>
+    <li><strong>Snapshot ≠ 임의 backup 파일:</strong> Committed offset과 log suffix를 함께 해석해야 완전한 image가 된다.</li>
+    <li><strong>Heartbeat ≠ metadata fetch:</strong> Liveness lease와 state replication은 별도 protocol 책임이다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. CreateTopics 요청이 성공하기까지 KRaft 내부 흐름을 설명하세요.</strong><br>
+  좋은 답변 구조: Admin→broker forwarding → active controller validation·serialization → Topic/Partition records → leader local append는 미확정 → voters pull replication·majority HW → state machine apply·response → broker observer delta apply → client metadata refresh → timeout의 unknown outcome과 멱등 retry.</p>
+  <p><strong>Q2. 3-controller quorum에서 두 controllers를 잃으면 기존 produce도 즉시 모두 실패합니까?</strong><br>
+  좋은 답변 구조: 과반 2 상실로 metadata commit·controller election 불가 → 기존 partition leaders와 broker-applied metadata의 data path는 일시 지속 가능 → broker/leader 장애가 추가되면 새 partition election 불가 → topic/config/ISR mutation 정체 → RTO·failure window → controller majority 우선 복구.</p>
+  <p><strong>Q3. Controller를 1·2·3·5개 중 어떻게 선택합니까?</strong><br>
+  좋은 답변 구조: 동시 failure budget N → 2N+1 계산 → 1은 dev, 2는 failure tolerance 0, 3은 한 failure, 5는 두 failure → AZ·latency·disk·GC failure domain → dedicated roles → voter 추가 비용 → status/replication lag·chaos 검증.</p>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#236a64">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>Clean election과 unclean election의 안전성 차이는?</li><li>B1/B2 LEO=120, B3 LEO=112에서 B3 unclean 선출 시 잠재 손실 구간은?</li><li>Kafka 4.x ELR은 왜 arbitrary non-ISR replica와 다른가?</li></ol>
+  <p style="padding:12px;background:#f1f6f5"><strong>짧은 정답:</strong> ① Clean 후보는 committed prefix를 보존하지만 unclean 후보는 뒤처져 data loss가 가능하다. ② B3는 0~111을 보유하므로 112~119, 최대 8 records다. ③ Strict min ISR로 HW가 전진하지 않은 구간을 이용해 controller가 안전 후보로 추적하기 때문이다.</p>
+  <h3 style="margin:16px 0 8px;color:#236a64">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>Metadata leader LEO가 증가했는데도 mutation이 아직 실패할 수 있는 이유는?</li><li>3 voters와 5 voters의 commit 과반·동시 실패 허용 수는?</li><li>Admin success 뒤 어떤 broker-side 지표로 propagation을 검증할까?</li></ol>
+  <p style="padding:12px;background:#f1f6f5"><strong>채점 기준:</strong> ① 과반 복제와 metadata HW 전진 전에는 uncommitted tail이라 failover에서 truncate될 수 있음을 설명(4점). ② 3→과반2·1 failure, 5→과반3·2 failures를 계산(3점). ③ Broker LastAppliedRecordOffset/Lag와 MetadataLoad/ApplyErrorCount를 controller committed offset과 비교(3점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#236a64">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/operations/kraft/" style="color:#236a64">Apache Kafka 4.3 KRaft Operations</a> — controller quorum 배치, dynamic membership, quorum·dump·shell 도구</li>
+    <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/158870126/KIP-595%3A+A+Raft+Protocol+for+the+Metadata+Quorum" style="color:#236a64">KIP-595: Metadata Quorum Raft Protocol</a> — voter·epoch·majority HW·pull replication·election</li>
+    <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/158864865/KIP-631+The+Quorum-based+Kafka+Controller" style="color:#236a64">KIP-631: Quorum-based Controller</a> — persistence, snapshot, broker registration·heartbeat·fencing</li>
+    <li><a href="https://kafka.apache.org/43/operations/monitoring/" style="color:#236a64">Apache Kafka 4.3 Monitoring</a> — quorum, controller, broker metadata apply 지표</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#184f4b;color:#fff;border-radius:10px"><strong>내일 예고 · Day 27</strong><br>랩: broker 중단, ISR 변화, 쓰기 가용성 관찰 — multi-replica 장애 표를 먼저 예측하고, leader failover·ISR/min ISR·controller quorum 상태를 한 timeline에 묶어 검증한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>
