@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-27T09:08:02+09:00",
+  "updatedAt": "2026-08-28T09:08:49+09:00",
   "lessons": [
     {
       "day": 1,
@@ -239,6 +239,15 @@
       "path": "day-26.html",
       "kind": "lesson",
       "publishedAt": "2026-08-27T09:08:02+09:00"
+    },
+    {
+      "day": 27,
+      "week": 4,
+      "title": "랩: broker 중단, ISR 변화, 쓰기 가용성 관찰",
+      "summary": "RF=3·min ISR=2·acks=all에서 broker 중단과 복구를 주입해 ISR·leader·HW·쓰기 가용성의 상태 전이를 예측하고 검증합니다.",
+      "path": "day-27.html",
+      "kind": "lab",
+      "publishedAt": "2026-08-28T09:08:49+09:00"
     }
   ]
 }
