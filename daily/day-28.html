@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 28 · 회상: 장애 시 durability/availability 표 작성</title>
+</head>
+<body style="margin:0;background:#edf2f5;color:#1c2730;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#edf2f5"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d1dce3;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#263d52;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#9fd2eb;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 4 / DAY 28 · RECALL &amp; TECHNICAL REVIEW</div>
+  <h1 style="margin:10px 0 8px;font-size:29px;line-height:1.25">회상: 장애 시 durability/availability 표 작성</h1>
+  <p style="margin:0;color:#dbeaf3">처음 보는 장애 조건을 3분 안에 판정하는 프레임 · 리뷰 70분 + 드릴 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#eaf5fb;border-left:5px solid #3180aa;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Kafka 장애표는 “broker 몇 대가 죽었나”가 아니라 <strong>요구 보장 → 설정 → 현재 data state → control state → 성공 확정 시점 → 안전한 복구</strong> 순서로 작성한다. Durability는 성공 응답을 받은 record와 가정한 failure model에 대한 약속이고, availability는 지금 요청을 완료할 수 있는가라는 별도 질문이다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#246787">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #c9dbe4"><strong>Durability</strong></td><td style="padding:10px;border:1px solid #c9dbe4">성공으로 확정한 data가 정의된 장애 뒤에도 보존되는 성질. “절대 안 잃음”이 아니라 ack 정책·replica·failure domain 가정에 묶인다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Availability</strong></td><td style="padding:10px;border:1px solid #c9dbe4">요청이 제한 시간 안에 성공 응답을 받을 수 있는 성질. Read·write·admin availability를 따로 본다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>RPO / RTO</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Recovery Point Objective는 허용 data loss 시점, Recovery Time Objective는 허용 복구 시간. RF와 min ISR 선택의 입력이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>RF / ISR</strong></td><td style="padding:10px;border:1px solid #c9dbe4">RF는 배치된 replica 총수, ISR은 현재 충분히 따라온 동적 집합이다. RF=3·ISR=1은 가능하다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>LEO / HW</strong></td><td style="padding:10px;border:1px solid #c9dbe4">LEO는 replica별 local append 끝, HW는 consumer에 공개 가능한 committed 경계. LEO 전진만으로 성공을 확정하지 않는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Leader epoch</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Partition leader 세대 번호. Failover 때 증가하고 stale leader를 fencing하며 divergent tail 정리의 기준이 된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>acks=all</strong></td><td style="padding:10px;border:1px solid #c9dbe4">현재 ISR 전체가 batch를 복제할 때 producer 성공을 반환하는 조건. “과반만 받는다”와 다르다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>min ISR</strong></td><td style="padding:10px;border:1px solid #c9dbe4"><code>acks=all</code> 쓰기를 허용할 최소 ISR 크기. Durability를 위해 write availability를 닫는 안전선이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Data quorum</strong></td><td style="padding:10px;border:1px solid #c9dbe4">엄밀한 Raft quorum 명칭은 아니며 여기서는 partition record 복제에 참여하는 leader·ISR 관계를 뜻한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Controller quorum</strong></td><td style="padding:10px;border:1px solid #c9dbe4">KRaft metadata log를 합의하는 controller voters. Leader·ISR·broker registration 변경을 commit한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>ELR</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Eligible Leader Replicas. ISR 밖이지만 HW까지의 data 보유가 입증돼 clean election 후보가 될 수 있는 Kafka 4.x 상태다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Unknown outcome</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Timeout 뒤 server commit 여부를 client가 모르는 상태. 재시도·idempotence·business key 조정이 필요하다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#246787">2. 왜 중요한가</h2>
+  <p>대규모 장애에서는 같은 “2대 down”도 결과가 다르다. 죽은 node가 topic replica인지 controller인지, leader인지 follower인지, 장애 전 ISR이 몇 개였는지, 안전 후보가 남았는지에 따라 write·read·election 결과가 갈린다. 숫자만 세면 잘못된 복구 순서를 선택한다.</p>
+  <p>실무에서 표는 의사소통 도구다. Incident commander·application owner·platform engineer가 “읽기는 되지만 쓰기는 막혔다”, “기존 leader data path는 살아 있지만 새 election은 불가하다”, “timeout은 유실이 아니라 결과 불명”을 같은 언어로 공유하게 한다.</p>
+  <p>면접관은 암기보다 경계를 본다. 성공의 정의, 상태 소유자, 불변식, control/data path, failure window, 비용 trade-off를 순서대로 설명하면 처음 보는 수치에도 답할 수 있다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">3. Architecture: 3분 장애표 작성 알고리즘</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:29%;padding:12px;background:#246787;color:#fff;border-radius:8px"><strong>1 · Contract</strong></td><td style="padding:12px;background:#eaf5fb">RPO/RTO, ack 성공의 범위, read isolation</td></tr>
+    <tr><td colspan="2" align="center" style="color:#3180aa;font-weight:800">&#8595; 어떤 실패를 견뎌야 하는가?</td></tr>
+    <tr><td style="padding:12px;background:#3d6f8a;color:#fff;border-radius:8px"><strong>2 · Config</strong></td><td style="padding:12px;background:#edf5f8">RF, min ISR, acks, unclean election, rack placement</td></tr>
+    <tr><td colspan="2" align="center" style="color:#477d98;font-weight:800">&#8595; 고정 설정과 현재 상태를 분리</td></tr>
+    <tr><td style="padding:12px;background:#775a8c;color:#fff;border-radius:8px"><strong>3 · Data state</strong></td><td style="padding:12px;background:#f4eef8">Leader·epoch, Replicas, ISR/ELR, LEO/HW</td></tr>
+    <tr><td colspan="2" align="center" style="color:#86669b;font-weight:800">&#8595; 누가 record와 authority를 보유하는가?</td></tr>
+    <tr><td style="padding:12px;background:#75602f;color:#fff;border-radius:8px"><strong>4 · Control state</strong></td><td style="padding:12px;background:#faf5e8">Active controller, voter 과반, metadata HW·lag</td></tr>
+    <tr><td colspan="2" align="center" style="color:#8a7139;font-weight:800">&#8595; 상태 전이를 commit할 수 있는가?</td></tr>
+    <tr><td style="padding:12px;background:#3c7455;color:#fff;border-radius:8px"><strong>5 · Verdict</strong></td><td style="padding:12px;background:#edf8f1">Write / read / election / admin 각각 Yes·No·조건부</td></tr>
+    <tr><td colspan="2" align="center" style="color:#427f5e;font-weight:800">&#8595; 증거와 failure window를 붙인다</td></tr>
+    <tr><td style="padding:12px;background:#8b4444;color:#fff;border-radius:8px"><strong>6 · Action</strong></td><td style="padding:12px;background:#fff0f0">Healthy majority 보호 → 최신 replica 복구 → ISR catch-up → canary</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>계약:</strong> “성공 응답을 받은 event의 RPO=0, write RTO=5분”처럼 먼저 요구사항을 고정한다.</li>
+    <li><strong>설정:</strong> RF와 min ISR, producer acks, election 정책, rack placement를 적는다. 기본값을 추측하지 않는다.</li>
+    <li><strong>Data state:</strong> Topic describe와 replica lag에서 leader·ISR·ELR·epoch·HW를 적는다. Process status만 보지 않는다.</li>
+    <li><strong>Control state:</strong> KRaft active controller와 voter majority를 확인한다. Partition data가 있어도 새 leader metadata를 commit하지 못할 수 있다.</li>
+    <li><strong>판정:</strong> Write·read·election·admin을 한 칸에 “Kafka 됨/안 됨”으로 뭉치지 않는다.</li>
+    <li><strong>복구:</strong> Data loss를 키울 수 있는 설정 변경보다 healthy majority와 최신 committed prefix를 먼저 보호한다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#246787">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#246787">두 복제 시스템을 한 표에 섞지 않는다</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfeef5"><th align="left" style="padding:9px;border:1px solid #c9dbe4">질문</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">Data partition</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">KRaft metadata</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">무엇을 복제?</td><td style="padding:9px;border:1px solid #c9dbe4">사용자 event batch</td><td style="padding:9px;border:1px solid #c9dbe4">Topic·leader·ISR·broker·config record</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">권한자</td><td style="padding:9px;border:1px solid #c9dbe4">Partition leader</td><td style="padding:9px;border:1px solid #c9dbe4">Active controller / metadata leader</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Commit 조건</td><td style="padding:9px;border:1px solid #c9dbe4">ISR·min ISR·acks·ELR 규칙</td><td style="padding:9px;border:1px solid #c9dbe4">Controller voter 과반</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">상실 영향</td><td style="padding:9px;border:1px solid #c9dbe4">해당 partition write/read·election</td><td style="padding:9px;border:1px solid #c9dbe4">Cluster metadata mutation·새 election</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">핵심 증거</td><td style="padding:9px;border:1px solid #c9dbe4">Leader/epoch, Replicas, ISR/ELR, LEO/HW</td><td style="padding:9px;border:1px solid #c9dbe4">CurrentLeader/Epoch, HW, voter lag</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#246787">성공 확정 시점과 failure window</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:8px;border:1px solid #c9dbe4">시점</th><th style="padding:8px;border:1px solid #c9dbe4">상태</th><th style="padding:8px;border:1px solid #c9dbe4">장애 시 해석</th></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Leader local append</td><td style="padding:8px;border:1px solid #c9dbe4">Leader LEO 전진</td><td style="padding:8px;border:1px solid #c9dbe4">Follower 미복제 tail은 failover에서 truncate 가능</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">ISR replication</td><td style="padding:8px;border:1px solid #c9dbe4">Follower fetch·append</td><td style="padding:8px;border:1px solid #c9dbe4">현재 ISR 전체가 따라오면 ack/HW 전진 조건 형성</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Broker success response</td><td style="padding:8px;border:1px solid #c9dbe4">Kafka 범위 성공 확정</td><td style="padding:8px;border:1px solid #c9dbe4">Response 유실 시 server 성공·client timeout 동시 가능</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">External side effect</td><td style="padding:8px;border:1px solid #c9dbe4">DB/API의 별도 commit</td><td style="padding:8px;border:1px solid #c9dbe4">Kafka idempotence만으로 원자성 보장 안 됨</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#246787">다섯 장애 시나리오 채점표</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:7px;border:1px solid #c9dbe4">조건</th><th style="padding:7px;border:1px solid #c9dbe4">Write</th><th style="padding:7px;border:1px solid #c9dbe4">Read</th><th style="padding:7px;border:1px solid #c9dbe4">핵심 이유</th></tr>
+    <tr><td style="padding:7px;border:1px solid #c9dbe4">RF3, ISR {1,2,3}, min2, follower B3 down</td><td style="padding:7px;border:1px solid #c9dbe4">ISR {1,2} commit 뒤 가능</td><td style="padding:7px;border:1px solid #c9dbe4">Leader B1에서 가능</td><td style="padding:7px;border:1px solid #c9dbe4">한 failure budget 소진, 두 ISR ack</td></tr>
+    <tr><td style="padding:7px;border:1px solid #c9dbe4">위 상태에서 B2도 down, ISR {1}</td><td style="padding:7px;border:1px solid #c9dbe4">불가</td><td style="padding:7px;border:1px solid #c9dbe4">Leader 생존 시 조건부 가능</td><td style="padding:7px;border:1px solid #c9dbe4">ISR &lt; min ISR, fail closed</td></tr>
+    <tr><td style="padding:7px;border:1px solid #c9dbe4">ISR {1,2,3}에서 leader B1 down</td><td style="padding:7px;border:1px solid #c9dbe4">선출 공백 뒤 가능</td><td style="padding:7px;border:1px solid #c9dbe4">새 leader에서 가능</td><td style="padding:7px;border:1px solid #c9dbe4">B2/B3 안전 후보·ISR 2 유지</td></tr>
+    <tr><td style="padding:7px;border:1px solid #c9dbe4">ISR {1,2}에서 B3 down 상태, leader B1도 down</td><td style="padding:7px;border:1px solid #c9dbe4">B2 선출돼도 min2 미달</td><td style="padding:7px;border:1px solid #c9dbe4">B2 leader면 조건부 가능</td><td style="padding:7px;border:1px solid #c9dbe4">Leader 존재와 write admission은 별개</td></tr>
+    <tr><td style="padding:7px;border:1px solid #c9dbe4">Data leader healthy, controller 과반 상실</td><td style="padding:7px;border:1px solid #c9dbe4">기존 state로 잠시 가능할 수 있음</td><td style="padding:7px;border:1px solid #c9dbe4">잠시 가능할 수 있음</td><td style="padding:7px;border:1px solid #c9dbe4">새 ISR/election/admin mutation은 commit 불가</td></tr>
+  </table>
+  <p><strong>중요:</strong> 마지막 행을 “무조건 가능”으로 답하면 안 된다. 기존 connection·leader·ISR이 안정적일 때 data path가 계속될 수 있다는 뜻이며, 추가 broker failure나 metadata refresh가 필요해지면 곧 막힌다. 상태 전이가 필요한지까지 적어야 한다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#246787">불변식에서 답을 유도한다</h3>
+  <ul style="padding-left:22px">
+    <li><strong>Committed prefix:</strong> Clean leader는 acknowledged record의 committed prefix를 뒤로 돌리지 않아야 한다.</li>
+    <li><strong>Single authority:</strong> Leader epoch와 controller epoch는 stale authority가 동시에 쓰지 못하게 fencing한다.</li>
+    <li><strong>Write admission:</strong> <code>acks=all</code>은 현재 ISR 전체 복제, min ISR은 append 허용의 최소 안전선이다.</li>
+    <li><strong>Recovery:</strong> Process restart가 아니라 follower catch-up·ISR 재가입·HW 보존이 완료 조건이다.</li>
+    <li><strong>Scope:</strong> Kafka 내부 exactly-once나 idempotence를 외부 DB transaction으로 자동 확장하지 않는다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#246787">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfeef5"><th align="left" style="padding:9px;border:1px solid #c9dbe4">판단</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">권장 답변</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">이유</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">RF/min ISR</td><td style="padding:9px;border:1px solid #c9dbe4">RPO/RTO·failure domain에서 역산</td><td style="padding:9px;border:1px solid #c9dbe4">RF3/min2는 만능값이 아니라 흔한 1-failure 계약</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">장애 중 config 변경</td><td style="padding:9px;border:1px solid #c9dbe4">Data loss 승인·근거·rollback 없이는 금지</td><td style="padding:9px;border:1px solid #c9dbe4">min ISR·unclean election 변경은 보장 자체를 바꿈</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">복구 우선순위</td><td style="padding:9px;border:1px solid #c9dbe4">Controller majority와 최신 replica 보호</td><td style="padding:9px;border:1px solid #c9dbe4">Authority·committed prefix를 잃지 않고 state transition 회복</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">종료 기준</td><td style="padding:9px;border:1px solid #c9dbe4">ISR·lag·HW·error·canary·SLO 정상</td><td style="padding:9px;border:1px solid #c9dbe4">Process green은 필요조건일 뿐 충분조건이 아님</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> Topic별 “failure matrix”를 운영 전 ADR에 넣는다. 행은 실패 조합, 열은 leader·ISR·controller quorum·write/read/admin·RPO·첫 조치다. 실제 장애 때 채우기 시작하지 말고 배포 전 canary와 game day로 검증한다.</p>
+  <p><strong>Evidence order:</strong> Client error·latency → topic describe → controller quorum → replica lag/ISR metric → broker disk/network/GC → config 변경 이력 순으로 수집한다. 로그 한 줄만 보고 결론을 내리지 않는다.</p>
+  <p><strong>Anti-pattern:</strong> RF와 ISR을 같은 값으로 말하기, acks=all을 과반 ack로 설명하기, controller quorum loss를 전체 cluster 즉시 down으로 단정하기, timeout을 유실로 단정하기, 복구를 “재시작 성공”으로 끝내기.</p>
+  <p><strong>Edge/version:</strong> Kafka 4.3.1 KRaft에서 ELR이 활성화되면 ISR 밖이라도 HW까지 안전성이 입증된 replica가 clean election 후보가 될 수 있다. ELR은 arbitrary unclean replica가 아니며 feature level·ELR field·min ISR을 함께 본다. Managed service는 동등한 provider metric과 SLA 경계를 명시한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffe5e5"><th style="padding:7px;border:1px solid #e4bcbc">증상</th><th style="padding:7px;border:1px solid #e4bcbc">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e4bcbc">가능한 가설</th><th style="padding:7px;border:1px solid #e4bcbc">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e4bcbc">rollback/복구</th><th style="padding:7px;border:1px solid #e4bcbc">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">Write 실패·read 정상</td><td style="padding:7px;border:1px solid #e4bcbc">ISR/min ISR, leader, producer acks/error</td><td style="padding:7px;border:1px solid #e4bcbc">Under min ISR, leader는 생존</td><td style="padding:7px;border:1px solid #e4bcbc">Load 제한·missing replica 복구</td><td style="padding:7px;border:1px solid #e4bcbc">ISR≥min·canary 후 해제</td><td style="padding:7px;border:1px solid #e4bcbc">즉시 min ISR 하향</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">Leader=-1</td><td style="padding:7px;border:1px solid #e4bcbc">ISR/ELR, epoch, controller leader/HW</td><td style="padding:7px;border:1px solid #e4bcbc">안전 후보 없음, quorum 상실</td><td style="padding:7px;border:1px solid #e4bcbc">Controller majority·최신 replica 복구</td><td style="padding:7px;border:1px solid #e4bcbc">Clean election·HW 보존 확인</td><td style="padding:7px;border:1px solid #e4bcbc">무조건 unclean election</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">Admin timeout·data traffic 일부 정상</td><td style="padding:7px;border:1px solid #e4bcbc">Metadata leader, voters, HW/lag, broker image</td><td style="padding:7px;border:1px solid #e4bcbc">Controller majority 상실</td><td style="padding:7px;border:1px solid #e4bcbc">Mutation 중지·healthy voters 보호</td><td style="padding:7px;border:1px solid #e4bcbc">Quorum 안정 후 desired state 재조회</td><td style="padding:7px;border:1px solid #e4bcbc">모든 broker 동시 restart</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">Restart 후 ISR 미복귀</td><td style="padding:7px;border:1px solid #e4bcbc">LEO gap, fetch lag/error, disk/network/GC</td><td style="padding:7px;border:1px solid #e4bcbc">Backlog, throttle, corrupt log</td><td style="padding:7px;border:1px solid #e4bcbc">Recovery bandwidth·disk 정상화</td><td style="padding:7px;border:1px solid #e4bcbc">Lag 0·ISR expand 확인</td><td style="padding:7px;border:1px solid #e4bcbc">다음 node 계속 restart</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">Timeout 뒤 duplicate</td><td style="padding:7px;border:1px solid #e4bcbc">Producer ID/epoch/sequence, offset, key</td><td style="padding:7px;border:1px solid #e4bcbc">Commit 후 response 유실</td><td style="padding:7px;border:1px solid #e4bcbc">Bounded retry·outcome 조회</td><td style="padding:7px;border:1px solid #e4bcbc">Business key reconcile</td><td style="padding:7px;border:1px solid #e4bcbc">Timeout=미기록 단정</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#246787">7. 30분 실습: evidence-first 장애표 드릴</h2>
+  <div style="padding:14px;background:#fff5dc;border-left:5px solid #d6a22c;border-radius:8px"><strong>명령보다 먼저 3분 예측</strong><br>
+  RF=3, replicas={1,2,3}, leader=1, ISR={1,2,3}, min ISR=2, acks=all, controller voters=5라고 적는다. B3 follower stop 뒤 B1 leader stop 시 write·read·election·admin availability와 첫 복구 대상을 먼저 표로 작성한다.</div>
+  <p><strong>사전 조건:</strong> Docker와 공식 Kafka 4.3.1 image. <a href="day-27.html" style="color:#246787">Day 27의 Step 1~2</a>로 <code>k27-b1</code>~<code>k27-b5</code>와 <code>day27.isr</code> topic을 baseline 상태로 만든다. Topic replicas는 B1·B2·B3, controller voters는 B1~B5다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 1 · 추측 전에 baseline 증거 고정</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker exec k27-b1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server k27-b1:19092 --describe --topic day27.isr
+docker exec k27-b1 /opt/kafka/bin/kafka-metadata-quorum.sh \
+  --bootstrap-server k27-b1:19092 describe --status</code>
+  <p><strong>예상:</strong> Leader=1, Replicas=1,2,3, ISR=1,2,3과 controller CurrentLeader·HighWatermark가 보인다. 출력과 예측표의 시작 상태가 다르면 실습을 진행하지 말고 baseline부터 복구한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 2 · 실패 주입 A: follower B3 중단</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker stop k27-b3
+sleep 8
+docker exec k27-b1 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server k27-b1:19092 --describe --topic day27.isr
+printf 'after-b3-down\n' | docker exec -i k27-b1 \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server k27-b1:19092 --topic day27.isr \
+  --producer-property acks=all</code>
+  <p><strong>예상:</strong> ISR={1,2}, write 성공. RF는 3 그대로이고 controller voter는 4/5로 과반이다. 장애표에 “available but degraded, failure margin 0 for write durability contract”라고 적는다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 3 · 실패 주입 B: leader B1도 중단</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker stop k27-b1
+sleep 8
+docker exec k27-b2 /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server k27-b2:19092 --describe --topic day27.isr
+printf 'must-fail-under-min-isr\n' | docker exec -i k27-b2 \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server k27-b2:19092 --topic day27.isr \
+  --producer-property acks=all \
+  --producer-property request.timeout.ms=5000 \
+  --producer-property delivery.timeout.ms=7000
+docker exec k27-b2 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server k27-b2:19092 --topic day27.isr \
+  --from-beginning --max-messages 1</code>
+  <p><strong>예상:</strong> B2가 clean leader로 선출될 수 있지만 ISR={2}라 min ISR=2 미달이다. 새 write는 실패하고 이미 committed된 첫 record read는 가능하다. B2·B4·B5가 controller 과반 3/5를 유지하므로 leader/ISR metadata는 commit 가능하다. “leader 있음 = write 가능”이 아님을 출력으로 증명한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 4 · B3 복구와 종료 조건</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker start k27-b3
+for i in 1 2 3 4 5 6; do
+  docker exec k27-b2 /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server k27-b2:19092 --describe --topic day27.isr
+  sleep 3
+done
+printf 'write-after-isr-recovery\n' | docker exec -i k27-b2 \
+  /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server k27-b2:19092 --topic day27.isr \
+  --producer-property acks=all</code>
+  <p><strong>예상:</strong> B3가 missing offsets를 fetch한 뒤 ISR={2,3}으로 돌아오고 write가 성공한다. Process start 시점이 아니라 ISR expand와 canary 성공 시점을 RTO로 기록한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">오류 해석과 cleanup</h3>
+  <p><strong>자주 나는 오류:</strong> B2가 아직 leader가 아니면 controller quorum과 election log를 먼저 확인한다. Consumer가 기대와 다른 record를 읽으면 이전 실습 data가 남은 것이므로 key/offset을 함께 출력해 구분한다. Producer timeout은 미기록을 뜻하지 않으므로 topic을 조회해 unknown outcome을 정리한다. ISR 복귀가 늦으면 replica LEO gap·disk·network를 확인한다.</p>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker rm -f k27-b1 k27-b2 k27-b3 k27-b4 k27-b5
+docker volume rm k27-b1-data k27-b2-data k27-b3-data k27-b4-data k27-b5-data
+docker network rm k27-net</code>
+  <p>Cleanup은 <code>k27-</code> 전용 자원만 제거하며 저장소 기본 broker·volume은 건드리지 않는다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>“복제 3개니까 두 대 장애 허용”:</strong> Data 보존 가능성과 write availability는 다르다. min ISR=2라면 두 replica 상실 시 write는 닫힌다.</li>
+    <li><strong>“acks=all은 과반”:</strong> 현재 ISR 전체를 기다린다. Min ISR이 과반처럼 보이는 값일 뿐 역할이 다르다.</li>
+    <li><strong>“Leader가 있으니 정상”:</strong> ISR이 min ISR보다 작으면 read는 가능해도 write는 실패한다.</li>
+    <li><strong>“Controller down은 즉시 data down”:</strong> 기존 state로 잠시 동작할 수 있지만 새 election·ISR mutation이 필요해지면 막힌다.</li>
+    <li><strong>“Timeout은 유실”:</strong> Commit 후 response 유실일 수 있어 결과 불명으로 다룬다.</li>
+    <li><strong>“Restart 성공은 복구 완료”:</strong> ISR 재가입·lag 0·HW 보존·canary를 확인한다.</li>
+    <li><strong>“ELR은 unclean election”:</strong> ELR은 HW까지 data가 있음이 입증된 안전 후보이고 arbitrary replica와 다르다.</li>
+    <li><strong>“모든 topic이 같은 정책”:</strong> Business RPO/RTO에 따라 RF·min ISR·retention·placement가 달라진다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#246787">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. RF=3·ISR=2·min ISR=2에서 leader가 죽으면 write와 read는 어떻게 됩니까?</strong><br>
+  좋은 답변 구조: 남은 ISR/ELR과 controller quorum 가정 → clean leader election·epoch 증가 → 남은 ISR 크기 계산 → 새 leader 하나만 남으면 read 조건부 가능·acks=all write 불가 → follower catch-up·ISR expand 후 write 재개 → 선출 공백과 client metadata refresh.</p>
+  <p><strong>Q2. Controller quorum을 잃었지만 producer traffic이 정상입니다. 안전합니까?</strong><br>
+  좋은 답변 구조: 기존 partition leader·ISR로 data path가 잠시 가능 → metadata mutation·broker fencing·새 leader election은 불가 → 다음 failure에서 영향 확대 → mutation freeze·controller majority 우선 복구 → HW/lag·active controller 검증 → “정상”이 아니라 degraded control plane.</p>
+  <p><strong>Q3. 장애 중 min ISR을 2에서 1로 낮추자는 제안을 검토하세요.</strong><br>
+  좋은 답변 구조: Business RPO/RTO와 손실 승인권자 → 현재 최신 copies·failure domain·backlog → single-copy ack 뒤 마지막 leader 상실의 failure window → traffic queueing·upstream backpressure·replica 복구 대안 → 변경 시 time-box·audit·rollback·post-condition.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#246787">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>RF=3·min ISR=2에서 follower 하나와 둘을 잃을 때 acks=all 결과는?</li><li>복귀한 broker가 process up이어도 복구 완료가 아닌 이유는?</li><li>Day 27에서 5 combined nodes를 쓴 이유는?</li></ol>
+  <p style="padding:12px;background:#eef4f7"><strong>짧은 정답:</strong> ① ISR 2까지 성공, ISR 1이면 fail closed. ② Missing log를 fetch해 ISR 재가입하기 전에는 안전 copy가 복원되지 않았다. ③ Topic replica 두 개를 내려 ISR 1을 만들면서도 B1·B4·B5 controller 과반 3/5를 유지해 data와 control failure를 분리하려고 했다.</p>
+  <h3 style="margin:16px 0 8px;color:#246787">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>장애표 작성의 여섯 단계를 순서대로 말하라.</li><li>Data leader healthy·controller 과반 상실에서 “조건부”라고 답해야 하는 이유는?</li><li>Incident 종료를 승인할 최소 증거 다섯 가지는?</li></ol>
+  <p style="padding:12px;background:#eef4f7"><strong>채점 기준:</strong> ① Contract→Config→Data state→Control state→Verdict→Action(3점). ② 기존 경로는 가능하지만 새 ISR/election/admin mutation이 불가하고 추가 failure에 취약함(3점). ③ Leader/epoch 안정, ISR≥정책·lag 0, metadata quorum 정상, 오류율·latency SLO, canary write/read, config 원복 중 다섯 가지(4점). 총 8점 이상이면 Week 4 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/configuration/topic-configs/" style="color:#246787">Apache Kafka 4.3 Topic Configs</a> — min ISR·acks=all·오류·visibility</li>
+    <li><a href="https://kafka.apache.org/43/operations/monitoring/" style="color:#246787">Apache Kafka 4.3 Monitoring</a> — URP·UnderMinISR·ISR shrink/expand·KRaft 지표</li>
+    <li><a href="https://kafka.apache.org/43/operations/kraft/" style="color:#246787">Apache Kafka 4.3 KRaft Operations</a> — controller quorum·과반·combined/dedicated 역할</li>
+    <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/263426970/KIP-966%2BEligible%2BLeader%2BReplicas" style="color:#246787">KIP-966: Eligible Leader Replicas</a> — strict min ISR와 clean election 후보</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#263d52;color:#fff;border-radius:10px"><strong>내일 예고 · Week 5 / Day 29</strong><br>group coordinator와 generation — consumer group의 membership·assignment·offset 상태를 누가 소유하고, generation fencing이 stale member의 commit을 어떻게 막는지 rebalance state machine으로 연결한다.</div>
+</td></tr></table>
+</td></tr></table>
+</body>
+</html>
