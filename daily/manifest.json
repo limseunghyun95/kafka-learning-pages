@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-29T09:10:38+09:00",
+  "updatedAt": "2026-08-30T09:00:50+09:00",
   "lessons": [
     {
       "day": 1,
@@ -257,6 +257,15 @@
       "path": "day-28.html",
       "kind": "review",
       "publishedAt": "2026-08-29T09:10:38+09:00"
+    },
+    {
+      "day": 29,
+      "week": 5,
+      "title": "group coordinator와 generation",
+      "summary": "group.id가 coordinator에 매핑되는 흐름, Classic generation state machine, stale member의 offset commit fencing과 coordinator failover를 실무 장애 진단까지 연결합니다.",
+      "path": "day-29.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-30T09:00:50+09:00"
     }
   ]
 }

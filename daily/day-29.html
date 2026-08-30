@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 29 · group coordinator와 generation</title>
+</head>
+<body style="margin:0;background:#edf2f5;color:#1c2730;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#edf2f5"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d1dce3;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#263d52;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#9fd2eb;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 5 / DAY 29 · GROUP COORDINATION</div>
+  <h1 style="margin:10px 0 8px;font-size:29px;line-height:1.25">group coordinator와 generation</h1>
+  <p style="margin:0;color:#dbeaf3">Consumer group의 권한자·상태 머신·zombie fencing · 이론 70분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#eaf5fb;border-left:5px solid #3180aa;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Group coordinator는 <code>group.id</code>별 membership·assignment·committed offset의 권한자이고, generation은 “현재 assignment 계약의 버전”이다. Rebalance 뒤 이전 generation의 member가 늦게 offset을 덮어쓰지 못하게 coordinator가 fencing한다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#246787">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #c9dbe4"><strong>Consumer group</strong></td><td style="padding:10px;border:1px solid #c9dbe4">같은 <code>group.id</code>를 공유하고 topic partition을 나눠 처리하는 consumer 집합. 한 group 안에서 partition 하나의 현재 소유자는 한 member여야 한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Coordinator</strong></td><td style="padding:10px;border:1px solid #c9dbe4">여러 참여자가 하나의 상태에 합의하도록 순서를 정하는 권한자. Kafka의 group coordinator는 broker 역할이며 KRaft controller와 다르다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Group coordinator</strong></td><td style="padding:10px;border:1px solid #c9dbe4">특정 group의 member·subscription·assignment·offset 요청을 처리하는 broker. 해당 group이 매핑된 <code>__consumer_offsets</code> partition leader가 역할을 맡는다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Generation</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Classic protocol에서 한 번의 안정된 membership·assignment 라운드를 식별하는 정수 버전. Record offset도 시간도 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Member ID</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Coordinator가 consumer incarnation에 부여하는 식별자. Process 이름이나 <code>client.id</code>와 같다고 가정하면 안 된다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Group leader</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Classic protocol에서 coordinator가 고른 member. Member metadata를 받아 client-side assignor로 assignment를 계산한다. Partition leader나 controller가 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Assignment</strong></td><td style="padding:10px;border:1px solid #c9dbe4">어느 member가 어떤 topic partition을 소비할지 정한 소유권 표. Subscription은 희망 목록이고 assignment는 실제 권한이다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Rebalance</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Membership·subscription·partition metadata가 바뀌어 assignment를 다시 계산하고 설치하는 상태 전이.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Heartbeat</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Member가 살아 있고 현재 group 계약에 참여 중임을 coordinator에 갱신하는 liveness 신호. 처리 성공 신호는 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Fencing</strong></td><td style="padding:10px;border:1px solid #c9dbe4">오래된 권한을 가진 process의 요청을 거부하는 안전장치. 세대 번호가 자물쇠 버전처럼 작동한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Zombie member</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Coordinator에게는 탈퇴·timeout 처리됐지만 GC pause·network partition 뒤 다시 움직여 예전 partition을 처리하려는 process.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>__consumer_offsets</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Group metadata와 committed offset을 저장하는 partitioned·replicated·compacted internal topic. 단순한 client-side 체크포인트 파일이 아니다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#246787">2. 왜 중요한가</h2>
+  <p>Consumer는 “내가 아직 partition P0의 주인인가?”를 local memory만으로 결정할 수 없다. Network 단절이나 긴 GC pause 동안 다른 member에게 P0가 넘어갈 수 있기 때문이다. Coordinator가 membership과 generation의 단일 권한자가 되어 split-brain consumer를 막는다.</p>
+  <p>실무 장애에서 lag 증가와 rebalance는 결과이지 원인이 아닐 때가 많다. Slow downstream → poll 지연 → member 제외 → generation 변경 → commit fencing → replay → downstream 부하 증가가 하나의 증폭 고리를 만든다. Coordinator의 상태 전이를 알면 timeout만 무작정 늘리지 않고 최초 병목을 찾을 수 있다.</p>
+  <p>면접에서는 “consumer끼리 partition을 나눈다”보다 누가 상태를 소유하고, 언제 assignment가 유효해지며, stale member의 commit을 어떤 필드로 거부하는지 설명해야 깊이가 드러난다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">3. Architecture: 발견부터 commit fencing까지</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0 8px;word-break:break-word">
+    <tr><td style="width:29%;padding:12px;background:#246787;color:#fff;border-radius:8px"><strong>1 · Consumer</strong></td><td style="padding:12px;background:#eaf5fb"><code>FindCoordinator(group.id)</code> → 아무 broker</td></tr>
+    <tr><td colspan="2" align="center" style="color:#3180aa;font-weight:800">&#8595; group.id가 internal topic partition에 매핑</td></tr>
+    <tr><td style="padding:12px;background:#3d6f8a;color:#fff;border-radius:8px"><strong>2 · Coordinator</strong></td><td style="padding:12px;background:#edf5f8"><code>__consumer_offsets-N</code> leader broker</td></tr>
+    <tr><td colspan="2" align="center" style="color:#477d98;font-weight:800">&#8595; JoinGroup: member·subscription 수집</td></tr>
+    <tr><td style="padding:12px;background:#775a8c;color:#fff;border-radius:8px"><strong>3 · Join barrier</strong></td><td style="padding:12px;background:#f4eef8">새 generation G=42 · group leader 선출</td></tr>
+    <tr><td colspan="2" align="center" style="color:#86669b;font-weight:800">&#8595; leader가 assignment 계산 → SyncGroup</td></tr>
+    <tr><td style="padding:12px;background:#75602f;color:#fff;border-radius:8px"><strong>4 · Stable</strong></td><td style="padding:12px;background:#faf5e8">Coordinator가 G=42 assignment 설치·응답</td></tr>
+    <tr><td colspan="2" align="center" style="color:#8a7139;font-weight:800">&#8595; Heartbeat(G=42) · processing · commit</td></tr>
+    <tr><td style="padding:12px;background:#3c7455;color:#fff;border-radius:8px"><strong>5 · OffsetCommit</strong></td><td style="padding:12px;background:#edf8f1"><code>group + member + G=42 + offsets</code> → internal log</td></tr>
+    <tr><td colspan="2" align="center" style="color:#427f5e;font-weight:800">&#8595; membership 변경 → G=43</td></tr>
+    <tr><td style="padding:12px;background:#8b4444;color:#fff;border-radius:8px"><strong>6 · Fence</strong></td><td style="padding:12px;background:#fff0f0">늦은 G=42 commit 거부 → rejoin 필요</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>발견:</strong> Consumer는 bootstrap broker가 coordinator라고 가정하지 않고 <code>FindCoordinator</code>로 현재 위치를 찾는다.</li>
+    <li><strong>상태 배치:</strong> <code>group.id</code>는 internal topic partition에 안정적으로 매핑된다. 그 partition leader가 coordinator이므로 groups가 broker들에 분산된다.</li>
+    <li><strong>Join:</strong> Classic protocol의 coordinator는 join barrier 동안 member metadata를 모으고 group leader와 새 generation을 정한다.</li>
+    <li><strong>Sync:</strong> Group leader가 assignment를 계산해 보내면 coordinator가 검증·설치하고 각 member에게 자신의 assignment를 반환한다.</li>
+    <li><strong>Stable:</strong> Member는 assignment callback을 수행하고 fetch·process를 시작한다. Heartbeat는 membership lease를 유지한다.</li>
+    <li><strong>Commit과 fencing:</strong> Offset commit에 member와 generation이 실린다. Coordinator의 현재 세대와 다르면 zombie commit을 거부한다.</li>
+  </ol>
+
+  <h2 style="margin:30px 0 12px;color:#246787">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#246787">상태의 소유자를 먼저 분리한다</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfeef5"><th align="left" style="padding:9px;border:1px solid #c9dbe4">상태</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">권한자</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">지속성·복구</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Members·generation·assignment</td><td style="padding:9px;border:1px solid #c9dbe4">Group coordinator</td><td style="padding:9px;border:1px solid #c9dbe4">Memory state + <code>__consumer_offsets</code> records replay</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Committed offsets</td><td style="padding:9px;border:1px solid #c9dbe4">Group coordinator</td><td style="padding:9px;border:1px solid #c9dbe4">Compacted internal log + cache</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Current processing·side effects</td><td style="padding:9px;border:1px solid #c9dbe4">Consumer application</td><td style="padding:9px;border:1px solid #c9dbe4">Application memory·DB/API; Kafka가 자동 rollback하지 않음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Partition record log</td><td style="padding:9px;border:1px solid #c9dbe4">Topic partition leader</td><td style="padding:9px;border:1px solid #c9dbe4">Topic replicas·ISR</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Cluster metadata</td><td style="padding:9px;border:1px solid #c9dbe4">KRaft controller quorum</td><td style="padding:9px;border:1px solid #c9dbe4">Metadata log quorum</td></tr>
+  </table>
+  <p><strong>핵심:</strong> Coordinator는 broker 안의 논리 역할이다. Coordinator failover와 partition leader failover, KRaft controller failover를 같은 “leader 변경”으로 뭉치면 장애 원인을 잘못 찾는다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#246787">Classic group state machine</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:8px;border:1px solid #c9dbe4">상태</th><th style="padding:8px;border:1px solid #c9dbe4">Coordinator가 기다리는 것</th><th style="padding:8px;border:1px solid #c9dbe4">Data processing 의미</th></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Empty</td><td style="padding:8px;border:1px solid #c9dbe4">첫 member</td><td style="padding:8px;border:1px solid #c9dbe4">활성 assignment 없음; offsets는 남을 수 있음</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">PreparingRebalance</td><td style="padding:8px;border:1px solid #c9dbe4">기존·신규 members의 JoinGroup</td><td style="padding:8px;border:1px solid #c9dbe4">이전 assignment 철회 중; 처리 중단 창 가능</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">CompletingRebalance</td><td style="padding:8px;border:1px solid #c9dbe4">Group leader의 SyncGroup assignment</td><td style="padding:8px;border:1px solid #c9dbe4">새 generation은 있으나 모든 member가 assignment를 받기 전</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Stable</td><td style="padding:8px;border:1px solid #c9dbe4">Heartbeats·commits</td><td style="padding:8px;border:1px solid #c9dbe4">현재 assignment로 fetch·process 가능</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Dead</td><td style="padding:8px;border:1px solid #c9dbe4">없음</td><td style="padding:8px;border:1px solid #c9dbe4">Coordinator가 더 이상 group 요청을 처리하지 않는 terminal 상태</td></tr>
+  </table>
+  <p>Member join·leave·session timeout·subscription 또는 topic partition 변화가 assignment 입력을 바꾸면 rebalance가 필요하다. 새 라운드가 확정되며 generation이 증가한다. Generation은 Lamport clock처럼 모든 사건의 전역 시간을 주는 것이 아니라 <strong>이 group assignment의 stale authority를 구분하는 epoch</strong>다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#246787">왜 generation이 안전을 만든다</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:8px;border:1px solid #c9dbe4">시간</th><th style="padding:8px;border:1px solid #c9dbe4">Member A</th><th style="padding:8px;border:1px solid #c9dbe4">Coordinator</th><th style="padding:8px;border:1px solid #c9dbe4">Member B</th></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">T1</td><td style="padding:8px;border:1px solid #c9dbe4">G=42, P0 처리</td><td style="padding:8px;border:1px solid #c9dbe4">Stable G=42</td><td style="padding:8px;border:1px solid #c9dbe4">P1 처리</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">T2</td><td style="padding:8px;border:1px solid #c9dbe4">긴 GC pause</td><td style="padding:8px;border:1px solid #c9dbe4">A session 만료·rebalance</td><td style="padding:8px;border:1px solid #c9dbe4">Join</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">T3</td><td style="padding:8px;border:1px solid #c9dbe4">멈춘 상태</td><td style="padding:8px;border:1px solid #c9dbe4">Stable G=43, P0→B</td><td style="padding:8px;border:1px solid #c9dbe4">P0 처리·offset 120 commit</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">T4</td><td style="padding:8px;border:1px solid #c9dbe4">깨어나 G=42 offset 110 commit</td><td style="padding:8px;border:1px solid #c9dbe4">G mismatch → reject</td><td style="padding:8px;border:1px solid #c9dbe4">offset 120 보호</td></tr>
+  </table>
+  <p>Fencing이 없으면 A의 늦은 commit이 120을 110으로 되돌려 110~119를 재처리하거나, 더 위험하게 처리하지 않은 미래 offset을 써서 유실을 만들 수 있다. Generation과 member ID 검사는 “현재 소유권을 증명하지 못한 요청은 상태를 바꾸지 못한다”는 불변식을 지킨다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#246787">성공 확정 시점과 failure window</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:8px;border:1px solid #c9dbe4">요청</th><th style="padding:8px;border:1px solid #c9dbe4">성공이 뜻하는 것</th><th style="padding:8px;border:1px solid #c9dbe4">아직 보장하지 않는 것</th></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">FindCoordinator</td><td style="padding:8px;border:1px solid #c9dbe4">현재 coordinator 위치 발견</td><td style="padding:8px;border:1px solid #c9dbe4">곧 failover하지 않음·group Stable</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">JoinGroup</td><td style="padding:8px;border:1px solid #c9dbe4">현재 generation membership 수락</td><td style="padding:8px;border:1px solid #c9dbe4">Assignment 설치·processing 시작</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">SyncGroup</td><td style="padding:8px;border:1px solid #c9dbe4">해당 generation assignment 반환</td><td style="padding:8px;border:1px solid #c9dbe4">Application side effect 성공</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Heartbeat</td><td style="padding:8px;border:1px solid #c9dbe4">Membership lease가 아직 유효</td><td style="padding:8px;border:1px solid #c9dbe4">Poll·processing·DB가 건강함</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">OffsetCommit</td><td style="padding:8px;border:1px solid #c9dbe4">Coordinator가 fencing을 통과시키고 internal topic에 복제</td><td style="padding:8px;border:1px solid #c9dbe4">그 offset 이전 외부 side effect의 원자성</td></tr>
+  </table>
+  <p>공식 구현 설명상 coordinator는 offset commit을 <code>__consumer_offsets</code>에 append하고 replicas가 받기 전에는 성공을 반환하지 않는다. 다만 성공 응답이 network에서 유실되면 client에는 결과 불명이다. 재시도는 가능하지만 async commit callback 순서 역전으로 더 작은 offset을 덮어쓰지 않도록 관리해야 한다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#246787">Kafka 4.3의 두 protocol에서 이름이 다르다</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:9px;border:1px solid #c9dbe4">구분</th><th style="padding:9px;border:1px solid #c9dbe4">Classic</th><th style="padding:9px;border:1px solid #c9dbe4">Consumer protocol</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Kafka 4.3 client 설정</td><td style="padding:9px;border:1px solid #c9dbe4"><code>group.protocol=classic</code>, 기본</td><td style="padding:9px;border:1px solid #c9dbe4"><code>group.protocol=consumer</code>, 명시 활성화</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">핵심 버전</td><td style="padding:9px;border:1px solid #c9dbe4">Group generation</td><td style="padding:9px;border:1px solid #c9dbe4">Group·assignment·member epochs</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">조정 API</td><td style="padding:9px;border:1px solid #c9dbe4">JoinGroup·SyncGroup·Heartbeat</td><td style="padding:9px;border:1px solid #c9dbe4">ConsumerGroupHeartbeat 중심</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Assignment 주도</td><td style="padding:9px;border:1px solid #c9dbe4">Client-side group leader</td><td style="padding:9px;border:1px solid #c9dbe4">Broker coordinator·server assignor</td></tr>
+  </table>
+  <p>오늘의 “generation” 설명은 Classic의 정확한 용어다. 새 Consumer protocol도 같은 목적의 epoch fencing을 갖지만 state model과 API가 다르다. 내일 두 protocol을 global barrier·incremental reconciliation·설정 소유권 관점에서 비교한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfeef5"><th align="left" style="padding:9px;border:1px solid #c9dbe4">판단</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">Best practice</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">이유</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">group.id</td><td style="padding:9px;border:1px solid #c9dbe4">서비스·환경·pipeline 목적을 담고 owner 등록</td><td style="padding:9px;border:1px solid #c9dbe4">Coordinator state·offset lifecycle·ACL·lag dashboard의 경계</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Commit 시점</td><td style="padding:9px;border:1px solid #c9dbe4">Side effect 성공 뒤 next offset commit</td><td style="padding:9px;border:1px solid #c9dbe4">Crash window는 중복으로 닫고 sink idempotency로 흡수</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Commit 실패</td><td style="padding:9px;border:1px solid #c9dbe4">Generation/member 오류는 소유권 상실로 취급</td><td style="padding:9px;border:1px solid #c9dbe4">Blind retry로 stale member가 계속 side effect를 만들면 안 됨</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">배포</td><td style="padding:9px;border:1px solid #c9dbe4">Wave·graceful leave·static/cooperative 전략 검토</td><td style="padding:9px;border:1px solid #c9dbe4">동시 member churn은 generation 폭증·stop-the-world 확대</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">관측</td><td style="padding:9px;border:1px solid #c9dbe4">Lag와 rebalance·heartbeat·commit latency를 함께 봄</td><td style="padding:9px;border:1px solid #c9dbe4">Lag만으로 coordinator·processing·sink 병목을 분리 못 함</td></tr>
+  </table>
+  <p><strong>필수 지표:</strong> <code>rebalance-rate-per-hour</code>, <code>failed-rebalance-rate-per-hour</code>, <code>rebalance-latency-max</code>, <code>heartbeat-rate</code>, <code>last-heartbeat-seconds-ago</code>, <code>commit-rate</code>, <code>commit-latency-avg/max</code>, assigned partitions, member churn, partition별 lag와 처리율을 같은 timeline에 둔다.</p>
+  <p><strong>Anti-pattern:</strong> Coordinator를 KRaft controller로 설명하기, heartbeat 성공을 business 처리 성공으로 해석하기, <code>CommitFailedException</code>을 무한 retry하기, group마다 무작위 UUID를 붙여 internal topic cardinality를 폭증시키기, 같은 <code>group.id</code>를 무관한 pipeline이 공유하기.</p>
+  <p><strong>Edge case:</strong> Coordinator broker가 바뀌면 client는 rediscover하고 새 coordinator가 internal topic partition을 replay해 cache를 복구한다. 이때 <code>NOT_COORDINATOR</code>·<code>COORDINATOR_LOAD_IN_PROGRESS</code>는 짧게 retriable할 수 있지만 deadline·backoff·jitter가 필요하다.</p>
+  <p><strong>Version 판단:</strong> Kafka 4.3의 Java consumer는 Classic이 기본이고 Consumer protocol은 명시적으로 켠다. 새 protocol에서는 heartbeat interval과 session timeout, assignor 소유권이 broker 쪽으로 이동하므로 Classic tuning을 그대로 복사하지 않는다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffe5e5"><th style="padding:7px;border:1px solid #e4bcbc">증상</th><th style="padding:7px;border:1px solid #e4bcbc">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e4bcbc">가능한 가설</th><th style="padding:7px;border:1px solid #e4bcbc">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e4bcbc">rollback/복구</th><th style="padding:7px;border:1px solid #e4bcbc">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">CommitFailed·ILLEGAL_GENERATION</td><td style="padding:7px;border:1px solid #e4bcbc">Group state, member ID, generation, rebalance log, assignment callback</td><td style="padding:7px;border:1px solid #e4bcbc">Member timeout·새 generation·stale commit</td><td style="padding:7px;border:1px solid #e4bcbc">처리 중단·현재 assignment 확인·rejoin</td><td style="padding:7px;border:1px solid #e4bcbc">Idempotency key로 side effect reconcile 후 resume</td><td style="padding:7px;border:1px solid #e4bcbc">예전 offset blind retry·계속 처리</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">Rebalance storm·lag 증가</td><td style="padding:7px;border:1px solid #e4bcbc">Member churn, poll gap, heartbeat, GC, deploy, sink latency</td><td style="padding:7px;border:1px solid #e4bcbc">Slow processing·rolling deploy·network·GC pause</td><td style="padding:7px;border:1px solid #e4bcbc">원인 member 격리·유입 제한·sink 병목 완화</td><td style="padding:7px;border:1px solid #e4bcbc">Stable generation·assignment·처리율 회복 확인</td><td style="padding:7px;border:1px solid #e4bcbc">Session timeout만 크게 올리기</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">NOT_COORDINATOR 반복</td><td style="padding:7px;border:1px solid #e4bcbc">FindCoordinator 결과, internal topic leader, broker/controller events</td><td style="padding:7px;border:1px solid #e4bcbc">Coordinator 이동·stale metadata·broker flap</td><td style="padding:7px;border:1px solid #e4bcbc">Bounded rediscovery·영향 group 특정</td><td style="padding:7px;border:1px solid #e4bcbc">Leader·cache load 안정 후 canary commit</td><td style="padding:7px;border:1px solid #e4bcbc">모든 consumer/broker 동시 restart</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">COORDINATOR_LOAD_IN_PROGRESS</td><td style="padding:7px;border:1px solid #e4bcbc">Coordinator age, offsets partition lag/ISR, request latency</td><td style="padding:7px;border:1px solid #e4bcbc">새 coordinator가 state replay 중</td><td style="padding:7px;border:1px solid #e4bcbc">Backoff+jitter·deadline 내 retry</td><td style="padding:7px;border:1px solid #e4bcbc">Load 완료·offset fetch/commit 검증</td><td style="padding:7px;border:1px solid #e4bcbc">Tight retry loop로 복구 방해</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">Heartbeat 정상·lag 계속 증가</td><td style="padding:7px;border:1px solid #e4bcbc">Poll interval, processing/sink latency, records-lag-max, commit rate</td><td style="padding:7px;border:1px solid #e4bcbc">Membership은 정상이나 처리량 부족</td><td style="padding:7px;border:1px solid #e4bcbc">Processing 병목·hot partition·sink 확인</td><td style="padding:7px;border:1px solid #e4bcbc">Rate·lag slope·end-to-end SLO 회복</td><td style="padding:7px;border:1px solid #e4bcbc">Coordinator 장애로 단정</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#246787">7. 30분 실습: generation fencing을 상태 전이로 관찰</h2>
+  <div style="padding:14px;background:#fff5dc;border-left:5px solid #d6a22c;border-radius:8px"><strong>실행 전 예측</strong><br>
+  Consumer A·B가 각각 2 partitions를 가진 상태에서 A를 session timeout보다 오래 멈추면 B가 4 partitions를 얻는다. A가 다시 움직여도 예전 generation 권한으로 계속 처리하지 못하고 rejoin해야 한다. 숫자 generation은 CLI가 직접 노출하지 않아도 assignment 변화와 log로 fencing 결과를 추론할 수 있다.</div>
+  <p><strong>사전 조건:</strong> Docker, 저장소의 공식 Apache Kafka 4.3.1 단일 KRaft broker. 기본 실습 broker 외 다른 자원은 건드리지 않는다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 1 · Broker와 4-partition topic 준비</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day29.group --partitions 4 --replication-factor 1</code>
+  <p><strong>예상:</strong> Topic 생성 성공. 단일 broker라 coordinator failover가 아니라 member generation 전이에 집중한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 2 · Classic consumer A·B를 background로 시작</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker bash -lc '
+nohup /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day29.group \
+  --group day29-generation --from-beginning \
+  --consumer-property group.protocol=classic \
+  --consumer-property session.timeout.ms=10000 \
+  --consumer-property heartbeat.interval.ms=3000 \
+  --consumer-property auto.commit.interval.ms=1000 \
+  --property print.partition=true --property print.offset=true \
+  &gt;/tmp/day29-a.log 2&gt;&amp;1 &amp; echo $! &gt;/tmp/day29-a.pid'
+docker compose exec broker bash -lc '
+nohup /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic day29.group \
+  --group day29-generation --from-beginning \
+  --consumer-property group.protocol=classic \
+  --consumer-property session.timeout.ms=10000 \
+  --consumer-property heartbeat.interval.ms=3000 \
+  --consumer-property auto.commit.interval.ms=1000 \
+  --property print.partition=true --property print.offset=true \
+  &gt;/tmp/day29-b.log 2&gt;&amp;1 &amp; echo $! &gt;/tmp/day29-b.pid'
+sleep 8
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --group day29-generation --members --verbose</code>
+  <p><strong>예상:</strong> Stable group에 members 2개, 각 member에 약 2 partitions가 배정된다. Consumer ID는 process PID나 client ID와 다른 coordinator 발급 member ID다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 3 · Record와 offset baseline 고정</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">for i in 1 2 3 4 5 6 7 8; do printf 'event-%02d\n' "$i"; done | \
+  docker compose exec -T broker /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic day29.group
+sleep 5
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --group day29-generation --offsets
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --group day29-generation --state</code>
+  <p><strong>예상:</strong> Four partition offsets가 전진하고 lag가 0에 가까워진다. State는 Stable, member 수는 2다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 4 · 실패 주입: A를 session timeout보다 오래 정지</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker bash -lc \
+  'kill -STOP $(cat /tmp/day29-a.pid)'
+sleep 15
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --group day29-generation --members --verbose
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --group day29-generation --state</code>
+  <p><strong>예상:</strong> Coordinator가 A session을 만료시키고 새 generation을 만든다. B 한 명이 4 partitions를 소유한다. “A process가 존재한다”와 “A가 group member다”는 다르다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 5 · Zombie A 재개와 rejoin 관찰</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker bash -lc \
+  'kill -CONT $(cat /tmp/day29-a.pid)'
+sleep 10
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --group day29-generation --members --verbose
+docker compose exec broker bash -lc \
+  'tail -n 40 /tmp/day29-a.log'</code>
+  <p><strong>예상:</strong> A의 오래된 heartbeat·commit 권한은 그대로 인정되지 않는다. Client가 group에 다시 join하면서 또 새 generation과 assignment가 설치되고, 최종적으로 members 2개·약 2 partitions씩으로 수렴한다. Client log level에 따라 explicit generation error가 숨겨질 수 있으므로 <strong>member/assignment state transition</strong>을 1차 증거로 삼는다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">오류 해석과 cleanup</h3>
+  <p><strong>자주 나는 오류:</strong> Session timeout 범위를 벗어나면 broker의 <code>group.min/max.session.timeout.ms</code> 범위를 확인한다. Group이 Empty면 PID와 log를 확인하되 broker를 재시작하지 않는다. Lag가 남으면 producer record가 어떤 partition에 들어갔는지와 auto commit interval을 본다. Shell이 <code>$!</code>를 먼저 확장하지 않도록 single quote를 유지한다.</p>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker bash -lc '
+for f in /tmp/day29-a.pid /tmp/day29-b.pid; do
+  test -f "$f" &amp;&amp; kill -TERM $(cat "$f") 2&gt;/dev/null || true
+done
+rm -f /tmp/day29-a.log /tmp/day29-b.log \
+  /tmp/day29-a.pid /tmp/day29-b.pid'
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day29.group</code>
+  <p>Cleanup은 <code>day29-</code> consumer process·log와 <code>day29.group</code> topic만 정리한다. Shared broker와 volume은 유지한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Coordinator = controller:</strong> Group coordinator는 internal topic partition leader인 broker 역할이고 KRaft controller와 다르다.</li>
+    <li><strong>Generation = offset:</strong> Generation은 assignment 계약 버전, offset은 partition log 위치다.</li>
+    <li><strong>Heartbeat = 처리 성공:</strong> Member liveness만 증명한다. Poll·DB latency와 data quality는 별도다.</li>
+    <li><strong>Join 성공 = 처리 시작:</strong> SyncGroup과 assignment 설치 전에는 partition 소유권이 완성되지 않았다.</li>
+    <li><strong>Commit 성공 = DB 원자성:</strong> Kafka offset durability와 외부 side effect는 서로 다른 transaction boundary다.</li>
+    <li><strong>CommitFailed 무한 retry:</strong> Generation을 잃었다면 먼저 처리를 멈추고 새 assignment를 확인해야 한다.</li>
+    <li><strong>Coordinator 한 대 병목:</strong> 모든 groups가 한 broker로 가지 않고 group.id별 internal partitions에 분산되지만 hot coordinator partition은 가능하다.</li>
+    <li><strong>Classic 설정을 Consumer protocol에 복사:</strong> 새 protocol은 heartbeat·session·assignor의 소유자가 다르다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#246787">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. Group coordinator는 어떻게 정해지고 장애 시 어떻게 복구됩니까?</strong><br>
+  좋은 답변 구조: group.id→<code>__consumer_offsets</code> partition mapping → 그 partition leader broker가 coordinator → FindCoordinator로 발견 → coordinator failover 시 client rediscovery → internal log replay·cache load → load-in-progress/backoff → offsets와 membership의 replicated state, KRaft controller와 역할 분리.</p>
+  <p><strong>Q2. Generation이 없으면 어떤 장애가 생깁니까?</strong><br>
+  좋은 답변 구조: A가 P0 처리 중 GC pause → session 만료·P0가 B로 재배정 → B가 offset 120 commit → A가 깨어나 offset 110/미래 offset commit → 중복 또는 유실 → generation/member fencing으로 stale mutation 거부 → side effect는 sink idempotency가 추가로 필요.</p>
+  <p><strong>Q3. Consumer lag와 rebalance가 동시에 증가합니다. 어떻게 진단합니까?</strong><br>
+  좋은 답변 구조: lag slope·input/processing rate 수치화 → member churn·group state·heartbeat/poll gap → GC/deploy/network/sink latency timeline → coordinator 이동 여부 분리 → 유입 제한·원인 member 격리·sink 복구 → timeout 변경은 가설 검증 후 → Stable generation·assignment·end-to-end SLO로 종료.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#246787">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>Kafka 장애표 작성의 여섯 단계를 순서대로 말하라.</li><li>Data leader는 건강하지만 controller 과반을 잃었을 때 왜 “조건부 가용”인가?</li><li>Restart 뒤 incident를 닫기 전에 확인할 복구 증거는?</li></ol>
+  <p style="padding:12px;background:#eef4f7"><strong>짧은 정답:</strong> ① Contract→Config→Data state→Control state→Verdict→Action. ② 기존 data path는 잠시 동작할 수 있지만 새 ISR·election·admin metadata를 commit하지 못해 다음 failure에 취약하다. ③ Leader/epoch, ISR·lag·HW, controller quorum, 오류율·latency, canary와 정책 원복.</p>
+  <h3 style="margin:16px 0 8px;color:#246787">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>Coordinator 발견부터 Stable assignment까지 Classic 요청 흐름을 말하라.</li><li>Generation과 member ID가 zombie offset commit을 막는 과정을 수치 예로 설명하라.</li><li>Heartbeat가 정상인데 lag가 증가할 수 있는 원인 세 가지와 첫 증거는?</li></ol>
+  <p style="padding:12px;background:#eef4f7"><strong>채점 기준:</strong> ① FindCoordinator→JoinGroup→leader assignment→SyncGroup→Stable/Heartbeat(3점). ② G42 A pause→G43 B 소유·commit→A G42 거부와 재join(4점). ③ Poll/processing 지연, sink latency, hot partition·처리율 부족 등을 heartbeat와 분리하고 poll gap·partition lag·sink latency를 제시(3점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/implementation/distribution/" style="color:#246787">Apache Kafka 4.3 Distribution</a> — coordinator 발견·offset internal topic·복제·cache load</li>
+    <li><a href="https://kafka.apache.org/43/operations/consumer-rebalance-protocol/" style="color:#246787">Apache Kafka 4.3 Consumer Rebalance Protocol</a> — Classic과 Consumer protocol의 운영 차이</li>
+    <li><a href="https://kafka.apache.org/43/configuration/consumer-configs/" style="color:#246787">Apache Kafka 4.3 Consumer Configs</a> — group protocol·heartbeat·session·static member 설정</li>
+    <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/217387038/KIP-848%2BThe%2BNext%2BGeneration%2Bof%2Bthe%2BConsumer%2BRebalance%2BProtocol" style="color:#246787">KIP-848</a> — group·assignment·member epoch와 broker-driven reconciliation</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#263d52;color:#fff;border-radius:10px"><strong>내일 예고 · Week 5 / Day 30</strong><br>classic vs consumer rebalance protocol — global synchronization barrier와 incremental reconciliation, client-side·server-side assignor, timeout·heartbeat 설정 소유권을 failure window와 migration 관점에서 비교한다.</div>
+</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>
