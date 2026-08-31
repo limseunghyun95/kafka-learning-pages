@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 30 · classic vs consumer rebalance protocol</title>
+</head>
+<body style="margin:0;background:#edf2f5;color:#1c2730;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#edf2f5"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d1dce3;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#263d52;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#9fd2eb;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 5 / DAY 30 · REBALANCE PROTOCOL</div>
+  <h1 style="margin:10px 0 8px;font-size:29px;line-height:1.25">classic vs consumer rebalance protocol</h1>
+  <p style="margin:0;color:#dbeaf3">Global barrier와 per-member reconciliation · 이론 75분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#eaf5fb;border-left:5px solid #3180aa;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Classic은 모든 member가 Join/Sync barrier에서 같은 generation으로 함께 멈추고 client leader가 assignment를 계산한다. Consumer protocol은 coordinator가 target assignment를 만들고 각 member가 heartbeat로 독립적으로 revoke·acquire하며 member epoch를 target으로 수렴한다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#246787">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:10px;border:1px solid #c9dbe4"><strong>Protocol</strong></td><td style="padding:10px;border:1px solid #c9dbe4">참여자들이 어떤 message를 어떤 순서와 의미로 주고받을지 정한 계약. Client 설정 이름만이 아니라 wire API와 state machine을 포함한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Barrier</strong></td><td style="padding:10px;border:1px solid #c9dbe4">모든 참여자가 도착해야 다음 단계로 넘어가는 동기화 지점. 한 member가 늦으면 전체가 기다린다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Reconciliation</strong></td><td style="padding:10px;border:1px solid #c9dbe4">현재 assignment를 목표 assignment와 비교해 revoke·acquire하며 차이를 없애는 과정.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Group epoch</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Consumer protocol에서 group metadata 입력 버전. Member·subscription·partition metadata가 바뀌면 증가한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Assignment epoch</strong></td><td style="padding:10px;border:1px solid #c9dbe4">어떤 group epoch를 입력으로 target assignment를 계산했는지 나타내는 버전.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Member epoch</strong></td><td style="padding:10px;border:1px solid #c9dbe4">각 member가 현재 적용한 assignment 버전. Member마다 잠시 달라도 결국 target epoch로 수렴한다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Target assignment</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Coordinator가 계산·지속한 desired state. 즉시 모든 member의 current assignment와 같지는 않다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Pending partition</strong></td><td style="padding:10px;border:1px solid #c9dbe4">새 owner에게 배정될 예정이지만 이전 owner의 revoke 확인 전이라 아직 획득할 수 없는 partition.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Assignor</strong></td><td style="padding:10px;border:1px solid #c9dbe4">Members와 partitions를 입력으로 assignment를 계산하는 알고리즘. Classic은 client-side, Consumer는 기본적으로 server-side다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Revocation</strong></td><td style="padding:10px;border:1px solid #c9dbe4">기존 owner가 partition 처리를 멈추고 commit·resource 정리를 한 뒤 소유권을 반납하는 단계.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Eager / cooperative</strong></td><td style="padding:10px;border:1px solid #c9dbe4">모두 먼저 반납하는가, 이동 대상만 단계적으로 반납하는가의 assignment 전략 축. Classic/Consumer protocol 축과 완전히 같은 말이 아니다.</td></tr>
+    <tr><td style="padding:10px;border:1px solid #c9dbe4"><strong>Fencing</strong></td><td style="padding:10px;border:1px solid #c9dbe4">오래된 generation 또는 member epoch의 heartbeat·commit을 거부해 동시에 두 owner가 상태를 바꾸지 못하게 하는 장치.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#246787">2. 왜 중요한가</h2>
+  <p>Rebalance는 partition ownership을 바꾸는 control path다. 이 시간에는 fetch가 멈추고 cache가 식으며, stateful application은 resource를 닫고 다시 열 수 있다. 초당 수십만 건을 처리하는 group에서 20초의 global pause는 단순 지연이 아니라 lag·retry·downstream burst를 만든다.</p>
+  <p>Classic의 문제는 느린 member 한 대가 group 전체의 join barrier를 지연시키고, assignment 계산 입력이 group leader client를 왕복한다는 점이다. Consumer protocol은 broker가 state와 assignor를 소유하고 member별로 수렴시켜 blast radius를 줄이지만, coordinator에 더 세밀한 state와 server-side 연산 책임을 준다.</p>
+  <p>실무 선택은 “새것이 빠르다”가 아니다. Broker·client version, custom assignor, timeout 운영권, observability, migration·rollback 경로를 함께 검증해야 한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">3. Architecture: 같은 join을 두 protocol로 비교</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:9px;border:1px solid #c9dbe4">단계</th><th style="padding:9px;border:1px solid #c9dbe4">Classic</th><th style="padding:9px;border:1px solid #c9dbe4">Consumer protocol</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4"><strong>1 · 변화 감지</strong></td><td style="padding:9px;border:1px solid #c9dbe4">B join → PreparingRebalance</td><td style="padding:9px;border:1px solid #c9dbe4">B heartbeat(epoch 0) → group epoch 증가</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#3180aa;font-weight:800">&#8595; membership·subscription이 assignment 입력을 바꿈</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4"><strong>2 · 동기화</strong></td><td style="padding:9px;border:1px solid #c9dbe4">모든 members JoinGroup barrier</td><td style="padding:9px;border:1px solid #c9dbe4">각 member heartbeat를 독립 처리</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#477d98;font-weight:800">&#8595; assignment 계산 주체가 갈림</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4"><strong>3 · 계산</strong></td><td style="padding:9px;border:1px solid #c9dbe4">Coordinator→group leader metadata → client assignor → SyncGroup</td><td style="padding:9px;border:1px solid #c9dbe4">Coordinator server assignor → target assignment 지속</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#86669b;font-weight:800">&#8595; P2를 A에서 B로 이동한다고 가정</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4"><strong>4 · 전환</strong></td><td style="padding:9px;border:1px solid #c9dbe4">Generation G+1, members가 SyncGroup 후 함께 재개</td><td style="padding:9px;border:1px solid #c9dbe4">A에 P2 revoke → B에는 P2 pending</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#8a7139;font-weight:800">&#8595; 이전 owner가 반납했음을 확인</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4"><strong>5 · 완료</strong></td><td style="padding:9px;border:1px solid #c9dbe4">Group 전체 Stable·같은 generation</td><td style="padding:9px;border:1px solid #c9dbe4">B가 P2 acquire, 각 member epoch가 target으로 수렴</td></tr>
+  </table>
+  <p><strong>Classic 요청 흐름:</strong> <code>JoinGroup</code> → coordinator가 group leader·generation 선택 → leader가 member metadata로 assignment 계산 → <code>SyncGroup</code> → 모든 member에 assignment → <code>Heartbeat</code>.</p>
+  <p><strong>Consumer 요청 흐름:</strong> <code>ConsumerGroupHeartbeat</code>가 join·subscription·heartbeat·assignment 전달을 통합한다. Coordinator는 group epoch를 올리고 target assignment를 계산한 뒤, member별 current assignment를 revoke→ack→acquire 순으로 조정한다.</p>
+  <p><strong>겹치지 않는 핵심:</strong> B가 P2를 얻기 전에 A의 P2 반납이 확인돼야 한다. 속도보다 먼저 지켜야 할 불변식은 “동시에 두 active owner가 같은 partition을 처리하지 않는다”다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#246787">상태 소유권과 동시성 모델</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:9px;border:1px solid #c9dbe4">질문</th><th style="padding:9px;border:1px solid #c9dbe4">Classic</th><th style="padding:9px;border:1px solid #c9dbe4">Consumer</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">권한 state</td><td style="padding:9px;border:1px solid #c9dbe4">Coordinator의 group generation·members</td><td style="padding:9px;border:1px solid #c9dbe4">Coordinator의 group·target·member assignment records</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">계산 위치</td><td style="padding:9px;border:1px solid #c9dbe4">선출된 consumer group leader</td><td style="padding:9px;border:1px solid #c9dbe4">Broker-side assignor</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">동기화 단위</td><td style="padding:9px;border:1px solid #c9dbe4">Group generation barrier</td><td style="padding:9px;border:1px solid #c9dbe4">Member별 heartbeat·epoch</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">수렴 모델</td><td style="padding:9px;border:1px solid #c9dbe4">한 generation에 함께 진입</td><td style="padding:9px;border:1px solid #c9dbe4">Current state가 target state로 eventual convergence</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Fencing token</td><td style="padding:9px;border:1px solid #c9dbe4">Generation + member ID</td><td style="padding:9px;border:1px solid #c9dbe4">Member epoch + member ID</td></tr>
+  </table>
+
+  <h3 style="margin:24px 0 8px;color:#246787">A가 P0,P1,P2를 갖고 B가 join하는 수치 예</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:8px;border:1px solid #c9dbe4">순서</th><th style="padding:8px;border:1px solid #c9dbe4">Classic G=8→9</th><th style="padding:8px;border:1px solid #c9dbe4">Consumer epoch 8→9</th></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">T0</td><td style="padding:8px;border:1px solid #c9dbe4">A={0,1,2}, Stable G8</td><td style="padding:8px;border:1px solid #c9dbe4">A current e8={0,1,2}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">T1</td><td style="padding:8px;border:1px solid #c9dbe4">B join, 전체 PreparingRebalance</td><td style="padding:8px;border:1px solid #c9dbe4">Group e9, target A={0,1}, B={2}</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">T2</td><td style="padding:8px;border:1px solid #c9dbe4">A·B Join barrier, processing pause</td><td style="padding:8px;border:1px solid #c9dbe4">A는 P0,P1 처리 계속·P2 revoke, B P2 pending</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">T3</td><td style="padding:8px;border:1px solid #c9dbe4">Leader 계산·SyncGroup</td><td style="padding:8px;border:1px solid #c9dbe4">A heartbeat로 P2 반납 ack·A e9</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">T4</td><td style="padding:8px;border:1px solid #c9dbe4">A={0,1}, B={2}, Stable G9</td><td style="padding:8px;border:1px solid #c9dbe4">B heartbeat로 P2 acquire·B e9</td></tr>
+  </table>
+  <p>Consumer protocol에서 member epochs가 잠시 다르다는 사실은 inconsistency가 아니라 안전한 전환 상태다. Target은 선언적 desired state이고, pending partition은 이전 owner가 놓기 전에 새 owner가 잡지 못하게 하는 handoff token이다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#246787">복잡도·비용 trade-off</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dfeef5"><th style="padding:8px;border:1px solid #c9dbe4">비용</th><th style="padding:8px;border:1px solid #c9dbe4">Classic</th><th style="padding:8px;border:1px solid #c9dbe4">Consumer</th></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Network payload</td><td style="padding:8px;border:1px solid #c9dbe4">Member metadata가 leader로 모이고 전체 assignment 반환</td><td style="padding:8px;border:1px solid #c9dbe4">Heartbeat delta·member별 assignment</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Tail latency</td><td style="padding:8px;border:1px solid #c9dbe4">가장 느린 join/sync member가 group 지연</td><td style="padding:8px;border:1px solid #c9dbe4">영향 member가 독립 수렴; 이동 partition만 대기</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Compute</td><td style="padding:8px;border:1px solid #c9dbe4">Group leader client CPU·heap</td><td style="padding:8px;border:1px solid #c9dbe4">Coordinator broker CPU·event-loop state</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Persisted state</td><td style="padding:8px;border:1px solid #c9dbe4">Generation·members·assignment 단위</td><td style="padding:8px;border:1px solid #c9dbe4">Group·target·current member records로 세분화</td></tr>
+    <tr><td style="padding:8px;border:1px solid #c9dbe4">Failure isolation</td><td style="padding:8px;border:1px solid #c9dbe4">Barrier 때문에 group-wide 영향</td><td style="padding:8px;border:1px solid #c9dbe4">Per-member reconciliation로 blast radius 축소</td></tr>
+  </table>
+  <p>Consumer protocol이 공짜는 아니다. Broker가 assignment와 더 많은 state transition을 책임지므로 coordinator request latency·event queue·internal topic 상태를 관측해야 한다. 다만 client leader의 메모리와 global synchronization 병목을 제거해 큰 group에서 더 예측 가능한 확장성을 얻는다.</p>
+
+  <h3 style="margin:24px 0 8px;color:#246787">성공 확정 시점과 failure window</h3>
+  <ul style="padding-left:22px">
+    <li><strong>Classic:</strong> JoinGroup 응답만으로 assignment가 유효하지 않다. SyncGroup 응답과 callback 완료 뒤 processing을 재개한다.</li>
+    <li><strong>Consumer:</strong> Target assignment 기록만으로 새 owner가 즉시 처리하지 않는다. 이전 owner revoke 확인과 새 member heartbeat 응답이 있어야 acquire한다.</li>
+    <li><strong>Response loss:</strong> Member epoch 전진 응답이 유실되면 stale epoch로 재시도할 수 있다. Coordinator는 fencing하고 client는 full heartbeat/rejoin으로 복구한다.</li>
+    <li><strong>Side effect:</strong> 두 protocol 모두 revoke callback·offset commit과 외부 DB transaction을 자동 원자화하지 않는다.</li>
+  </ul>
+
+  <h3 style="margin:24px 0 8px;color:#246787">Kafka 4.3 현재성</h3>
+  <p>Kafka 4.0부터 Consumer protocol은 GA이며 server에서 지원된다. Kafka 4.3 Java consumer의 <code>group.protocol</code> 기본값은 여전히 <code>classic</code>이고, 새 protocol은 <code>consumer</code>로 명시한다. Consumer protocol에서는 client의 <code>heartbeat.interval.ms</code>, <code>session.timeout.ms</code>, <code>partition.assignment.strategy</code>가 사용되지 않으며 heartbeat·session과 server assignor는 broker/group 설정이 소유한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dfeef5"><th align="left" style="padding:9px;border:1px solid #c9dbe4">판단</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">권장</th><th align="left" style="padding:9px;border:1px solid #c9dbe4">이유</th></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Protocol 선택</td><td style="padding:9px;border:1px solid #c9dbe4">Client/broker·assignor·SLO compatibility matrix 작성</td><td style="padding:9px;border:1px solid #c9dbe4">한 줄 config 변경이 ownership·timeout·state model을 바꿈</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Canary</td><td style="padding:9px;border:1px solid #c9dbe4">비핵심 별도 group.id로 동일 traffic replay</td><td style="padding:9px;border:1px solid #c9dbe4">기존 production offset·ownership을 건드리지 않음</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Assignor</td><td style="padding:9px;border:1px solid #c9dbe4">Custom client assignor를 server assignor로 대체 가능한지 검증</td><td style="padding:9px;border:1px solid #c9dbe4">Rack·affinity·state locality 정책이 결과를 바꿈</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Timeout</td><td style="padding:9px;border:1px solid #c9dbe4">Consumer protocol은 broker/group 정책으로 중앙 관리</td><td style="padding:9px;border:1px solid #c9dbe4">Client별 임의 값이 더 이상 source of truth가 아님</td></tr>
+    <tr><td style="padding:9px;border:1px solid #c9dbe4">Rollback</td><td style="padding:9px;border:1px solid #c9dbe4">Migration policy·empty/non-empty group·offset 보존 검증</td><td style="padding:9px;border:1px solid #c9dbe4">Protocol rollback과 application rollback은 별도 절차</td></tr>
+  </table>
+  <p><strong>전환 순서:</strong> ① broker/client version·<code>group.version</code>·migration policy 확인 ② current members·lag·rebalance p95 baseline ③ server assignor와 heartbeat/session 정책 결정 ④ canary group에서 join/leave/GC/deploy failure injection ⑤ production wave ⑥ epoch·pending assignment·lag 검증 ⑦ rollback 조건과 owner 기록.</p>
+  <p><strong>Best practice:</strong> 신규 group은 Consumer protocol을 우선 평가하되 custom assignor나 vendor client가 막으면 Classic을 명시적으로 유지하고 이유·제거 조건을 ADR에 남긴다. 기존 non-empty group 전환은 official migration policy와 client compatibility를 확인하며, 가장 보수적인 절차는 consumers를 모두 멈춘 뒤 동일 offset group을 새 protocol로 재기동하는 것이다.</p>
+  <p><strong>Anti-pattern:</strong> Classic의 <code>session.timeout.ms</code>를 Consumer protocol client에 남겨 적용됐다고 믿기, cooperative assignor와 Consumer protocol을 동의어로 부르기, canary 없이 같은 group.id에서 혼합 배포하기, lag 0만 보고 pause time을 무시하기.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#ffe5e5"><th style="padding:7px;border:1px solid #e4bcbc">증상</th><th style="padding:7px;border:1px solid #e4bcbc">먼저 수집할 증거/지표</th><th style="padding:7px;border:1px solid #e4bcbc">가능한 가설</th><th style="padding:7px;border:1px solid #e4bcbc">안전한 첫 조치</th><th style="padding:7px;border:1px solid #e4bcbc">rollback/복구</th><th style="padding:7px;border:1px solid #e4bcbc">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">전환 뒤 group join 실패</td><td style="padding:7px;border:1px solid #e4bcbc">Broker/client version, group type, feature, migration policy, error code</td><td style="padding:7px;border:1px solid #e4bcbc">Unsupported protocol·mixed client·migration 차단</td><td style="padding:7px;border:1px solid #e4bcbc">Wave 중지·기존 members 보호</td><td style="padding:7px;border:1px solid #e4bcbc">검증한 protocol/image로 rollback·offset 확인</td><td style="padding:7px;border:1px solid #e4bcbc">같은 group에 양쪽 client 계속 투입</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">Consumer protocol에서도 pause 큼</td><td style="padding:7px;border:1px solid #e4bcbc">Member epochs, target epoch, pending partitions, callback·sink latency</td><td style="padding:7px;border:1px solid #e4bcbc">느린 revoke·server assignor·hot member</td><td style="padding:7px;border:1px solid #e4bcbc">Pending owner와 blocking member 특정</td><td style="padding:7px;border:1px solid #e4bcbc">Callback 경량화·점진 재투입</td><td style="padding:7px;border:1px solid #e4bcbc">Protocol 효과 없다고 즉시 전체 rollback</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">FENCED_MEMBER_EPOCH</td><td style="padding:7px;border:1px solid #e4bcbc">Member ID/current epoch, heartbeat loss, assignment</td><td style="padding:7px;border:1px solid #e4bcbc">Stale member·응답 유실·reassignment</td><td style="padding:7px;border:1px solid #e4bcbc">Partition 처리 중단·full heartbeat/rejoin</td><td style="padding:7px;border:1px solid #e4bcbc">새 assignment와 side effect reconcile</td><td style="padding:7px;border:1px solid #e4bcbc">옛 epoch commit 무한 retry</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">Coordinator CPU/request latency 상승</td><td style="padding:7px;border:1px solid #e4bcbc">Group cardinality, heartbeat rate, assignment updates, offsets partition 분포</td><td style="padding:7px;border:1px solid #e4bcbc">Migration burst·hot coordinator partition·churn</td><td style="padding:7px;border:1px solid #e4bcbc">Rollout 정지·churn 제한·영향 group 특정</td><td style="padding:7px;border:1px solid #e4bcbc">Rate 안정·queue/latency canary 확인</td><td style="padding:7px;border:1px solid #e4bcbc">모든 group 동시 전환</td></tr>
+    <tr><td style="padding:7px;border:1px solid #e4bcbc">설정 변경했지만 timeout 동일</td><td style="padding:7px;border:1px solid #e4bcbc">group.protocol, effective client/broker/group config</td><td style="padding:7px;border:1px solid #e4bcbc">새 protocol에서 client timeout 무시</td><td style="padding:7px;border:1px solid #e4bcbc">실제 설정 소유자 확인</td><td style="padding:7px;border:1px solid #e4bcbc">Broker/group 정책 수정 후 canary</td><td style="padding:7px;border:1px solid #e4bcbc">Client 값만 반복 변경</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#246787">7. 30분 실습: timeout 소유권과 group 전환 비교</h2>
+  <div style="padding:14px;background:#fff5dc;border-left:5px solid #d6a22c;border-radius:8px"><strong>실행 전 예측</strong><br>
+  Classic member는 client의 10초 session timeout으로 제거된다. Consumer protocol member는 client에 session 값을 주지 않고 broker 기본 정책을 사용하므로 제거까지 약 45초가 걸릴 수 있다. Protocol별 assignment 계산 위치와 timeout owner를 출력으로 방어한다.</div>
+  <p><strong>사전 조건:</strong> Docker와 저장소의 공식 Apache Kafka 4.3.1 단일 KRaft broker. 실습 process와 topic 이름은 <code>day30-</code> prefix만 사용한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 1 · Topic 준비</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">make up
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic day30.protocol --partitions 6 --replication-factor 1</code>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 2 · Classic members와 10초 timeout</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">for n in a b; do
+  docker compose exec -T broker bash -lc "
+  nohup /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 --topic day30.protocol \
+    --group day30-classic \
+    --consumer-property group.protocol=classic \
+    --consumer-property session.timeout.ms=10000 \
+    --consumer-property heartbeat.interval.ms=3000 \
+    &gt;/tmp/day30-classic-$n.log 2&gt;&amp;1 &amp;
+  echo \$! &gt;/tmp/day30-classic-$n.pid"
+done
+sleep 8
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --group day30-classic --members --verbose</code>
+  <p><strong>예상:</strong> Members 2개가 각 3 partitions를 가진다. Group leader client가 assignment를 계산했고 같은 generation으로 Stable해진 상태다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 3 · Classic member A 강제 종료</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker bash -lc \
+  'kill -KILL $(cat /tmp/day30-classic-a.pid)'
+for i in 1 2 3 4 5 6; do
+  date '+%H:%M:%S'
+  docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+    --bootstrap-server localhost:9092 --describe \
+    --group day30-classic --state || true
+  sleep 3
+done</code>
+  <p><strong>예상:</strong> 약 10초 뒤 A가 제거되고 new generation에서 B가 6 partitions를 얻는다. State가 Preparing/CompletingRebalance를 거쳐 Stable로 돌아오는 시각을 기록한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 4 · Consumer protocol members 시작</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">for n in a b; do
+  docker compose exec -T broker bash -lc "
+  nohup /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 --topic day30.protocol \
+    --group day30-consumer \
+    --consumer-property group.protocol=consumer \
+    --consumer-property group.remote.assignor=uniform \
+    &gt;/tmp/day30-consumer-$n.log 2&gt;&amp;1 &amp;
+  echo \$! &gt;/tmp/day30-consumer-$n.pid"
+done
+sleep 8
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --group day30-consumer --members --verbose</code>
+  <p><strong>예상:</strong> Members 2개가 server-side uniform assignor 결과를 받는다. Classic용 <code>session.timeout.ms</code>를 client에 넣지 않았고 broker/group config가 liveness 정책을 소유한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">Step 5 · Consumer member A 강제 종료와 epoch 수렴</h3>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker bash -lc \
+  'kill -KILL $(cat /tmp/day30-consumer-a.pid)'
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+  date '+%H:%M:%S'
+  docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+    --bootstrap-server localhost:9092 --describe \
+    --group day30-consumer --state || true
+  sleep 3
+done
+docker compose exec broker /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe \
+  --group day30-consumer --members --verbose</code>
+  <p><strong>예상:</strong> Kafka 4.3 기본 server session timeout 45초 전후에 A가 제거되고 B가 6 partitions로 수렴한다. CLI/version에 따라 epoch·pending 필드가 보이면 target/current 차이를 기록한다. 핵심은 detection latency 차이가 protocol 성능이 아니라 <strong>설정 소유권과 effective value 차이</strong>에서 왔다는 점이다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#246787">오류 해석과 cleanup</h3>
+  <p><strong>자주 나는 오류:</strong> Consumer protocol이 지원되지 않으면 broker/client가 4.0+인지와 feature를 확인한다. <code>group.remote.assignor</code> 오류는 broker <code>group.consumer.assignors</code> 목록을 본다. PID 파일이 없으면 log부터 읽고 broker를 재시작하지 않는다. 45초 전에 결과를 단정하지 않는다.</p>
+  <code style="display:block;padding:10px;background:#172b3a;color:#eaf7ff;border-radius:7px;white-space:pre-wrap;word-break:break-all">docker compose exec broker bash -lc '
+for f in /tmp/day30-*.pid; do
+  test -f "$f" &amp;&amp; kill -TERM $(cat "$f") 2&gt;/dev/null || true
+done
+rm -f /tmp/day30-*.pid /tmp/day30-*.log'
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic day30.protocol</code>
+  <p>Cleanup은 <code>day30-</code> process·log와 <code>day30.protocol</code>만 제거하며 shared broker·volume은 유지한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Consumer protocol = cooperative assignor:</strong> Protocol과 assignment 전략은 다른 축이다. Classic도 CooperativeStickyAssignor를 쓸 수 있다.</li>
+    <li><strong>Incremental = 즉시 완료:</strong> 이전 owner revoke·ack가 느리면 pending partition은 기다린다.</li>
+    <li><strong>Member epochs가 다르면 split-brain:</strong> 안전한 per-member 수렴 중일 수 있다. Ownership overlap이 없는지가 핵심이다.</li>
+    <li><strong>Client timeout 그대로 적용:</strong> Consumer protocol은 heartbeat/session을 broker가 제어한다.</li>
+    <li><strong>새 protocol은 broker 비용 0:</strong> Assignment 계산·세분화된 state records·heartbeat 처리가 coordinator로 이동한다.</li>
+    <li><strong>Lag 0이면 pause 없음:</strong> 유입이 적으면 lag는 0이어도 rebalance callback과 cache warm-up latency가 클 수 있다.</li>
+    <li><strong>Protocol switch는 무중단 보장:</strong> Client·assignor·migration policy에 따라 stop/restart 또는 controlled conversion이 필요하다.</li>
+    <li><strong>Kafka 5.0 계획을 4.3 사실로 단정:</strong> 오늘 자료는 Kafka 4.3.1과 공식 4.3 문서 기준이다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#246787">9. 대기업 기술 면접 질문 3개</h2>
+  <p><strong>Q1. Classic rebalance의 확장성 병목과 Consumer protocol의 해결 방식을 설명하세요.</strong><br>
+  좋은 답변 구조: M members·P partitions 가정 → Join/Sync global barrier와 slowest member tail latency → leader client로 metadata 왕복·assignment 계산 → broker target assignment와 per-member heartbeat reconciliation → unaffected partitions 처리 지속 → coordinator CPU/state 비용·관측 필요.</p>
+  <p><strong>Q2. Consumer protocol에서 같은 partition이 두 member에게 동시에 배정되지 않는 이유는?</strong><br>
+  좋은 답변 구조: group epoch→target assignment → old owner revoke 지시 → new owner pending → revoke acknowledgement·state persistence → new owner acquire → member epoch fencing → response loss·zombie 시 FENCED_MEMBER_EPOCH와 rejoin.</p>
+  <p><strong>Q3. Production Classic group을 Consumer protocol로 전환하는 계획을 설계하세요.</strong><br>
+  좋은 답변 구조: broker/client·feature·custom assignor inventory → p95 rebalance/lag/SLO baseline → canary 별도 group → join/leave/GC/deploy failure injection → server timeout/assignor 정책 → wave rollout·migration policy → offset·epoch·pending·side effect 검증 → rollback trigger와 책임자.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">10. 복습과 정답</h2>
+  <h3 style="margin:16px 0 8px;color:#246787">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px"><li>Group coordinator는 어떻게 선택되고 어디에 상태를 저장하는가?</li><li>Generation이 zombie offset commit을 막는 수치 예를 말하라.</li><li>Heartbeat가 정상인데 lag가 증가할 수 있는 이유는?</li></ol>
+  <p style="padding:12px;background:#eef4f7"><strong>짧은 정답:</strong> ① group.id가 <code>__consumer_offsets</code> partition에 매핑되고 그 leader broker가 coordinator이며 internal compacted log와 cache에 상태를 둔다. ② G42 A pause→G43 B가 offset 120→A의 G42 offset 110 거부. ③ Heartbeat는 membership liveness일 뿐 poll·processing·sink 처리량을 보장하지 않는다.</p>
+  <h3 style="margin:16px 0 8px;color:#246787">오늘 확인 3문제</h3>
+  <ol style="padding-left:22px"><li>Classic과 Consumer protocol의 assignment 계산 주체·동기화 단위·fencing token을 비교하라.</li><li>Target assignment, pending partition, member epoch의 관계를 P2 이동 예로 설명하라.</li><li>Consumer protocol 전환 전 반드시 검증할 항목 다섯 가지는?</li></ol>
+  <p style="padding:12px;background:#eef4f7"><strong>채점 기준:</strong> ① Client leader/group barrier/generation 대 broker assignor/member reconciliation/member epoch(3점). ② A revoke 전 B pending, ack 뒤 B acquire, 각 epoch가 target으로 수렴(3점). ③ Version·feature, assignor, timeout owner, metrics baseline, migration/rollback, canary·offset·side effect 중 다섯 가지(4점). 총 8점 이상 통과.</p>
+
+  <h2 style="margin:30px 0 12px;color:#246787">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/operations/consumer-rebalance-protocol/" style="color:#246787">Apache Kafka 4.3 Consumer Rebalance Protocol</a> — GA·Classic/Consumer 비교·전환</li>
+    <li><a href="https://kafka.apache.org/43/configuration/consumer-configs/" style="color:#246787">Apache Kafka 4.3 Consumer Configs</a> — group.protocol·client 설정 경계</li>
+    <li><a href="https://kafka.apache.org/43/configuration/broker-configs/" style="color:#246787">Apache Kafka 4.3 Broker Configs</a> — server assignor·heartbeat·session·migration policy</li>
+    <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/217387038/KIP-848%2BThe%2BNext%2BGeneration%2Bof%2Bthe%2BConsumer%2BRebalance%2BProtocol" style="color:#246787">KIP-848</a> — group/assignment/member epoch와 incremental reconciliation</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:18px;background:#263d52;color:#fff;border-radius:10px"><strong>내일 예고 · Week 5 / Day 31</strong><br>eager/cooperative assignment와 pause 비용 — protocol과 assignor 축을 분리하고 revoke 범위, stop-the-world, cache warm-up, duplicate window를 수치로 비교한다.</div>
+</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>

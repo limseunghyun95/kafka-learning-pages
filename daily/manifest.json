@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-30T09:00:50+09:00",
+  "updatedAt": "2026-08-31T09:02:10+09:00",
   "lessons": [
     {
       "day": 1,
@@ -266,6 +266,15 @@
       "path": "day-29.html",
       "kind": "lesson",
       "publishedAt": "2026-08-30T09:00:50+09:00"
+    },
+    {
+      "day": 30,
+      "week": 5,
+      "title": "classic vs consumer rebalance protocol",
+      "summary": "Classic의 Join/Sync global barrier와 Consumer protocol의 broker-driven target assignment·member epoch reconciliation을 비용·장애·전환 관점에서 비교합니다.",
+      "path": "day-30.html",
+      "kind": "lesson",
+      "publishedAt": "2026-08-31T09:02:10+09:00"
     }
   ]
 }
