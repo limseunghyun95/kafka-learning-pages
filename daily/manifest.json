@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-08-31T09:02:10+09:00",
+  "updatedAt": "2026-09-01T09:00:45+09:00",
   "lessons": [
     {
       "day": 1,
@@ -275,6 +275,15 @@
       "path": "day-30.html",
       "kind": "lesson",
       "publishedAt": "2026-08-31T09:02:10+09:00"
+    },
+    {
+      "day": 31,
+      "week": 5,
+      "title": "eager/cooperative assignment와 pause 비용",
+      "summary": "Eager의 full revocation과 Cooperative의 incremental handoff를 집합·불변식·partition-seconds 비용·callback·전환 장애 관점에서 비교합니다.",
+      "path": "day-31.html",
+      "kind": "lesson",
+      "publishedAt": "2026-09-01T09:00:45+09:00"
     }
   ]
 }
