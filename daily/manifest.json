@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-09-01T09:00:45+09:00",
+  "updatedAt": "2026-10-11T14:58:09+09:00",
   "lessons": [
     {
       "day": 1,
@@ -284,6 +284,15 @@
       "path": "day-31.html",
       "kind": "lesson",
       "publishedAt": "2026-09-01T09:00:45+09:00"
+    },
+    {
+      "day": 32,
+      "week": 5,
+      "title": "static membership, heartbeat, max poll interval",
+      "summary": "Heartbeat/session의 process liveness와 max poll의 application progress를 분리하고, static identity가 rebalance churn과 장애 failover window를 어떻게 맞바꾸는지 분석합니다.",
+      "path": "day-32.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-11T14:58:09+09:00"
     }
   ]
 }
