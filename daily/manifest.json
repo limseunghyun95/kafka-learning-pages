@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-10-11T14:58:09+09:00",
+  "updatedAt": "2026-10-12T09:19:15+09:00",
   "lessons": [
     {
       "day": 1,
@@ -293,6 +293,15 @@
       "path": "day-32.html",
       "kind": "lesson",
       "publishedAt": "2026-10-11T14:58:09+09:00"
+    },
+    {
+      "day": 33,
+      "week": 5,
+      "title": "transaction coordinator와 read-committed",
+      "summary": "transactional.id·PID/epoch·coordinator state log·commit/abort marker·LSO가 여러 Kafka partition의 원자적 가시성을 만드는 흐름과 장애 창을 분석합니다.",
+      "path": "day-33.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-12T09:19:15+09:00"
     }
   ]
 }
