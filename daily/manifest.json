@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-10-12T09:19:15+09:00",
+  "updatedAt": "2026-10-13T09:00:33+09:00",
   "lessons": [
     {
       "day": 1,
@@ -302,6 +302,15 @@
       "path": "day-33.html",
       "kind": "lesson",
       "publishedAt": "2026-10-12T09:19:15+09:00"
+    },
+    {
+      "day": 34,
+      "week": 5,
+      "title": "랩: slow consumer·rebalance storm 재현",
+      "summary": "느린 poll이 max poll 초과와 ownership 이동을 거쳐 rebalance storm으로 증폭되는 과정을 재현하고, state·members·lag 증거로 진단·복구합니다.",
+      "path": "day-34.html",
+      "kind": "lab",
+      "publishedAt": "2026-10-13T09:00:33+09:00"
     }
   ]
 }
