@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 35 · 회상: exactly-once가 외부 DB까지 자동 확장되지 않는 이유</title>
+</head>
+<body style="margin:0;background:#f3f0ec;color:#302b28;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#f3f0ec"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #ded5cc;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#4b3f3a;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#dfcbbd;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 5 / DAY 35 · RECALL &amp; DESIGN REVIEW</div>
+  <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.28">회상: exactly-once가 외부 DB까지 자동 확장되지 않는 이유</h1>
+  <p style="margin:0;color:#f0e7e1">원자성 경계·dual-write 실패 창·outbox/inbox를 설계 언어로 방어하기 · 이론 70분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#f5ece6;border-left:5px solid #9a6045;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Kafka transaction coordinator는 Kafka topic-partition과 <code>__consumer_offsets</code>의 commit만 원자적으로 조정한다. 외부 DB의 WAL·lock·commit 결과는 알지 못하므로, DB side effect까지 exactly-once로 만들려면 outbox·inbox·unique key·CDC 같은 별도 application protocol이 필요하다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:9px;border:1px solid #dfd0c6"><strong>Exactly-once</strong></td><td style="padding:9px;border:1px solid #dfd0c6">관찰 가능한 결과가 논리 작업당 한 번만 반영되는 성질. 전 세계 모든 side effect가 한 번이라는 뜻이 아니며, 시스템·operation·observer의 범위를 먼저 말해야 한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd0c6"><strong>Idempotence</strong></td><td style="padding:9px;border:1px solid #dfd0c6">같은 operation을 여러 번 실행해도 최종 상태가 한 번 실행한 것과 같은 성질. 중복 요청을 안전하게 흡수하는 도구이지 요청이 한 번만 도착한다는 보장은 아니다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd0c6"><strong>Atomicity</strong></td><td style="padding:9px;border:1px solid #dfd0c6">한 경계 안의 여러 변경이 모두 commit되거나 모두 abort되는 성질. Kafka transaction과 DB transaction은 각각 다른 atomicity domain이다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd0c6"><strong>Dual write</strong></td><td style="padding:9px;border:1px solid #dfd0c6">하나의 업무 요청에서 DB와 Kafka처럼 독립된 두 시스템에 쓰는 것. 두 번째 write 전후 crash가 부분 성공 상태를 만든다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd0c6"><strong>WAL</strong></td><td style="padding:9px;border:1px solid #dfd0c6">Write-Ahead Log. DB가 data page보다 먼저 변경 의도를 기록해 crash recovery에 쓰는 로그. Kafka transaction log와 별도이며 서로 자동 복제되지 않는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd0c6"><strong>Transactional outbox</strong></td><td style="padding:9px;border:1px solid #dfd0c6">Business row와 발행할 event row를 같은 DB transaction에 저장하고, 별도 relay/CDC가 outbox를 Kafka로 전달하는 패턴.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd0c6"><strong>Inbox / dedup key</strong></td><td style="padding:9px;border:1px solid #dfd0c6">Consumer가 처리한 <code>event_id</code>를 sink transaction 안에 기록해 재전달을 감지하는 패턴. Unique constraint나 conditional update가 원자적 gate가 된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd0c6"><strong>CDC</strong></td><td style="padding:9px;border:1px solid #dfd0c6">Change Data Capture. DB transaction log의 확정된 변경을 읽어 event stream으로 전달한다. Snapshot·ordering·schema·offset 책임은 별도로 설계해야 한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd0c6"><strong>2PC / XA</strong></td><td style="padding:9px;border:1px solid #dfd0c6">Coordinator가 여러 resource에 prepare 후 commit/abort를 지시하는 분산 transaction 방식. 참여 시스템 지원, lock 시간, coordinator 장애, 운영 복잡성의 비용이 있다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd0c6"><strong>Unknown outcome</strong></td><td style="padding:9px;border:1px solid #dfd0c6">Timeout으로 caller는 실패를 받았지만 server commit 여부는 아직 모르는 상태. “오류 응답=미반영”으로 가정하면 중복 또는 누락을 만든다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">2. 왜 중요한가</h2>
+  <p>주문 DB row를 저장한 뒤 <code>order-created</code> event를 Kafka에 보낸다고 하자. DB commit 뒤 process가 죽으면 event가 없다. 반대로 Kafka publish 뒤 DB commit 전에 죽으면 downstream은 존재하지 않는 주문을 본다. 순서만 바꾸면 실패 창의 방향만 바뀐다.</p>
+  <p>Kafka의 <code>commitTransaction()</code>은 Kafka 내부에서는 강한 의미를 갖는다. 여러 Kafka partitions의 records와 consumer offsets를 같은 transaction에 넣을 수 있다. 그러나 transaction coordinator가 보유한 참여 집합에는 PostgreSQL transaction ID, MySQL binlog position, REST 결제 승인 번호가 없다. 모르는 resource를 commit하거나 rollback할 수는 없다.</p>
+  <p>면접에서 “Kafka는 exactly-once를 지원한다”라고만 답하면 범위를 놓친다. 좋은 답은 <strong>무엇이 한 번인지, 누가 commit을 결정하는지, 어느 log가 source of truth인지, crash가 어느 두 operation 사이에 가능한지, 재시도를 어떻게 멱등하게 만드는지</strong>를 차례로 명시한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">3. Architecture: 두 coordinator가 자동으로 하나가 되지 않는 이유</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word;font-size:14px">
+    <tr style="background:#efe0d6"><th style="padding:8px;border:1px solid #dfd0c6">Application</th><th style="padding:8px;border:1px solid #dfd0c6">External DB domain</th><th style="padding:8px;border:1px solid #dfd0c6">Kafka transaction domain</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6"><strong>① consume order command</strong></td><td style="padding:8px;border:1px solid #dfd0c6">아직 변경 없음</td><td style="padding:8px;border:1px solid #dfd0c6">Input offset는 아직 미commit</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#9a6045;font-weight:800">&#8595; application이 서로 다른 두 transaction을 시작</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6"><strong>② INSERT order</strong></td><td style="padding:8px;border:1px solid #dfd0c6">DB transaction manager가 WAL·lock·constraint를 소유</td><td style="padding:8px;border:1px solid #dfd0c6">Kafka coordinator는 이 변경을 모름</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#b44b58;font-weight:800">&#8595; DB COMMIT 뒤 crash하면 DB만 성공한 missing-event window</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6"><strong>③ produce event + offset</strong></td><td style="padding:8px;border:1px solid #dfd0c6">이미 commit됐거나 아직 미commit</td><td style="padding:8px;border:1px solid #dfd0c6">Coordinator가 Kafka partitions·offsets·marker를 소유</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#b44b58;font-weight:800">&#8595; Kafka COMMIT 뒤 DB rollback/crash면 event-only window</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6"><strong>④ response</strong><br>한쪽 timeout 가능</td><td style="padding:8px;border:1px solid #dfd0c6">DB commit 결과는 DB log에서 복구</td><td style="padding:8px;border:1px solid #dfd0c6">Kafka commit 결과는 transaction log·markers에서 복구</td></tr>
+  </table>
+  <p><strong>Data path:</strong> Kafka Fetch/Produce와 DB query/commit이 별도 connection·protocol·storage engine을 탄다. <strong>Control path:</strong> Kafka coordinator와 DB transaction manager가 각자의 state machine을 진행한다. 공통 coordinator나 합의 protocol을 명시적으로 도입하지 않는 한 두 결정 사이에는 atomic cut이 없다.</p>
+  <p><strong>상태의 소유자:</strong> Kafka coordinator는 <code>transactional.id</code>, PID/epoch, Kafka 참여 partitions, commit/abort를 소유한다. Group coordinator는 input offset을 소유한다. DB는 row·constraint·WAL commit을 소유한다. Application은 두 결과를 연결하는 business key와 retry policy를 소유한다.</p>
+  <p><strong>핵심 불변식:</strong> Kafka-only EOS에서는 output record와 다음 input offset이 같은 Kafka transaction에 있어야 한다. External sink에서는 <code>event_id</code>당 business mutation이 최대 한 번 반영되도록 dedup record와 mutation을 같은 DB transaction에 넣어야 한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#8a4f37">보장 범위를 operation 집합으로 쓰기</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#efe0d6"><th style="padding:8px;border:1px solid #dfd0c6">기법</th><th style="padding:8px;border:1px solid #dfd0c6">원자 경계</th><th style="padding:8px;border:1px solid #dfd0c6">경계 밖</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Idempotent producer</td><td style="padding:8px;border:1px solid #dfd0c6">한 producer session의 protocol retry 중 Kafka append 중복 억제</td><td style="padding:8px;border:1px solid #dfd0c6">Application-level resend, 외부 DB, consumer side effect</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Kafka transaction</td><td style="padding:8px;border:1px solid #dfd0c6">여러 Kafka topic-partition writes + Kafka consumer offsets</td><td style="padding:8px;border:1px solid #dfd0c6">RDB, HTTP API, object storage, email</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Streams exactly_once_v2</td><td style="padding:8px;border:1px solid #dfd0c6">Kafka input offsets·output topics·state changelog의 처리 결과</td><td style="padding:8px;border:1px solid #dfd0c6">Topology 안에서 직접 호출한 비transactional 외부 side effect</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">DB transaction + inbox</td><td style="padding:8px;border:1px solid #dfd0c6">Dedup key insert + business rows update</td><td style="padding:8px;border:1px solid #dfd0c6">Kafka offset commit; 재전달은 허용하고 sink에서 흡수</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">DB outbox + relay</td><td style="padding:8px;border:1px solid #dfd0c6">Business row + outbox row</td><td style="padding:8px;border:1px solid #dfd0c6">Kafka publish와 outbox published 표시는 보통 at-least-once</td></tr>
+  </table>
+
+  <h3 style="margin:22px 0 8px;color:#8a4f37">왜 “정확히 한 번 전달”보다 “효과적으로 한 번”인가</h3>
+  <p>Network에서는 response가 유실될 수 있다. Sender는 server가 commit했는지 모른 채 retry해야 한다. Retry를 막으면 누락, retry하면 중복 가능성이 생긴다. 그래서 실무 end-to-end 목표는 보통 <strong>at-least-once transport + idempotent effect</strong>다. 동일 <code>event_id</code>의 재전달을 허용하되 sink transaction이 한 번만 business state를 바꾸게 한다.</p>
+  <p>Dedup key는 payload hash보다 domain identity가 좋다. 같은 payload라도 서로 다른 주문일 수 있고, timestamp·serialization 차이로 hash가 달라질 수 있다. Producer가 stable event ID를 만들고 consumer가 unique constraint 또는 conditional write로 원자 검증한다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#8a4f37">Outbox가 닫는 창과 남기는 창</h3>
+  <p>Business row와 outbox row를 같은 DB transaction에 넣으면 “DB는 성공했는데 발행할 정보가 영원히 없음”을 막는다. Relay는 commit된 outbox를 반복 읽어 Kafka에 publish할 수 있다. 하지만 Kafka ack 후 <code>published=true</code> 전에 relay가 죽으면 같은 event를 다시 publish한다. 따라서 outbox는 보통 누락 방지에 강하고, downstream inbox/idempotency와 함께 써야 중복 효과까지 막는다.</p>
+  <p>CDC relay는 polling race를 줄이고 DB log ordering을 활용하지만 만능은 아니다. Snapshot과 streaming 전환, schema evolution, partition key, 재시작 offset, poison event, tombstone 정책이 새 책임이 된다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#8a4f37">2PC를 기본 답으로 쓰기 어려운 이유</h3>
+  <p>2PC는 참여 resource가 prepare/commit protocol을 지원하고 coordinator recovery가 정확해야 한다. Prepared transaction은 lock과 resource를 오래 잡을 수 있고 network partition 때 availability를 희생할 수 있다. Kafka와 일반 application DB 사이에 “설정 하나”로 생기는 기능이 아니다. 강한 원자성이 실제 business requirement이고 모든 participant·driver·운영 절차가 검증된 경우에만 비용과 함께 선택한다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#8a4f37">성공 확정 시점과 unknown outcome</h3>
+  <ul style="padding-left:22px">
+    <li><strong>DB commit 정상 반환:</strong> DB transaction의 durability만 확정한다. Kafka event 존재는 확정하지 않는다.</li>
+    <li><strong>Kafka commitTransaction 정상 반환:</strong> Kafka transaction의 records·offsets commit을 확정한다. DB row는 확정하지 않는다.</li>
+    <li><strong>Timeout:</strong> 미실행이 아니라 결과 미확인일 수 있다. Stable operation ID로 상태 조회·retry해야 한다.</li>
+    <li><strong>Outbox row commit:</strong> 발행 의도가 durable해진다. Kafka 전달·downstream 처리는 아직 미확정이다.</li>
+    <li><strong>Inbox+business commit:</strong> 해당 event ID의 sink 효과가 한 번 반영됐음을 sink DB가 증명한다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#efe0d6"><th style="padding:8px;border:1px solid #dfd0c6">요구사항</th><th style="padding:8px;border:1px solid #dfd0c6">권장 패턴</th><th style="padding:8px;border:1px solid #dfd0c6">판단 이유</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Kafka→Kafka 변환</td><td style="padding:8px;border:1px solid #dfd0c6">Kafka transaction 또는 Streams exactly_once_v2 + read_committed</td><td style="padding:8px;border:1px solid #dfd0c6">Output과 input offset을 같은 Kafka atomic domain에 포함 가능</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">DB 변경 후 event</td><td style="padding:8px;border:1px solid #dfd0c6">Transactional outbox + CDC/relay + stable event ID</td><td style="padding:8px;border:1px solid #dfd0c6">Business row와 발행 의도를 한 DB commit으로 묶음</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Kafka event→DB</td><td style="padding:8px;border:1px solid #dfd0c6">Inbox/unique key와 business mutation을 같은 DB transaction에 저장</td><td style="padding:8px;border:1px solid #dfd0c6">Offset 전후 crash 재전달을 sink가 안전하게 흡수</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">결제·메일·외부 API</td><td style="padding:8px;border:1px solid #dfd0c6">Idempotency-Key, 상태 조회, bounded retry, saga/compensation</td><td style="padding:8px;border:1px solid #dfd0c6">Remote provider transaction에 Kafka coordinator가 참여하지 않음</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">감사·정산</td><td style="padding:8px;border:1px solid #dfd0c6">Immutable operation ledger + reconciliation job + 수동 복구 절차</td><td style="padding:8px;border:1px solid #dfd0c6">완벽한 online 원자성보다 누락 탐지·재현·보정 가능성이 중요</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> Design document 첫 줄에 보장 범위를 쓴다. 예: “Kafka input offset과 output topic은 atomic, PostgreSQL effect는 event_id unique constraint로 effectively-once.” Event ID 생성 주체·retention·dedup TTL·replay 정책·schema compatibility·reconciliation owner까지 명시한다.</p>
+  <p><strong>Anti-pattern:</strong> Producer idempotence를 consumer EOS로 오해하기, DB write 뒤 Kafka send만 하고 retry policy 없음, offset을 DB보다 먼저 commit하기, outbox row를 business transaction 밖에서 insert하기, payload hash를 영구 idempotency key로 사용하기, DLQ로 보내면 일관성이 해결됐다고 보기.</p>
+  <p><strong>Edge case:</strong> Dedup row TTL이 replay 보존 기간보다 짧으면 오래된 event가 다시 효과를 낸다. Business transaction은 rollback됐는데 outbox만 남으면 phantom event가 된다. CDC snapshot과 live log가 겹치면 중복이 가능하다. Compaction topic은 “transaction의 모든 record를 한꺼번에 영원히 관찰”하는 보장이 아니다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:13px;word-break:break-word">
+    <tr style="background:#efe0d6"><th style="padding:6px;border:1px solid #dfd0c6">증상</th><th style="padding:6px;border:1px solid #dfd0c6">먼저 수집할 증거/지표</th><th style="padding:6px;border:1px solid #dfd0c6">가능한 가설</th><th style="padding:6px;border:1px solid #dfd0c6">안전한 첫 조치</th><th style="padding:6px;border:1px solid #dfd0c6">rollback/복구</th><th style="padding:6px;border:1px solid #dfd0c6">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:6px;border:1px solid #dfd0c6">DB row는 있는데 event 없음</td><td style="padding:6px;border:1px solid #dfd0c6">Business ID, DB commit/WAL 시각, outbox row, producer request·error, topic key</td><td style="padding:6px;border:1px solid #dfd0c6">DB-first crash, outbox 누락, relay 정지</td><td style="padding:6px;border:1px solid #dfd0c6">해당 ID의 상태를 양쪽에서 조회하고 신규 재발행 제한</td><td style="padding:6px;border:1px solid #dfd0c6">Stable event ID로 outbox backfill 후 재발행·reconcile</td><td style="padding:6px;border:1px solid #dfd0c6">새 랜덤 ID로 무작정 publish, DB row 삭제</td></tr>
+    <tr><td style="padding:6px;border:1px solid #dfd0c6">Event는 있는데 DB row 없음</td><td style="padding:6px;border:1px solid #dfd0c6">Kafka offset/transaction marker, DB transaction log, request ID, consumer isolation</td><td style="padding:6px;border:1px solid #dfd0c6">Kafka-first crash, read_uncommitted, phantom outbox</td><td style="padding:6px;border:1px solid #dfd0c6">Downstream side effect를 pause하고 source-of-truth 확인</td><td style="padding:6px;border:1px solid #dfd0c6">Compensating event 또는 missing DB state 복구 후 재처리</td><td style="padding:6px;border:1px solid #dfd0c6">증거 없이 offset skip, 임의 DB insert</td></tr>
+    <tr><td style="padding:6px;border:1px solid #dfd0c6">같은 event가 DB에 두 번 반영</td><td style="padding:6px;border:1px solid #dfd0c6">event_id, inbox unique constraint, consumer offset, rebalance/crash timeline</td><td style="padding:6px;border:1px solid #dfd0c6">Offset commit 전 crash, non-atomic dedup, TTL 만료</td><td style="padding:6px;border:1px solid #dfd0c6">Consumer scale 변경 중지, duplicate key 범위와 금액 영향 계산</td><td style="padding:6px;border:1px solid #dfd0c6">Inbox+mutation atomic patch 후 idempotent replay·보정 transaction</td><td style="padding:6px;border:1px solid #dfd0c6">Offset을 최신으로 강제 이동해 누락 숨기기</td></tr>
+    <tr><td style="padding:6px;border:1px solid #dfd0c6">Commit timeout 후 상태 불명</td><td style="padding:6px;border:1px solid #dfd0c6">Operation ID, broker/DB logs, transaction state, response timeout 시각</td><td style="padding:6px;border:1px solid #dfd0c6">Commit 성공·응답 유실, coordinator 전이, network partition</td><td style="padding:6px;border:1px solid #dfd0c6">같은 ID로 상태 조회하고 write traffic을 제한</td><td style="padding:6px;border:1px solid #dfd0c6">Documented retry/recovery protocol 실행, reconciliation 기록</td><td style="padding:6px;border:1px solid #dfd0c6">실패로 단정해 다른 ID로 재실행, commit 뒤 abort 전환</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">7. 20~40분 실습: DB-first crash와 outbox 중복 발행</h2>
+  <div style="padding:14px;background:#fff3d8;border-left:5px solid #d28b22;border-radius:8px"><strong>목표:</strong> SQLite를 외부 DB로 보고 DB commit 뒤 Kafka publish 전 crash를 재현한다. 이어 outbox가 누락 창을 닫지만 relay crash 때문에 중복 publish는 남긴다는 사실을 직접 관찰한다.</div>
+  <p><strong>사전 조건:</strong> 저장소 root, Docker, Python 3 표준 라이브러리. Apache Kafka 4.3.1 compose 환경. 약 30분.</p>
+
+  <h3 style="margin:20px 0 8px;color:#8a4f37">0) 실행 전 예측</h3>
+  <ol style="padding-left:22px">
+    <li>DB commit 뒤 publish 전에 process가 죽으면 어느 시스템이 진실을 갖는가?</li>
+    <li>Outbox relay가 Kafka ack 뒤 published 표시 전에 죽으면 몇 번 publish될 수 있는가?</li>
+    <li>Kafka에 중복 event가 있어도 DB 효과를 한 번으로 만들 최소 constraint는 무엇인가?</li>
+  </ol>
+
+  <h3 style="margin:20px 0 8px;color:#8a4f37">1) Topic과 SQLite 준비</h3>
+  <pre style="margin:0;padding:14px;background:#2a2421;color:#f7eee9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose up -d
+docker compose exec broker bash -lc 'bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic day35-order-events --partitions 1 --replication-factor 1'
+python3 -c 'import sqlite3; c=sqlite3.connect("/tmp/day35.db"); c.executescript("CREATE TABLE IF NOT EXISTS orders(order_id TEXT PRIMARY KEY,status TEXT); CREATE TABLE IF NOT EXISTS outbox(event_id TEXT PRIMARY KEY,payload TEXT,published INTEGER DEFAULT 0);"); c.commit()'</pre>
+
+  <h3 style="margin:20px 0 8px;color:#8a4f37">2) 실패 주입 A: DB-first 뒤 의도적으로 중단</h3>
+  <pre style="margin:0;padding:14px;background:#2a2421;color:#f7eee9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">python3 -c 'import sqlite3; c=sqlite3.connect("/tmp/day35.db"); c.execute("INSERT INTO orders VALUES(?,?)",("order-42","CREATED")); c.commit(); print("DB_COMMIT_OK; crash before Kafka publish")'
+python3 -c 'import sqlite3; print(sqlite3.connect("/tmp/day35.db").execute("SELECT * FROM orders").fetchall())'
+docker compose exec broker bash -lc 'bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic day35-order-events --from-beginning --timeout-ms 3000'</pre>
+  <p><strong>예상:</strong> DB에는 <code>order-42</code>가 있지만 topic은 비어 있다. DB commit 성공이 Kafka event 성공을 뜻하지 않는다는 가장 작은 반례다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#8a4f37">3) Outbox로 missing-event window 닫기</h3>
+  <pre style="margin:0;padding:14px;background:#2a2421;color:#f7eee9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">python3 -c 'import sqlite3; c=sqlite3.connect("/tmp/day35.db"); c.execute("BEGIN"); c.execute("INSERT OR IGNORE INTO orders VALUES(?,?)",("order-43","CREATED")); c.execute("INSERT INTO outbox(event_id,payload) VALUES(?,?)",("evt-order-43","order-43|CREATED")); c.commit(); print("BUSINESS_AND_OUTBOX_COMMITTED")'
+python3 -c 'import sqlite3; c=sqlite3.connect("/tmp/day35.db"); print(c.execute("SELECT * FROM orders").fetchall()); print(c.execute("SELECT * FROM outbox").fetchall())'</pre>
+  <p><strong>예상:</strong> Business row와 발행 의도가 함께 존재한다. 둘 중 하나만 남는 DB 내부 실패 창은 사라졌다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#8a4f37">4) 실패 주입 B: relay ack 뒤 published 표시 전 crash</h3>
+  <pre style="margin:0;padding:14px;background:#2a2421;color:#f7eee9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">printf 'evt-order-43|order-43|CREATED\n' | docker compose exec -T broker bash -lc 'bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic day35-order-events'
+# ACK 뒤 crash를 가정해 outbox.published는 0으로 둔다.
+printf 'evt-order-43|order-43|CREATED\n' | docker compose exec -T broker bash -lc 'bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic day35-order-events'
+docker compose exec broker bash -lc 'bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic day35-order-events --from-beginning --timeout-ms 5000'</pre>
+  <p><strong>예상:</strong> 같은 event ID가 두 번 보인다. Outbox는 누락 가능한 의도를 durable하게 만들었지만 transport를 exactly-once로 만들지는 않았다. Downstream은 <code>event_id</code>를 unique inbox key로 사용해야 한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#8a4f37">5) Inbox의 atomic gate 확인</h3>
+  <pre style="margin:0;padding:14px;background:#2a2421;color:#f7eee9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">python3 -c 'import sqlite3; c=sqlite3.connect("/tmp/day35.db"); c.executescript("CREATE TABLE IF NOT EXISTS inbox(event_id TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS shipments(order_id TEXT PRIMARY KEY,status TEXT);"); c.execute("BEGIN"); cur=c.execute("INSERT OR IGNORE INTO inbox VALUES(?)",("evt-order-43",)); (c.execute("INSERT OR IGNORE INTO shipments VALUES(?,?)",("order-43","READY")) if cur.rowcount else None); c.commit(); print("first",c.execute("SELECT * FROM shipments").fetchall())'
+python3 -c 'import sqlite3; c=sqlite3.connect("/tmp/day35.db"); c.execute("BEGIN"); cur=c.execute("INSERT OR IGNORE INTO inbox VALUES(?)",("evt-order-43",)); (c.execute("INSERT OR IGNORE INTO shipments VALUES(?,?)",("order-43","READY")) if cur.rowcount else None); c.commit(); print("retry",c.execute("SELECT * FROM shipments").fetchall())'</pre>
+  <p><strong>예상:</strong> 두 번째 실행에서도 shipment row는 하나다. 중요한 점은 inbox insert와 business mutation이 같은 DB transaction 안에 있다는 것이다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#8a4f37">6) 자주 나는 오류와 해결</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:37%;padding:8px;border:1px solid #dfd0c6"><code>UNIQUE constraint failed</code></td><td style="padding:8px;border:1px solid #dfd0c6">이 실험에서 중복 operation의 증거다. ID를 바꿔 숨기지 말고 <code>INSERT OR IGNORE</code> 또는 명시적 upsert 정책을 사용한다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Consumer timeout 메시지</td><td style="padding:8px;border:1px solid #dfd0c6">실험용 <code>--timeout-ms</code> 종료는 정상이다. 출력된 records와 개수를 본다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Topic에 이전 데이터가 있음</td><td style="padding:8px;border:1px solid #dfd0c6">새 topic 이름을 사용하거나 cleanup 후 재생성한다. 기존 evidence를 임의 삭제하지 않는다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Python 조건식이 낯섦</td><td style="padding:8px;border:1px solid #dfd0c6"><code>cur.rowcount</code>가 1일 때만 shipment insert를 실행해 inbox unique gate를 표현한 것이다.</td></tr>
+  </table>
+
+  <h3 style="margin:20px 0 8px;color:#8a4f37">7) Cleanup</h3>
+  <pre style="margin:0;padding:14px;background:#2a2421;color:#f7eee9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">python3 -c 'import os; os.remove("/tmp/day35.db") if os.path.exists("/tmp/day35.db") else None'
+docker compose exec broker bash -lc 'bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic day35-order-events'
+docker compose down</pre>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Exactly-once는 형용사가 아니다:</strong> Operation 집합과 observer를 명시해야 검증 가능한 요구사항이 된다.</li>
+    <li><strong>Producer idempotence ≠ application idempotence:</strong> 새 producer 호출로 같은 payload를 다시 보내는 것은 protocol retry dedup 범위 밖일 수 있다.</li>
+    <li><strong>read_committed ≠ 외부 DB commit:</strong> Kafka aborted records를 숨길 뿐 DB side effect를 rollback하지 않는다.</li>
+    <li><strong>Outbox ≠ 중복 없음:</strong> Relay publish와 published 표시 사이 crash 때문에 at-least-once가 일반적이다.</li>
+    <li><strong>Inbox TTL:</strong> Kafka replay 가능 기간보다 짧으면 오래된 duplicate가 다시 효과를 낸다.</li>
+    <li><strong>Offset-first commit:</strong> DB write 전에 offset을 commit하면 crash 시 record가 영구 누락될 수 있다.</li>
+    <li><strong>DB-first commit:</strong> Offset 전 crash는 재처리되므로 unique event ID가 없으면 duplicate가 난다.</li>
+    <li><strong>Reconciliation 없는 설계:</strong> Online path가 아무리 강해도 unknown outcome과 수동 운영 실수는 남는다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">9. 대기업 기술 면접 질문</h2>
+  <h3 style="margin:18px 0 6px;color:#8a4f37">Q1. Kafka exactly-once가 PostgreSQL까지 보장되는가?</h3>
+  <p><strong>좋은 답변 구조:</strong> 먼저 보장 범위 질문 → Kafka transaction 참여 resource(topic partitions·offsets) → DB WAL이 coordinator에 없음을 설명 → DB-first/Kafka-first crash timeline → outbox/inbox 대안 → 중복·지연·운영 trade-off까지 말한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#8a4f37">Q2. 주문 생성과 event 발행의 누락·중복을 모두 줄이는 설계를 하라.</h3>
+  <p><strong>좋은 답변 구조:</strong> Order ID와 event ID 정의 → orders+outbox 단일 DB transaction → CDC/relay at-least-once → Kafka key/partition ordering → downstream inbox unique transaction → retry·DLQ·replay·reconciliation → SLO와 소유팀으로 마무리한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#8a4f37">Q3. 왜 2PC 대신 outbox를 선택했는가?</h3>
+  <p><strong>좋은 답변 구조:</strong> 원자성 요구 강도와 참여 resource 지원 여부 → 2PC lock·availability·coordinator recovery 비용 → outbox의 local atomicity와 eventual delivery → 남는 duplicate·latency → inbox와 reconciliation 보완 → 2PC가 필요한 예외 조건을 제시한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">10. 복습과 정답</h2>
+  <h3 style="margin:18px 0 6px;color:#8a4f37">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px">
+    <li>Heartbeat가 정상인데도 slow consumer가 ownership을 잃을 수 있는 이유는?</li>
+    <li>Rebalance storm의 양의 피드백 고리를 네 단계로 설명하라.</li>
+    <li>Lag 급증 때 consumer 증설 전에 확인할 세 가지 상한은?</li>
+  </ol>
+  <div style="padding:14px;background:#f6efeb;border-radius:8px"><strong>어제 정답/채점:</strong> ① Application poll progress가 max poll interval을 넘기 때문(2점). ② 처리 지연→poll timeout/ownership 이동→rebalance·warm-up·중복 비용→실효 처리율 하락과 재가입 반복(3점). ③ Partition 수, consumer 실제 처리율, DB/API/CPU/network의 shared capacity(3점).</div>
+
+  <h3 style="margin:22px 0 6px;color:#8a4f37">오늘 확인 문제 3개</h3>
+  <ol style="padding-left:22px">
+    <li>Kafka transaction에 외부 DB write가 자동 포함되지 않는 근본 이유는?</li>
+    <li>Outbox가 제거하는 failure window와 남기는 failure window는?</li>
+    <li>Inbox pattern에서 반드시 같은 DB transaction에 있어야 하는 두 write는?</li>
+  </ol>
+  <div style="padding:14px;background:#f6efeb;border-radius:8px"><strong>오늘 정답/채점:</strong> ① Kafka coordinator가 DB transaction/WAL을 참여 resource로 소유·합의하지 않기 때문(2점). ② Business commit 후 발행 의도 누락은 제거하지만 Kafka publish 후 published 표시 전 crash의 duplicate 발행은 남김(3점). ③ Event ID dedup/inbox insert와 business mutation(3점). 총 8점 중 6점 이상이면 통과.</div>
+
+  <h3 style="margin:22px 0 6px;color:#8a4f37">Week 5 회상 체크</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#efe0d6"><th style="padding:8px;border:1px solid #dfd0c6">질문</th><th style="padding:8px;border:1px solid #dfd0c6">30초 핵심</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Group generation/epoch</td><td style="padding:8px;border:1px solid #dfd0c6">현재 membership·assignment 세대이며 stale owner를 fence한다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Classic vs Consumer</td><td style="padding:8px;border:1px solid #dfd0c6">Client-side global barrier와 broker-driven incremental reconciliation의 차이다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Heartbeat vs max poll</td><td style="padding:8px;border:1px solid #dfd0c6">Process session 생존과 application progress를 분리한다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">Transaction visibility</td><td style="padding:8px;border:1px solid #dfd0c6">Coordinator decision·markers·LSO·read_committed가 Kafka 내부 원자 가시성을 만든다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd0c6">End-to-end EOS</td><td style="padding:8px;border:1px solid #dfd0c6">Transport 보장과 sink effect를 나누고 external boundary에는 idempotency protocol을 둔다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html" style="color:#8a4f37">KafkaProducer 4.3.1 API</a> — idempotence·transaction·offset 결합 범위</li>
+    <li><a href="https://cwiki.apache.org/confluence/spaces/KAFKA/pages/66854913/KIP-98%2B-%2BExactly%2BOnce%2BDelivery%2Band%2BTransactional%2BMessaging" style="color:#8a4f37">KIP-98</a> — Kafka transaction의 보장·coordinator·marker data flow</li>
+    <li><a href="https://kafka.apache.org/43/operations/transaction-protocol/" style="color:#8a4f37">Kafka 4.3 Transaction Protocol</a> — 현재 transaction protocol과 server-side defense</li>
+    <li><a href="https://kafka.apache.org/43/streams/developer-guide/config-streams/" style="color:#8a4f37">Kafka Streams Configuration</a> — exactly_once_v2의 Kafka processing guarantee</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#8a4f37">12. 내일 예고</h2>
+  <div style="padding:16px;background:#f5ece6;border-left:5px solid #9a6045;border-radius:8px"><strong>Day 36 · serialization과 schema contract</strong><br>
+  Byte array가 business contract가 되는 과정, serializer/deserializer 책임, schema evolution과 producer/consumer 호환성의 첫 단추를 학습한다.</div>
+</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>

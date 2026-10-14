@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-10-13T09:00:33+09:00",
+  "updatedAt": "2026-10-14T09:01:59+09:00",
   "lessons": [
     {
       "day": 1,
@@ -311,6 +311,15 @@
       "path": "day-34.html",
       "kind": "lab",
       "publishedAt": "2026-10-13T09:00:33+09:00"
+    },
+    {
+      "day": 35,
+      "week": 5,
+      "title": "회상: exactly-once가 외부 DB까지 자동 확장되지 않는 이유",
+      "summary": "Kafka transaction의 원자성 범위를 외부 DB dual-write와 분리하고, outbox·inbox·idempotency·reconciliation으로 end-to-end 효과를 설계합니다.",
+      "path": "day-35.html",
+      "kind": "review",
+      "publishedAt": "2026-10-14T09:01:59+09:00"
     }
   ]
 }
