@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 36 · serialization과 schema contract</title>
+</head>
+<body style="margin:0;background:#edf2f4;color:#263238;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#edf2f4"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #d5e0e4;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#183c4a;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#a9d7e5;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 6 / DAY 36 · SCHEMA &amp; DATA CONTRACT</div>
+  <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.28">serialization과 schema contract</h1>
+  <p style="margin:0;color:#d9edf3">객체가 바이트가 되는 순간부터 호환성·partition·복구 책임을 설계하기 · 이론 70분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#eaf5f8;border-left:5px solid #2b7a91;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Kafka broker는 업무 객체나 필드 의미가 아니라 key/value <strong>바이트 배열</strong>을 저장한다. 따라서 serializer와 schema contract는 단순 변환 코드가 아니라 partition 안정성, producer/consumer 독립 배포, 장애 격리, replay 가능성을 결정하는 분산 시스템 경계다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:9px;border:1px solid #cbdde3"><strong>Serialization</strong></td><td style="padding:9px;border:1px solid #cbdde3">메모리의 객체를 저장·전송 가능한 결정적 byte sequence로 바꾸는 과정. 포장 규칙이라고 생각하면 쉽다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdde3"><strong>Deserialization</strong></td><td style="padding:9px;border:1px solid #cbdde3">바이트를 독자가 이해하는 타입·객체로 복원하는 과정. 형식이 다르거나 손상되면 여기서 실패한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdde3"><strong>Schema</strong></td><td style="padding:9px;border:1px solid #cbdde3">필드 이름·타입·필수 여부·기본값·논리적 의미를 기술한 데이터 구조 명세.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdde3"><strong>Data contract</strong></td><td style="padding:9px;border:1px solid #cbdde3">Schema에 ownership, 의미, 호환성, 품질, 변경·폐기 절차, SLO까지 더한 생산자와 소비자 사이의 운영 약속.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdde3"><strong>Wire format</strong></td><td style="padding:9px;border:1px solid #cbdde3">네트워크와 log에 실제 놓이는 byte layout. JSON text, Avro binary, Protobuf binary 등이 예다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdde3"><strong>Encoding</strong></td><td style="padding:9px;border:1px solid #cbdde3">문자를 바이트로 매핑하는 규칙. UTF-8과 UTF-16은 같은 문자열을 다른 바이트로 만든다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdde3"><strong>Compatibility</strong></td><td style="padding:9px;border:1px solid #cbdde3">새 writer와 예전 reader 또는 예전 data와 새 reader가 함께 동작할 수 있는 성질. 방향과 시점을 반드시 명시한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdde3"><strong>Canonical form</strong></td><td style="padding:9px;border:1px solid #cbdde3">논리적으로 같은 값을 언제나 같은 bytes로 표현하는 정규 규칙. Hash·서명·partition key 안정성에 중요하다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdde3"><strong>Poison pill</strong></td><td style="padding:9px;border:1px solid #cbdde3">Consumer가 해석하지 못해 같은 offset에서 반복 실패하게 만드는 record. 약이 아니라 처리 파이프라인을 멈추는 독성 record라는 비유다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdde3"><strong>Tombstone</strong></td><td style="padding:9px;border:1px solid #cbdde3">Key는 있고 value가 null인 record. Compacted topic에서 key 삭제 의도를 나타내며 문자열 "null"이나 빈 bytes와 다르다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">2. 왜 중요한가</h2>
+  <p>Producer 코드에서는 <code>OrderCreated</code> 객체를 보내지만 broker disk에는 Java class도 Python dict도 없다. Kafka client의 <code>Serializer&lt;T&gt;</code>가 객체를 <code>byte[]</code>로 만들고, broker는 그 결과를 record batch 안에 보존한다. Consumer client의 <code>Deserializer&lt;T&gt;</code>가 같은 의미 체계를 공유할 때만 다시 업무 객체가 된다.</p>
+  <p>이 경계가 깨지면 broker는 정상이고 lag도 0에 가까운데 애플리케이션은 실패할 수 있다. 예를 들어 producer가 <code>amount</code>를 문자열에서 정수로 바꾸고 consumer를 먼저 준비하지 않으면 deserialization exception이 발생한다. 더 위험한 경우는 parsing은 성공하지만 단위가 원에서 센트로 바뀌어 조용히 잘못된 값을 만든다. Schema validation은 구조 오류는 잡지만 의미 오류까지 자동으로 잡지는 못한다.</p>
+  <p>면접에서는 “Avro가 좋다”보다 <strong>어느 component가 어떤 bytes를 만들고, schema identity를 어디에 싣고, 어느 배포 순서가 안전하며, 실패한 offset을 어떻게 격리·재처리하는지</strong>를 설명해야 깊이가 드러난다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">3. Architecture: 객체에서 bytes, bytes에서 객체로</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word;font-size:14px">
+    <tr style="background:#dceef3"><th style="padding:8px;border:1px solid #cbdde3">Producer process</th><th style="padding:8px;border:1px solid #cbdde3">Kafka cluster</th><th style="padding:8px;border:1px solid #cbdde3">Consumer process</th></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3"><strong>① 업무 객체</strong><br>OrderCreated, key=order-42</td><td style="padding:8px;border:1px solid #cbdde3">아직 record 없음</td><td style="padding:8px;border:1px solid #cbdde3">아직 fetch 전</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#2b7a91;font-weight:800">&#8595; key/value serializer가 각각 bytes를 만든다</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3"><strong>② key bytes + value bytes</strong><br>header에 version/trace metadata 가능</td><td style="padding:8px;border:1px solid #cbdde3">Broker는 업무 필드 의미를 검사하지 않음</td><td style="padding:8px;border:1px solid #cbdde3">Schema 계약이 맞아야 해석 가능</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#2b7a91;font-weight:800">&#8595; serialized key가 partition 선택에 영향을 준 뒤 batch·ProduceRequest 전송</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">Accumulator가 partition별 batch 구성</td><td style="padding:8px;border:1px solid #cbdde3"><strong>③ partition log append</strong><br>key/value bytes·headers·timestamp·CRC 보존</td><td style="padding:8px;border:1px solid #cbdde3">Fetch offset 대기</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#2b7a91;font-weight:800">&#8595; FetchResponse가 record batch bytes를 전달</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">Producer 객체 생명은 이미 끝남</td><td style="padding:8px;border:1px solid #cbdde3">동일 bytes는 retention 동안 replay 가능</td><td style="padding:8px;border:1px solid #cbdde3"><strong>④ deserializer</strong><br>bytes + topic + headers → typed object</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">Callback은 broker ack 확인</td><td style="padding:8px;border:1px solid #cbdde3">Schema registry는 Kafka broker와 별도 control plane일 수 있음</td><td style="padding:8px;border:1px solid #cbdde3"><strong>⑤ business processing</strong><br>검증·side effect·offset commit</td></tr>
+  </table>
+  <p><strong>Data path:</strong> 객체 → serializer → key/value bytes → partitioner → record batch → ProduceRequest → partition log → FetchResponse → deserializer → 객체다. <strong>Control path:</strong> schema 등록·호환성 검사·artifact 배포·consumer rollout이 data bytes의 해석 규칙을 관리한다. Kafka broker metadata quorum은 topic/partition metadata를 관리하지만 업무 schema 승인을 대신하지 않는다.</p>
+  <p><strong>상태의 소유자:</strong> Producer는 writer schema와 serialization code, broker는 immutable record bytes와 offset, schema system은 schema ID·version·compatibility policy, consumer는 reader schema와 실패 처리, domain team은 필드 의미와 migration plan을 소유한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#17627a">타입은 process 안에만 있고 wire에는 bytes만 있다</h3>
+  <p>Java의 generic <code>KafkaProducer&lt;K,V&gt;</code>는 compile-time API 안전성을 돕지만, broker가 K와 V의 class를 아는 것은 아니다. <code>key.serializer</code>와 <code>value.serializer</code>가 실제 bytes를 정한다. Consumer도 자기 <code>key.deserializer</code>와 <code>value.deserializer</code>로 bytes를 해석한다. 양쪽 설정이 다르면 compile은 성공해도 runtime에서 깨진다.</p>
+  <p>Serialization은 단순히 JSON 문자열을 만드는 일이 아니다. Null 표현, field order, 숫자 폭, endianness, 문자열 encoding, timestamp·decimal logical type, default value, unknown field 처리까지 포함한다. 특히 IEEE-754 floating point로 금액을 표현하면 십진 정확성 문제가 생길 수 있어 scale이 있는 decimal contract 또는 정수 최소 단위를 명시해야 한다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#17627a">Key bytes는 routing contract다</h3>
+  <p>Key가 있을 때 기본 partition 선택은 serialized key bytes의 hash와 연결된다. 논리적으로 같은 고객 ID라도 <code>"42"</code>, UTF-8 integer text, 8-byte big-endian long은 다른 bytes이므로 다른 partition으로 갈 수 있다. Serializer 교체는 value 형식 변경을 넘어 key ordering·co-location·state store locality를 바꾸는 migration이다.</p>
+  <div style="padding:14px;background:#fff3d8;border-left:5px solid #d28b22;border-radius:8px"><strong>불변식:</strong> 같은 business key에 partition-local ordering이 필요하다면 migration 전후의 canonical key bytes 또는 명시적 partition mapping이 안정적이어야 한다.</div>
+
+  <h3 style="margin:22px 0 8px;color:#17627a">Null, empty, 문자열 "null"은 세 상태다</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dceef3"><th style="padding:8px;border:1px solid #cbdde3">표현</th><th style="padding:8px;border:1px solid #cbdde3">Bytes</th><th style="padding:8px;border:1px solid #cbdde3">의미</th></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">null value</td><td style="padding:8px;border:1px solid #cbdde3">null byte array</td><td style="padding:8px;border:1px solid #cbdde3">Compacted topic에서 tombstone 의미 가능</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">empty string</td><td style="padding:8px;border:1px solid #cbdde3">길이 0 byte array</td><td style="padding:8px;border:1px solid #cbdde3">존재하지만 내용이 빈 값</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">"null"</td><td style="padding:8px;border:1px solid #cbdde3">UTF-8 4 bytes</td><td style="padding:8px;border:1px solid #cbdde3">n-u-l-l 문자 데이터</td></tr>
+  </table>
+  <p>Kafka 공식 Serializer/Deserializer API는 null data를 null byte array/object로 다루는 것을 권장한다. Custom serializer가 null을 빈 bytes로 바꾸면 tombstone contract와 downstream 의미가 깨질 수 있다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#17627a">성공 확정 시점은 단계마다 다르다</h3>
+  <ul style="padding-left:22px">
+    <li><strong>serialize 반환:</strong> bytes 생성만 성공했다. Broker 저장은 아직 아니다.</li>
+    <li><strong>send Future 성공:</strong> 설정된 ack 기준으로 해당 bytes append가 성공했다. Consumer 해석 성공은 아니다.</li>
+    <li><strong>deserialize 반환:</strong> 구조 복원은 성공했다. Domain invariant와 side effect 성공은 아니다.</li>
+    <li><strong>business commit + offset commit:</strong> 처리 semantics에 따른 end-to-end 성공 지점이다. 두 commit 사이 failure window는 별도 설계가 필요하다.</li>
+  </ul>
+
+  <h3 style="margin:22px 0 8px;color:#17627a">Schema와 contract의 차이</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dceef3"><th style="padding:8px;border:1px solid #cbdde3">Schema가 말하는 것</th><th style="padding:8px;border:1px solid #cbdde3">Contract가 추가로 말해야 하는 것</th></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3"><code>order_id</code>는 string</td><td style="padding:8px;border:1px solid #cbdde3">전역 unique인가, 재사용 가능한가, PII인가, partition key인가</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3"><code>amount</code>는 long</td><td style="padding:8px;border:1px solid #cbdde3">통화·scale·음수 허용·반올림·정산 source of truth</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3"><code>occurred_at</code>는 timestamp</td><td style="padding:8px;border:1px solid #cbdde3">event time인가 ingest time인가, timezone·precision·지연 허용 범위</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">필드는 optional</td><td style="padding:8px;border:1px solid #cbdde3">unknown과 not-applicable을 구분하는가, 언제 채워지는가</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#dceef3"><th style="padding:8px;border:1px solid #cbdde3">판단 항목</th><th style="padding:8px;border:1px solid #cbdde3">Best practice</th><th style="padding:8px;border:1px solid #cbdde3">이유</th></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">Key contract</td><td style="padding:8px;border:1px solid #cbdde3">Canonical encoding과 변경 금지/이중 발행 migration 명시</td><td style="padding:8px;border:1px solid #cbdde3">Partition·ordering·join locality가 bytes에 의존</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">Schema identity</td><td style="padding:8px;border:1px solid #cbdde3">Payload 또는 header에 독자가 해석할 수 있는 version/ID 포함</td><td style="padding:8px;border:1px solid #cbdde3">Topic 이름만으로 여러 writer version을 구분하기 어려움</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">Compatibility gate</td><td style="padding:8px;border:1px solid #cbdde3">CI에서 등록·호환성 검사 후 배포, production에서 임의 auto-register 금지 검토</td><td style="padding:8px;border:1px solid #cbdde3">Incompatible writer가 log에 들어가기 전에 차단</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">Rollout</td><td style="padding:8px;border:1px solid #cbdde3">Reader가 새·옛 형식을 모두 읽게 배포한 뒤 writer 전환</td><td style="padding:8px;border:1px solid #cbdde3">Producer/consumer 독립 배포 사이 mixed-version window 보호</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">Error path</td><td style="padding:8px;border:1px solid #cbdde3">원본 bytes·topic/partition/offset·schema ID·exception을 보존해 격리</td><td style="padding:8px;border:1px solid #cbdde3">수정 후 replay와 forensic 재현 가능</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">Ownership</td><td style="padding:8px;border:1px solid #cbdde3">Producer team이 contract owner, consumer 목록과 deprecation deadline 운영</td><td style="padding:8px;border:1px solid #cbdde3">기술 호환만으로 의미 변경을 통제할 수 없음</td></tr>
+  </table>
+  <p><strong>Version/engine 차이:</strong> Kafka core의 Serializer/Deserializer는 bytes 변환 interface다. Schema registry, Avro/Protobuf/JSON Schema wire envelope, subject naming, compatibility mode는 별도 도구·client integration의 책임이며 구현마다 다르다. 내일 각 형식과 정책을 비교한다.</p>
+  <p><strong>Anti-pattern:</strong> Topic 하나를 “아무 JSON” 통로로 쓰기, field 삭제 후 producer만 즉시 배포하기, key serializer를 value와 함께 무심코 교체하기, exception message만 남기고 원본 offset/bytes를 버리기, deserializer 안에서 원격 API 호출하기, PII payload 전체를 error log에 남기기.</p>
+  <p><strong>Edge case:</strong> Unicode 정규화가 다른 같은 문자열, JSON number의 53-bit 정밀도, timestamp millisecond/microsecond 혼용, decimal scale 변화, duplicated JSON key, unknown enum, null vs absent, compression bomb, oversized record, schema service 일시 장애, cache miss 폭증을 테스트해야 한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:13px;word-break:break-word">
+    <tr style="background:#dceef3"><th style="padding:6px;border:1px solid #cbdde3">증상</th><th style="padding:6px;border:1px solid #cbdde3">먼저 수집할 증거/지표</th><th style="padding:6px;border:1px solid #cbdde3">가능한 가설</th><th style="padding:6px;border:1px solid #cbdde3">안전한 첫 조치</th><th style="padding:6px;border:1px solid #cbdde3">rollback/복구</th><th style="padding:6px;border:1px solid #cbdde3">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:6px;border:1px solid #cbdde3">특정 offset에서 consumer 반복 실패</td><td style="padding:6px;border:1px solid #cbdde3">Topic/partition/offset, key, schema ID/version, exception class, 원본 bytes hash</td><td style="padding:6px;border:1px solid #cbdde3">Incompatible writer, corrupt payload, wrong deserializer, unknown enum</td><td style="padding:6px;border:1px solid #cbdde3">영향 partition을 확인하고 원본을 안전한 quarantine에 보존</td><td style="padding:6px;border:1px solid #cbdde3">Reader hotfix 후 같은 offset replay 또는 승인된 변환·재발행</td><td style="padding:6px;border:1px solid #cbdde3">증거 없이 offset skip, payload 전체를 공개 log에 출력</td></tr>
+    <tr><td style="padding:6px;border:1px solid #cbdde3">Key ordering이 갑자기 깨짐</td><td style="padding:6px;border:1px solid #cbdde3">배포 전후 key bytes·hash·partition, serializer artifact version</td><td style="padding:6px;border:1px solid #cbdde3">Key encoding 변경, normalization 차이, partition 증가</td><td style="padding:6px;border:1px solid #cbdde3">Writer rollout 중지, 변경된 key 집합과 downstream state 영향 계산</td><td style="padding:6px;border:1px solid #cbdde3">구 serializer로 rollback하거나 새 topic·repartition migration</td><td style="padding:6px;border:1px solid #cbdde3">기존 record를 임의 재키잉, partition만 수동 고정</td></tr>
+    <tr><td style="padding:6px;border:1px solid #cbdde3">Producer serialization error 증가</td><td style="padding:6px;border:1px solid #cbdde3">Serializer error rate, input type, null/size 분포, schema service latency</td><td style="padding:6px;border:1px solid #cbdde3">잘못된 객체 타입, 필수값 누락, registry/cache 장애</td><td style="padding:6px;border:1px solid #cbdde3">실패 event를 source에서 보존하고 bad release traffic 제한</td><td style="padding:6px;border:1px solid #cbdde3">Artifact rollback, schema service/cache 복구 후 stable event ID로 재시도</td><td style="padding:6px;border:1px solid #cbdde3">예외를 삼키고 ack 처리, validation 제거</td></tr>
+    <tr><td style="padding:6px;border:1px solid #cbdde3">Parsing은 성공하지만 값이 이상함</td><td style="padding:6px;border:1px solid #cbdde3">Field별 분포·단위·producer version·sample raw bytes·contract changelog</td><td style="padding:6px;border:1px solid #cbdde3">단위/scale/timezone 의미 변경, default 오용</td><td style="padding:6px;border:1px solid #cbdde3">Downstream side effect를 제한하고 영향 구간을 timestamp·offset으로 고정</td><td style="padding:6px;border:1px solid #cbdde3">보정 event·backfill·reconciliation 후 contract test 추가</td><td style="padding:6px;border:1px solid #cbdde3">Schema validation 통과만 보고 정상 선언</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">7. 20~40분 실습: 같은 논리 key가 다른 bytes가 되는 순간</h2>
+  <div style="padding:14px;background:#fff3d8;border-left:5px solid #d28b22;border-radius:8px"><strong>목표:</strong> String과 8-byte integer encoding을 직접 비교하고, 같은 topic에 서로 다른 value contract를 넣었을 때 독자가 실패하는 과정을 관찰한다. 별도 library 없이 Python 3와 Kafka CLI만 사용한다.</div>
+  <p><strong>사전 조건:</strong> 저장소 root, Docker, Python 3, 공식 Apache Kafka 4.3.1 compose 환경. 약 30분.</p>
+
+  <h3 style="margin:20px 0 8px;color:#17627a">0) 실행 전 예측</h3>
+  <ol style="padding-left:22px">
+    <li>논리 key 42의 UTF-8 문자열과 signed 64-bit big-endian bytes는 같은가?</li>
+    <li>JSON field가 없을 때 default를 넣는 reader는 null과 absent를 구분할 수 있는가?</li>
+    <li>Consumer가 poison pill을 skip하면 처리량은 회복되지만 어떤 증거를 잃을 수 있는가?</li>
+  </ol>
+
+  <h3 style="margin:20px 0 8px;color:#17627a">1) Key bytes와 hash 입력 비교</h3>
+  <pre style="margin:0;padding:14px;background:#1f3037;color:#ecf7fa;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">python3 -c 'import struct; a="42".encode("utf-8"); b=struct.pack(">q",42); print("string",a.hex(),len(a)); print("long",b.hex(),len(b)); print("same?",a==b)'
+python3 -c 'import unicodedata; a="é"; b="e\u0301"; print(a==b,a.encode().hex(),b.encode().hex()); print(unicodedata.normalize("NFC",a).encode()==unicodedata.normalize("NFC",b).encode())'</pre>
+  <p><strong>예상:</strong> 42의 두 encoding은 길이와 bytes가 다르다. 화면상 같은 Unicode도 normalization 전 bytes가 다를 수 있다. Hash 함수가 같아도 입력 bytes가 달라지므로 partition contract가 바뀔 수 있다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#17627a">2) Topic 준비와 versioned payload 전송</h3>
+  <pre style="margin:0;padding:14px;background:#1f3037;color:#ecf7fa;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose up -d
+docker compose exec broker bash -lc 'bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic day36-contract --partitions 1 --replication-factor 1'
+printf 'order-42:{"version":1,"order_id":"order-42","amount_won":12000}\norder-43:{"version":2,"order_id":"order-43","amount_won":"12000"}\n' | docker compose exec -T broker bash -lc 'bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic day36-contract --property parse.key=true --property key.separator=:'</pre>
+  <p><strong>실패 주입:</strong> v2는 <code>amount_won</code>을 integer에서 string으로 바꿨다. Kafka broker는 두 records를 모두 정상 append한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#17627a">3) 엄격한 reader로 poison pill 관찰</h3>
+  <pre style="margin:0;padding:14px;background:#1f3037;color:#ecf7fa;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose exec broker bash -lc 'bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic day36-contract --from-beginning --timeout-ms 5000 --property print.key=true --property key.separator=:' | python3 -c 'import sys,json; lines=[x.rstrip("\n") for x in sys.stdin if x.strip()];
+for line in lines:
+ key,raw=line.split(":",1); obj=json.loads(raw); assert type(obj["amount_won"]) is int, (key,"amount_won must be int",type(obj["amount_won"]).__name__); print("OK",key,obj["amount_won"])'</pre>
+  <p><strong>예상:</strong> <code>order-42</code>는 통과하고 <code>order-43</code>에서 assertion이 난다. 이는 broker 장애가 아니라 writer/reader contract 불일치다. 실제 consumer poll에서는 deserialization 단계가 실패하면 business handler에 도달하기 전 같은 offset에서 진행이 멈출 수 있다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#17627a">4) 안전한 reader migration을 작은 코드로 확인</h3>
+  <pre style="margin:0;padding:14px;background:#1f3037;color:#ecf7fa;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose exec broker bash -lc 'bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic day36-contract --from-beginning --timeout-ms 5000 --property print.key=true --property key.separator=:' | python3 -c 'import sys,json; lines=[x.rstrip("\n") for x in sys.stdin if x.strip()];
+for line in lines:
+ key,raw=line.split(":",1); obj=json.loads(raw); value=obj["amount_won"]; assert isinstance(value,(int,str)); won=int(value); assert won&gt;=0; print("MIGRATED",key,won)'
+</pre>
+  <p><strong>예상:</strong> 두 version 모두 읽힌다. 실제 배포에서는 먼저 이중 reader를 배포하고 consumer fleet가 준비된 것을 확인한 뒤 writer를 전환한다. 이 코드는 문자열이면 모두 안전하다는 뜻이 아니므로 숫자 형식·범위·통화 invariant도 검증해야 한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#17627a">5) 자주 나는 오류와 해결</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:37%;padding:8px;border:1px solid #cbdde3">Consumer timeout 메시지</td><td style="padding:8px;border:1px solid #cbdde3">실험용 <code>--timeout-ms</code> 종료는 정상이다. 앞의 records와 Python 결과를 본다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3"><code>ValueError</code> at split</td><td style="padding:8px;border:1px solid #cbdde3">CLI key 출력 설정과 separator를 확인한다. JSON 내부 colon 때문에 반드시 첫 colon에서만 나누도록 <code>split(":",1)</code>을 사용한다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">이전 record가 섞임</td><td style="padding:8px;border:1px solid #cbdde3">새 topic 이름을 사용하거나 cleanup 후 다시 만든다. Contract 실험 결과를 억지로 필터링하지 않는다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdde3">HTML에서 <code>&gt;=</code>가 이상함</td><td style="padding:8px;border:1px solid #cbdde3">메일에서는 특수문자를 escape했다. 복사 시 <code>&gt;=</code>가 <code>&gt;=</code>로 보여도 브라우저 렌더링 결과는 실제 연산자다.</td></tr>
+  </table>
+
+  <h3 style="margin:20px 0 8px;color:#17627a">6) Cleanup</h3>
+  <pre style="margin:0;padding:14px;background:#1f3037;color:#ecf7fa;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose exec broker bash -lc 'bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic day36-contract'
+docker compose down</pre>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Broker가 schema를 이해한다고 가정:</strong> Kafka core는 payload field 의미를 validation하지 않는다.</li>
+    <li><strong>Value만 contract라고 생각:</strong> Key encoding 변경은 partition·ordering·join을 흔든다.</li>
+    <li><strong>Parsing 성공=의미 호환:</strong> 단위·timezone·enum 의미 변화는 구조 검사만으로 놓칠 수 있다.</li>
+    <li><strong>Null 혼동:</strong> Null bytes, empty bytes, 문자열 null은 다르며 tombstone semantics에 영향을 준다.</li>
+    <li><strong>Consumer-first가 언제나 안전하다고 단순화:</strong> 새 reader가 old+new 모두 읽는지 fixture와 real sample로 검증해야 한다.</li>
+    <li><strong>DLQ만 있으면 해결:</strong> DLQ는 격리일 뿐 contract 수정·replay·side effect 순서·SLO owner가 필요하다.</li>
+    <li><strong>원본 evidence 유실:</strong> Topic/partition/offset, headers, schema ID, bytes hash가 없으면 재현이 어려워진다.</li>
+    <li><strong>민감정보 노출:</strong> Poison payload 전체를 log·DLQ에 저장하면 PII와 credential이 복제될 수 있다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">9. 대기업 기술 면접 질문</h2>
+  <h3 style="margin:18px 0 6px;color:#17627a">Q1. Kafka broker는 schema를 알고 있는가? Schema 변경은 누가 막는가?</h3>
+  <p><strong>좋은 답변 구조:</strong> Broker는 record bytes·metadata를 저장한다는 경계 → serializer/deserializer의 process 책임 → 별도 schema system과 CI gate → mixed-version rollout 순서 → poison pill의 증거·격리·replay → contract owner까지 말한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#17627a">Q2. Key serializer를 String에서 Long으로 바꾸면 무슨 일이 생기는가?</h3>
+  <p><strong>좋은 답변 구조:</strong> 논리 key와 serialized bytes 분리 → hash 입력 변화 → partition 이동과 per-key ordering 단절 → stateful join/compaction 영향 → old/new dual-read 또는 새 topic/repartition migration → 검증 지표를 제시한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#17627a">Q3. 500개 consumer 중 하나가 새 schema에서 실패한다. 안전하게 복구하라.</h3>
+  <p><strong>좋은 답변 구조:</strong> 영향 topic/partition/offset과 writer version 고정 → exception·schema ID·bytes hash 수집 → writer rollout 중지 → PII-safe quarantine → backward-capable reader hotfix/rollback → offset replay와 side effect idempotency → contract test·canary·alert 개선으로 마무리한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">10. 복습과 정답</h2>
+  <h3 style="margin:18px 0 6px;color:#17627a">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px">
+    <li>Kafka transaction이 외부 DB write를 자동으로 rollback하지 못하는 이유는?</li>
+    <li>Outbox가 닫는 failure window와 남기는 failure window는?</li>
+    <li>Inbox pattern의 핵심 atomicity invariant는?</li>
+  </ol>
+  <div style="padding:14px;background:#edf6f8;border-radius:8px"><strong>어제 정답/채점:</strong> ① Kafka coordinator가 DB WAL·transaction을 참여 resource로 소유하지 않음(2점). ② Business row와 발행 의도 분리는 막지만 publish ack와 published 표시 사이 crash의 중복은 남김(3점). ③ event ID dedup insert와 business mutation을 같은 DB transaction에 둠(3점).</div>
+
+  <h3 style="margin:22px 0 6px;color:#17627a">오늘 확인 문제 3개</h3>
+  <ol style="padding-left:22px">
+    <li>같은 논리 key라도 serializer 변경이 ordering을 깨뜨릴 수 있는 이유는?</li>
+    <li>Schema와 data contract의 차이를 amount 필드 예로 설명하라.</li>
+    <li>Deserialization poison pill 대응 시 최소한 어떤 evidence를 보존해야 하는가?</li>
+  </ol>
+  <div style="padding:14px;background:#edf6f8;border-radius:8px"><strong>오늘 정답/채점:</strong> ① Partition 선택은 serialized key bytes의 hash와 연결되어 encoding 변경 시 partition이 달라질 수 있음(3점). ② Schema는 long 구조를 말하지만 contract는 통화·단위·scale·범위·owner·변경 절차까지 말함(3점). ③ Topic/partition/offset, key, schema ID/version, exception, 안전하게 보관한 원본 bytes 또는 hash(3점). 총 9점 중 7점 이상이면 통과.</div>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/common/serialization/Serializer.html" style="color:#17627a">Kafka 4.3.1 Serializer API</a> — 객체를 bytes로 바꾸는 interface, null·headers·lifecycle 계약</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/common/serialization/Deserializer.html" style="color:#17627a">Kafka 4.3.1 Deserializer API</a> — bytes를 typed object로 복원하는 interface와 ByteBuffer 경계</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html" style="color:#17627a">KafkaProducer 4.3.1 API</a> — key/value serializer와 asynchronous send·batch data path</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html" style="color:#17627a">KafkaConsumer 4.3.1 API</a> — key/value deserializer와 poll 기반 consumer 동작</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#17627a">12. 내일 예고</h2>
+  <div style="padding:16px;background:#eaf5f8;border-left:5px solid #2b7a91;border-radius:8px"><strong>Day 37 · Avro/Protobuf/JSON, compatibility 정책</strong><br>
+  세 형식의 wire 비용·schema identity·unknown field·default·tooling 차이를 비교하고 backward/forward/full compatibility를 배포 순서와 함께 설계한다.</div>
+</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>

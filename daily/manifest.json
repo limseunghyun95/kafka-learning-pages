@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-10-14T09:01:59+09:00",
+  "updatedAt": "2026-10-15T09:14:09+09:00",
   "lessons": [
     {
       "day": 1,
@@ -320,6 +320,15 @@
       "path": "day-35.html",
       "kind": "review",
       "publishedAt": "2026-10-14T09:01:59+09:00"
+    },
+    {
+      "day": 36,
+      "week": 6,
+      "title": "serialization과 schema contract",
+      "summary": "업무 객체가 key/value bytes로 변환되어 partition log에 저장되고 다시 객체로 복원되는 흐름을 따라 key routing·호환성·poison pill·배포 책임을 설계합니다.",
+      "path": "day-36.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-15T09:14:09+09:00"
     }
   ]
 }
