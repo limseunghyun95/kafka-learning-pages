@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 37 · Avro/Protobuf/JSON, compatibility 정책</title>
+</head>
+<body style="margin:0;background:#f2f0f7;color:#292735;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#f2f0f7"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #ddd7eb;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#382f5b;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#cbc3ee;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 6 / DAY 37 · FORMAT &amp; COMPATIBILITY</div>
+  <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.28">Avro/Protobuf/JSON, compatibility 정책</h1>
+  <p style="margin:0;color:#eeeafa">포맷 선택보다 중요한 writer/reader 방향과 무중단 진화 규칙 · 이론 75분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#f0edf9;border-left:5px solid #6f5aa8;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Avro·Protobuf·JSON 중 “최고의 포맷”을 고르는 문제가 아니다. 과거 bytes를 누가 언제 읽어야 하는지 정의하고, writer schema와 reader schema의 조합을 CI에서 검증하며, reader-first rollout과 replay horizon을 지키는 것이 진짜 compatibility 설계다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:9px;border:1px solid #d9d1ea"><strong>Writer schema</strong></td><td style="padding:9px;border:1px solid #d9d1ea">Record를 bytes로 만들 때 producer가 사용한 구조 명세. 과거 data를 해석하려면 당시 writer schema를 알아야 하는 포맷이 있다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d9d1ea"><strong>Reader schema</strong></td><td style="padding:9px;border:1px solid #d9d1ea">Consumer가 bytes를 현재 객체로 복원할 때 기대하는 구조 명세.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d9d1ea"><strong>Backward compatible</strong></td><td style="padding:9px;border:1px solid #d9d1ea"><strong>새 reader가 옛 writer의 data를 읽을 수 있음.</strong> Consumer를 새 version으로 먼저 배포할 때 중요하다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d9d1ea"><strong>Forward compatible</strong></td><td style="padding:9px;border:1px solid #d9d1ea"><strong>옛 reader가 새 writer의 data를 읽을 수 있음.</strong> Producer가 먼저 바뀌거나 구 consumer가 오래 남을 때 중요하다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d9d1ea"><strong>Full compatible</strong></td><td style="padding:9px;border:1px solid #d9d1ea">Backward와 forward를 모두 만족. 의미 호환성까지 자동 보장한다는 뜻은 아니다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d9d1ea"><strong>Transitive</strong></td><td style="padding:9px;border:1px solid #d9d1ea">후보 schema를 최신 하나가 아니라 보존된 모든 과거 version과 검사하는 정책.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d9d1ea"><strong>Unknown field</strong></td><td style="padding:9px;border:1px solid #d9d1ea">Writer에는 있지만 reader가 모르는 field. 무시·보존·오류 중 어떤 동작인지 format과 library 설정에 따라 다르다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d9d1ea"><strong>Default value</strong></td><td style="padding:9px;border:1px solid #d9d1ea">Writer data에 field가 없을 때 reader가 채우는 값. Write 시 항상 저장되는 값과 혼동하면 안 된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d9d1ea"><strong>Field number</strong></td><td style="padding:9px;border:1px solid #d9d1ea">Protobuf binary wire에서 field identity가 되는 정수 tag. 이름보다 번호가 핵심이며 사용 후 재사용하면 안 된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #d9d1ea"><strong>Schema fingerprint</strong></td><td style="padding:9px;border:1px solid #d9d1ea">정규화된 schema에서 계산한 식별값. Text whitespace가 달라도 같은 구조를 식별하는 데 쓸 수 있다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">2. 왜 중요한가</h2>
+  <p>Kafka topic은 retention 동안 여러 producer version이 쓴 records를 함께 보존한다. 오늘 새 schema로 배포해도 어제 schema로 쓴 bytes는 사라지지 않는다. Consumer group을 reset하거나 신규 consumer가 <code>earliest</code>에서 시작하면 수개월 전 writer schema와 오늘 reader schema가 만난다.</p>
+  <p>Rolling deployment 중에는 old producer/new producer와 old consumer/new consumer가 동시에 존재한다. 따라서 “현재 producer와 현재 consumer가 통과한다”는 테스트만으로는 부족하다. 안전성은 <strong>writer version × reader version × 실제 rollout 순서 × replay 기간</strong>의 곱으로 결정된다.</p>
+  <p>또한 syntax compatibility와 semantic compatibility는 다르다. <code>amount</code>를 long 그대로 두고 단위를 원에서 센트로 바꾸면 schema 검사는 통과하지만 정산은 틀린다. 그래서 registry의 구조 검사와 domain contract review, data quality 관측이 모두 필요하다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">3. Architecture: schema 제안부터 mixed-version 소비까지</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word;font-size:14px">
+    <tr style="background:#e8e2f5"><th style="padding:8px;border:1px solid #d9d1ea">개발·Control path</th><th style="padding:8px;border:1px solid #d9d1ea">Producer·Data path</th><th style="padding:8px;border:1px solid #d9d1ea">Consumer·Data path</th></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea"><strong>① schema 변경 제안</strong><br>owner·의미·rollout·rollback 기록</td><td style="padding:8px;border:1px solid #d9d1ea">Old writer는 계속 v1 생성</td><td style="padding:8px;border:1px solid #d9d1ea">Old reader는 v1만 검증됨</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#6f5aa8;font-weight:800">&#8595; CI가 backward/forward/full 및 latest/transitive 정책으로 역사와 비교</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea"><strong>② 승인·등록</strong><br>Schema version/ID와 artifact 생성</td><td style="padding:8px;border:1px solid #d9d1ea">아직 writer 전환 금지</td><td style="padding:8px;border:1px solid #d9d1ea"><strong>③ New reader 먼저 배포</strong><br>v1+v2 모두 읽음</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#6f5aa8;font-weight:800">&#8595; consumer fleet readiness와 error rate 확인</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">Schema history·compatibility evidence 보존</td><td style="padding:8px;border:1px solid #d9d1ea"><strong>④ New writer canary</strong><br>Schema identity + v2 payload 직렬화</td><td style="padding:8px;border:1px solid #d9d1ea">Old/new data 모두 역직렬화·처리</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#6f5aa8;font-weight:800">&#8595; Kafka broker는 opaque key/value bytes를 partition log에 append</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">Registry/cache 장애 정책 운영</td><td style="padding:8px;border:1px solid #d9d1ea">Writer 점진 확대 또는 rollback</td><td style="padding:8px;border:1px solid #d9d1ea"><strong>⑤ replay·신규 group</strong><br>옛 schema ID까지 조회해 복원</td></tr>
+  </table>
+  <p><strong>Data path:</strong> Object → format serializer → schema identity를 포함한 envelope/header → Kafka record bytes → fetch → identity lookup/cache → writer/reader resolution → object다. Schema identity를 넣는 위치와 byte layout은 사용하는 integration마다 다르며 Kafka core protocol의 보편 규칙으로 가정하면 안 된다.</p>
+  <p><strong>Control path:</strong> Schema repository/registry, CI compatibility gate, code generation, artifact release, rollout controller, contract catalog가 해석 규칙을 관리한다. KRaft controller는 topic metadata를 관리하지만 Avro field default나 Protobuf field number 재사용을 검사하지 않는다.</p>
+  <p><strong>상태의 소유자:</strong> Producer team은 writer schema·meaning, schema system은 version history·policy, consumer team은 reader behavior·quarantine, platform team은 availability·cache·ACL, Kafka broker는 bytes·offset·retention을 소유한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">4. CS 내부 동작</h2>
+  <h3 style="margin:20px 0 8px;color:#59458e">세 포맷의 wire 정신 모델</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#e8e2f5"><th style="padding:8px;border:1px solid #d9d1ea">관점</th><th style="padding:8px;border:1px solid #d9d1ea">Avro</th><th style="padding:8px;border:1px solid #d9d1ea">Protobuf binary</th><th style="padding:8px;border:1px solid #d9d1ea">JSON text</th></tr>
+    <tr><td style="padding:7px;border:1px solid #d9d1ea"><strong>Field identity</strong></td><td style="padding:7px;border:1px solid #d9d1ea">Writer schema의 field 순서·이름과 reader resolution</td><td style="padding:7px;border:1px solid #d9d1ea">Field number + wire type tag</td><td style="padding:7px;border:1px solid #d9d1ea">Payload의 field name</td></tr>
+    <tr><td style="padding:7px;border:1px solid #d9d1ea"><strong>Schema 필요</strong></td><td style="padding:7px;border:1px solid #d9d1ea">Binary data에 field name/type가 없으므로 writer schema가 필요</td><td style="padding:7px;border:1px solid #d9d1ea">Generated/descriptor schema로 field number 의미 해석</td><td style="padding:7px;border:1px solid #d9d1ea">문법 parsing은 가능하지만 type·required·meaning 검증에는 schema 필요</td></tr>
+    <tr><td style="padding:7px;border:1px solid #d9d1ea"><strong>Unknown field</strong></td><td style="padding:7px;border:1px solid #d9d1ea">Reader에 없는 writer field는 resolution에서 무시 가능</td><td style="padding:7px;border:1px solid #d9d1ea">Binary parser가 unknown field를 보존할 수 있으나 JSON 변환 등에서 유실 가능</td><td style="padding:7px;border:1px solid #d9d1ea">Parser/validator의 ignore·reject·preserve 정책에 달림</td></tr>
+    <tr><td style="padding:7px;border:1px solid #d9d1ea"><strong>크기·가독성</strong></td><td style="padding:7px;border:1px solid #d9d1ea">Compact binary, field names 미반복</td><td style="padding:7px;border:1px solid #d9d1ea">Compact binary, 낮은 field number가 더 짧음</td><td style="padding:7px;border:1px solid #d9d1ea">사람이 읽기 쉬우나 이름·문자 숫자를 반복</td></tr>
+    <tr><td style="padding:7px;border:1px solid #d9d1ea"><strong>주요 장점</strong></td><td style="padding:7px;border:1px solid #d9d1ea">Writer/reader schema resolution과 data pipeline 친화성</td><td style="padding:7px;border:1px solid #d9d1ea">다언어 codegen·stable numeric tag·효율적 binary</td><td style="padding:7px;border:1px solid #d9d1ea">낮은 진입 장벽·debug 가시성·광범위한 도구</td></tr>
+    <tr><td style="padding:7px;border:1px solid #d9d1ea"><strong>대표 함정</strong></td><td style="padding:7px;border:1px solid #d9d1ea">Default는 write가 아니라 read resolution에 사용</td><td style="padding:7px;border:1px solid #d9d1ea">Field number 재사용·presence·binary/JSON 규칙 혼동</td><td style="padding:7px;border:1px solid #d9d1ea">Number precision·strict unknown field·schema 없는 의미 drift</td></tr>
+  </table>
+
+  <h3 style="margin:22px 0 8px;color:#59458e">Avro: writer schema와 reader schema를 함께 푼다</h3>
+  <p>Avro binary에는 field name과 type 정보가 반복되지 않는다. Reader는 writer schema를 확보하고 자기 reader schema와 resolution한다. Writer에만 있는 field는 reader가 무시할 수 있고, reader에만 있는 field는 default가 있으면 채울 수 있다. Default가 없는 새 reader field가 old writer data에 없으면 오류다.</p>
+  <p>Field 순서는 schema resolution에서 이름으로 맞출 수 있지만 binary bytes 자체는 writer schema 순서를 따른다. Enum symbol 삭제, union branch 변경, decimal precision/scale 변경은 단순 field 추가보다 위험하다. Alias는 rename migration을 도울 수 있지만 domain 의미 변화까지 해결하지 않는다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#59458e">Protobuf: 이름보다 field number가 wire identity다</h3>
+  <p>Binary wire에는 field number와 wire type이 기록된다. 새 고유 번호의 optional field 추가는 old reader가 unknown field로 다룰 수 있어 일반적으로 안전한 변화다. 반면 기존 번호를 다른 의미로 재사용하면 같은 bytes가 다른 field로 해석되어 corruption이나 민감정보 노출까지 이어질 수 있다. 삭제한 번호와 이름은 <code>reserved</code>로 남긴다.</p>
+  <p>Proto3 binary는 unknown fields를 보존할 수 있지만 field-by-field 객체 복사나 ProtoJSON 변환을 거치면 유실될 수 있다. Binary compatibility와 ProtoJSON compatibility는 동일하지 않다. Presence가 필요한 scalar는 <code>optional</code>을 명시해 “미설정”과 zero value를 구분한다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#59458e">JSON: 스스로 보이는 것과 contract가 있는 것은 다르다</h3>
+  <p>JSON에는 field name과 primitive token이 보여 debug가 쉽다. 하지만 <code>required</code>, <code>additionalProperties</code>, number 범위, string format을 강제하려면 JSON Schema와 validator 정책이 필요하다. Old reader가 unknown field를 거부하면 optional field 추가도 forward-incompatible할 수 있다.</p>
+  <p>JSON number는 consumer 언어의 숫자 모델에 따라 정밀도가 달라질 수 있다. 64-bit ID를 JavaScript number로 읽으면 정확성을 잃을 수 있어 string contract를 선택하기도 한다. 사람이 읽을 수 있다는 사실은 안정적인 type system을 뜻하지 않는다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#59458e">Compatibility 방향을 식으로 고정하기</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#e8e2f5"><th style="padding:8px;border:1px solid #d9d1ea">정책</th><th style="padding:8px;border:1px solid #d9d1ea">검사 질문</th><th style="padding:8px;border:1px solid #d9d1ea">주요 배포/복구 상황</th></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea"><strong>Backward</strong></td><td style="padding:8px;border:1px solid #d9d1ea">Reader(new) ← Data(writer old)가 가능한가?</td><td style="padding:8px;border:1px solid #d9d1ea">Consumer-first 배포, 새 consumer의 과거 replay</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea"><strong>Forward</strong></td><td style="padding:8px;border:1px solid #d9d1ea">Reader(old) ← Data(writer new)가 가능한가?</td><td style="padding:8px;border:1px solid #d9d1ea">Producer-first 전환, 느리게 업그레이드되는 consumer</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea"><strong>Full</strong></td><td style="padding:8px;border:1px solid #d9d1ea">두 방향이 모두 가능한가?</td><td style="padding:8px;border:1px solid #d9d1ea">독립 배포 팀이 많고 순서를 강제하기 어려운 shared event</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea"><strong>Transitive</strong></td><td style="padding:8px;border:1px solid #d9d1ea">후보가 모든 역사 version과 가능한가?</td><td style="padding:8px;border:1px solid #d9d1ea">긴 retention, replay, 장기 미접속 consumer, data lake backfill</td></tr>
+  </table>
+  <p><strong>핵심 불변식:</strong> Topic retention 안에 남아 있고 다시 읽힐 수 있는 모든 writer version은 지원 reader 집합 중 최소 하나로 해석 가능해야 한다. 최신 version끼리만 통과하는 것으로는 replay 안전성을 증명할 수 없다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">5. 실무 설계 판단</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr style="background:#e8e2f5"><th style="padding:8px;border:1px solid #d9d1ea">상황</th><th style="padding:8px;border:1px solid #d9d1ea">권장 판단</th><th style="padding:8px;border:1px solid #d9d1ea">이유·trade-off</th></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">분석·CDC·lake pipeline</td><td style="padding:8px;border:1px solid #d9d1ea">Avro를 후보로 검토, writer schema identity와 logical type 엄격 관리</td><td style="padding:8px;border:1px solid #d9d1ea">Compact와 schema resolution 장점, schema infrastructure 의존</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">다언어 service event</td><td style="padding:8px;border:1px solid #d9d1ea">Protobuf를 후보로 검토, field number lifecycle·codegen 계약</td><td style="padding:8px;border:1px solid #d9d1ea">Generated type와 효율, binary/JSON 차이·build coupling 비용</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">외부 공개·human debug 중심</td><td style="padding:8px;border:1px solid #d9d1ea">JSON + explicit JSON Schema + strict CI fixture</td><td style="padding:8px;border:1px solid #d9d1ea">접근성은 좋지만 크기·정밀도·parser 정책 편차 관리 필요</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">Kafka key</td><td style="padding:8px;border:1px solid #d9d1ea">Value보다 더 엄격한 canonical schema와 migration plan</td><td style="padding:8px;border:1px solid #d9d1ea">변경 시 partition·ordering·join·compaction identity가 바뀜</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">긴 retention/replay</td><td style="padding:8px;border:1px solid #d9d1ea">Backward-transitive 또는 full-transitive를 요구사항에 맞게 선택</td><td style="padding:8px;border:1px solid #d9d1ea">Latest-only chain이 먼 과거 data를 못 읽는 함정 방지</td></tr>
+  </table>
+  <p><strong>Best practice:</strong> Schema file을 application code와 함께 version control하고 PR에서 owner review·compatibility test·golden bytes test를 수행한다. Consumer를 먼저 배포해 old+new fixture를 읽히고, producer canary를 통해 deserialization error·unknown enum·business invariant 지표를 본 뒤 확대한다.</p>
+  <p><strong>Change checklist:</strong> Field 추가/삭제/rename/type 변경, nullability/default, enum, logical type·단위, key bytes, schema identity, generated code version, unknown-field policy, retry/quarantine, rollback writer, retention/replay 기간, downstream catalog를 모두 검토한다.</p>
+  <p><strong>Version/engine 차이:</strong> Kafka 4.3.1 core는 Java primitive/basic Serde를 제공하지만 Avro/Protobuf/JSON registry compatibility 정책은 Kafka broker의 내장 보장이 아니다. Registry product와 serializer integration에 따라 subject naming, ID envelope, cache, auto-registration, reference 동작이 다르므로 운영 중인 구현 문서를 별도로 고정해야 한다.</p>
+  <p><strong>Anti-pattern:</strong> Production producer가 권한 없이 schema auto-register, compatibility를 NONE으로 잠시 풀고 복구하지 않음, default에 business 의미 숨김, Protobuf number 재사용, JSON unknown field strictness 미테스트, 최신 두 version만 fixture test, schema rollback 없이 application만 rollback.</p>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:13px;word-break:break-word">
+    <tr style="background:#e8e2f5"><th style="padding:6px;border:1px solid #d9d1ea">증상</th><th style="padding:6px;border:1px solid #d9d1ea">먼저 수집할 증거/지표</th><th style="padding:6px;border:1px solid #d9d1ea">가능한 가설</th><th style="padding:6px;border:1px solid #d9d1ea">안전한 첫 조치</th><th style="padding:6px;border:1px solid #d9d1ea">rollback/복구</th><th style="padding:6px;border:1px solid #d9d1ea">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:6px;border:1px solid #d9d1ea">새 producer 배포 뒤 consumer error 폭증</td><td style="padding:6px;border:1px solid #d9d1ea">Writer version/schema ID, failing topic-partition-offset, reader artifact, exception·bytes hash</td><td style="padding:6px;border:1px solid #d9d1ea">Forward incompatibility, old reader 잔존, wrong subject/schema</td><td style="padding:6px;border:1px solid #d9d1ea">Writer canary/rollout 중지, 실패 record와 fleet version 분포 고정</td><td style="padding:6px;border:1px solid #d9d1ea">Old writer rollback 또는 tolerant reader 선배포 후 idempotent replay</td><td style="padding:6px;border:1px solid #d9d1ea">Offset 강제 skip, registry policy를 NONE으로 변경</td></tr>
+    <tr><td style="padding:6px;border:1px solid #d9d1ea">신규 group의 과거 replay만 실패</td><td style="padding:6px;border:1px solid #d9d1ea">최초 실패 offset·writer schema history·retention·compatibility mode 이력</td><td style="padding:6px;border:1px solid #d9d1ea">Latest-only chain은 통과했지만 non-transitive gap 존재</td><td style="padding:6px;border:1px solid #d9d1ea">Replay 중지, 실패 version 범위와 안전 reader를 찾음</td><td style="padding:6px;border:1px solid #d9d1ea">Bridge reader/transform backfill 후 transitive gate 도입</td><td style="padding:6px;border:1px solid #d9d1ea">과거 schema 삭제, start offset을 최신으로 이동</td></tr>
+    <tr><td style="padding:6px;border:1px solid #d9d1ea">Parsing 성공하지만 값이 오염</td><td style="padding:6px;border:1px solid #d9d1ea">Field 분포·단위·enum·logical type, schema diff, producer release timeline</td><td style="padding:6px;border:1px solid #d9d1ea">Semantic breaking change, default 오용, number precision 손실</td><td style="padding:6px;border:1px solid #d9d1ea">Side effect 제한, 영향 offset·시간·entity 범위를 계산</td><td style="padding:6px;border:1px solid #d9d1ea">보정 event/backfill·reconciliation 후 semantic contract test 추가</td><td style="padding:6px;border:1px solid #d9d1ea">Schema 검사 통과만 보고 정상 선언</td></tr>
+    <tr><td style="padding:6px;border:1px solid #d9d1ea">Schema service 지연·장애</td><td style="padding:6px;border:1px solid #d9d1ea">Lookup/register latency, cache hit, HTTP status, ID별 실패, client timeout</td><td style="padding:6px;border:1px solid #d9d1ea">Control plane 장애, cache cold start, ACL/credential 만료</td><td style="padding:6px;border:1px solid #d9d1ea">신규 schema 등록 중지, 검증된 local cache와 기존 ID 사용 범위 확인</td><td style="padding:6px;border:1px solid #d9d1ea">서비스/ACL 복구 후 bounded retry, 미발행 event 재처리</td><td style="padding:6px;border:1px solid #d9d1ea">Unknown ID를 임의 schema로 decode, 무한 retry로 thread 고갈</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">7. 20~40분 실습: backward·forward·transitive를 코드로 판정</h2>
+  <div style="padding:14px;background:#fff3d8;border-left:5px solid #d28b22;border-radius:8px"><strong>목표:</strong> Python 표준 라이브러리만으로 writer/reader 조합을 만들고, “새 reader가 old data를 읽는다”와 “old reader가 new data를 읽는다”를 직접 구분한다. 이어 latest 검사는 통과하지만 transitive 검사는 실패하는 schema chain을 재현한다.</div>
+  <p><strong>사전 조건:</strong> 저장소 root와 Python 3. Kafka broker는 이 실험에서 bytes를 해석하지 않으므로 실행하지 않아도 된다. 약 30분.</p>
+
+  <h3 style="margin:20px 0 8px;color:#59458e">0) 실행 전 예측</h3>
+  <ol style="padding-left:22px">
+    <li>새 reader가 새 field <code>currency</code>에 default를 가지면 old data를 읽을 수 있는가?</li>
+    <li>Old reader가 unknown field를 거부하면 new writer data를 읽을 수 있는가?</li>
+    <li>Candidate가 직전 schema와 compatible이면 모든 과거 data도 안전한가?</li>
+  </ol>
+
+  <h3 style="margin:20px 0 8px;color:#59458e">1) Backward와 forward를 반대 방향으로 실행</h3>
+  <pre style="margin:0;padding:14px;background:#29243c;color:#f4f1ff;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">python3 - &lt;&lt;'PY'
+old_data={"order_id":"o-1","amount":12000}
+new_data={"order_id":"o-2","amount":9000,"currency":"KRW"}
+
+def new_reader(x):
+    allowed={"order_id","amount","currency"}
+    assert set(x)&lt;=allowed
+    return {"order_id":x["order_id"],"amount":x["amount"],"currency":x.get("currency","KRW")}
+
+def old_reader_strict(x):
+    allowed={"order_id","amount"}
+    unknown=set(x)-allowed
+    assert not unknown, f"unknown={unknown}"
+    return {"order_id":x["order_id"],"amount":x["amount"]}
+
+print("BACKWARD new_reader&lt;-old_data",new_reader(old_data))
+try:
+    old_reader_strict(new_data)
+except AssertionError as e:
+    print("FORWARD FAIL old_reader&lt;-new_data",e)
+PY</pre>
+  <p><strong>예상:</strong> 새 reader는 default로 old data를 읽어 backward 통과한다. Strict old reader는 <code>currency</code>를 unknown으로 거부해 forward 실패한다. JSON에 field name이 보인다고 자동 호환되는 것이 아니다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#59458e">2) Reader 정책 하나가 결과를 바꾸는지 확인</h3>
+  <pre style="margin:0;padding:14px;background:#29243c;color:#f4f1ff;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">python3 - &lt;&lt;'PY'
+new_data={"order_id":"o-2","amount":9000,"currency":"KRW"}
+def old_reader_tolerant(x):
+    return {"order_id":x["order_id"],"amount":x["amount"]}
+print("FORWARD PASS",old_reader_tolerant(new_data))
+PY</pre>
+  <p><strong>예상:</strong> Unknown field를 무시하는 reader에서는 같은 field 추가가 forward-compatible하다. 변화의 안전성은 schema diff만 아니라 실제 reader policy에 달려 있다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#59458e">3) Latest-only 통과, transitive 실패 재현</h3>
+  <pre style="margin:0;padding:14px;background:#29243c;color:#f4f1ff;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">python3 - &lt;&lt;'PY'
+v1={"fields":{"customer_id"},"defaults":set()}
+v2={"fields":{"customer_id","buyer_id"},"defaults":{"buyer_id"}}
+v3={"fields":{"buyer_id"},"defaults":set()}
+
+def backward(reader,writer):
+    missing=reader["fields"]-writer["fields"]
+    return missing&lt;=reader["defaults"],missing
+
+print("v2 reads v1",backward(v2,v1))
+print("v3 reads latest v2",backward(v3,v2))
+print("v3 reads historical v1",backward(v3,v1))
+assert backward(v3,v2)[0] and not backward(v3,v1)[0]
+print("LATEST=PASS, TRANSITIVE=FAIL")
+PY</pre>
+  <p><strong>예상:</strong> v2는 default로 v1을 읽고, v3는 직전 v2의 <code>buyer_id</code>를 읽는다. 하지만 v3는 v1에 없는 <code>buyer_id</code>의 default를 제거했으므로 v1 replay에 실패한다. Version별 pair가 연속 통과해도 compatibility가 자동으로 추이적이지는 않다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#59458e">4) 실패 주입과 복구 설계</h3>
+  <p><strong>실패 주입:</strong> v3를 latest-only gate로 승인했다고 가정하고 v1 fixture를 reader test에 넣는다. <code>TRANSITIVE=FAIL</code>을 incident evidence로 기록한다.</p>
+  <p><strong>안전한 복구:</strong> v3 reader에 <code>buyer_id</code> default/alias 변환을 유지하거나, v1→v3 bridge backfill을 별도 topic으로 수행한다. 과거 schema와 data를 삭제해서 test를 통과시키지 않는다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#59458e">5) 자주 나는 오류와 해결</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:37%;padding:8px;border:1px solid #d9d1ea"><code>SyntaxError</code> at <code>&lt;&lt;</code></td><td style="padding:8px;border:1px solid #d9d1ea">코드 블록 전체를 zsh/bash terminal에서 실행한다. Python REPL 안에 shell heredoc 문법을 넣지 않는다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">Expected FAIL이 안 남</td><td style="padding:8px;border:1px solid #d9d1ea">Old reader가 unknown field를 무시하는 구현인지 확인한다. 이것이 바로 reader policy 차이다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">Schema tool 결과와 다름</td><td style="padding:8px;border:1px solid #d9d1ea">이 실습은 방향 모델이다. 실제 format의 type promotion·enum·union·field number 규칙은 해당 spec과 registry 구현으로 검증한다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #d9d1ea">Default로 모든 문제 해결</td><td style="padding:8px;border:1px solid #d9d1ea">Default가 domain상 유효한지 별도 검증한다. UNKNOWN 통화나 0 금액이 조용한 corruption을 만들 수 있다.</td></tr>
+  </table>
+
+  <h3 style="margin:20px 0 8px;color:#59458e">6) Cleanup</h3>
+  <p>이 실습은 stdin code만 실행하므로 생성 파일과 Kafka topic이 없다. Terminal history에 민감한 payload를 넣지 않았는지만 확인하면 된다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Backward 방향 반대로 외우기:</strong> 새 reader가 old data를 읽는 방향부터 문장으로 쓴다.</li>
+    <li><strong>Latest-only chain:</strong> v3↔v2와 v2↔v1 통과가 v3↔v1 통과를 보장하지 않는다.</li>
+    <li><strong>Default의 의미:</strong> Avro default는 missing field를 read할 때 쓰이며 모든 write에 자동 저장되는 값이 아니다.</li>
+    <li><strong>Protobuf number 재사용:</strong> 이름을 바꿔도 동일 번호는 wire에서 같은 identity다. 삭제 번호를 reserve한다.</li>
+    <li><strong>Binary와 JSON 혼동:</strong> Protobuf binary-safe change가 ProtoJSON에서도 safe하다고 단정하지 않는다.</li>
+    <li><strong>JSON 자유 형식:</strong> <code>additionalProperties</code>와 unknown-field parser 설정 없이는 field 추가 결과가 팀마다 다르다.</li>
+    <li><strong>Enum 추가/삭제:</strong> 언어 binding과 old reader의 unknown enum 처리까지 확인한다.</li>
+    <li><strong>Semantic drift:</strong> 이름·type이 같아도 단위·timezone·정의가 바뀌면 breaking change다.</li>
+    <li><strong>Registry가 single point:</strong> Lookup cache, timeout, ACL, backup, history immutability와 장애 시 신규 등록 정책이 필요하다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">9. 대기업 기술 면접 질문</h2>
+  <h3 style="margin:18px 0 6px;color:#59458e">Q1. Avro, Protobuf, JSON 중 무엇을 선택하겠는가?</h3>
+  <p><strong>좋은 답변 구조:</strong> 먼저 consumer 언어·replay 기간·debug·size/CPU·schema governance 요구를 수치화 → 세 format의 wire identity와 tooling 비교 → key/value를 분리 → compatibility/rollout/error path → benchmark와 조직 운영 비용으로 결론을 방어한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#59458e">Q2. Backward compatible이면 무중단 배포가 항상 가능한가?</h3>
+  <p><strong>좋은 답변 구조:</strong> Backward 방향 정의 → rolling 중 old reader와 new writer가 만나는 forward 방향 지적 → reader-first 전제와 fleet readiness → semantic change·key schema·transitive replay 예외 → canary·rollback·quarantine을 제시한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#59458e">Q3. Schema v1→v2→v3가 매 단계 통과했는데 과거 replay가 실패했다. 원인은?</h3>
+  <p><strong>좋은 답변 구조:</strong> Latest-only vs transitive 구분 → 최초 실패 offset의 writer schema ID 확인 → version graph와 default/alias/field number 분석 → bridge reader 또는 backfill 복구 → transitive CI와 golden bytes fixture 도입까지 말한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">10. 복습과 정답</h2>
+  <h3 style="margin:18px 0 6px;color:#59458e">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px">
+    <li>Kafka broker가 업무 객체의 field type을 직접 검증하지 않는 이유는?</li>
+    <li>Key serializer 변경이 value serializer 변경보다 더 위험할 수 있는 이유는?</li>
+    <li>Poison pill 대응 시 보존해야 할 최소 evidence는?</li>
+  </ol>
+  <div style="padding:14px;background:#f2eff9;border-radius:8px"><strong>어제 정답/채점:</strong> ① Broker는 serializer 결과인 opaque bytes를 저장하고 type은 client contract에 있기 때문(2점). ② Key bytes hash가 partition·ordering·join locality를 결정하기 때문(3점). ③ Topic/partition/offset, key, schema ID/version, exception, PII-safe 원본 bytes 또는 hash(3점).</div>
+
+  <h3 style="margin:22px 0 6px;color:#59458e">오늘 확인 문제 3개</h3>
+  <ol style="padding-left:22px">
+    <li>Backward와 forward compatibility를 reader/writer 문장으로 각각 써라.</li>
+    <li>Avro field default와 Protobuf field number에서 가장 흔한 함정은?</li>
+    <li>Latest-only 검사와 transitive 검사의 운영상 차이는?</li>
+  </ol>
+  <div style="padding:14px;background:#f2eff9;border-radius:8px"><strong>오늘 정답/채점:</strong> ① 새 reader←old writer가 backward, old reader←new writer가 forward(3점). ② Avro default는 read resolution용이며, Protobuf number는 재사용 금지 wire identity(3점). ③ Latest는 직전 version만, transitive는 모든 보존 history와 검사해 오래된 replay를 보호(3점). 총 9점 중 7점 이상이면 통과.</div>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/streams/developer-guide/datatypes/" style="color:#59458e">Apache Kafka 4.3.1 Data Types and Serialization</a> — Kafka client/Streams Serde 경계와 기본 타입</li>
+    <li><a href="https://avro.apache.org/docs/1.12.0/specification/" style="color:#59458e">Apache Avro 1.12.0 Specification</a> — binary encoding, writer/reader schema resolution, defaults·aliases</li>
+    <li><a href="https://protobuf.dev/programming-guides/proto3/#updating" style="color:#59458e">Protocol Buffers proto3 Language Guide</a> — field number, safe/unsafe change, unknown field·presence</li>
+    <li><a href="https://json-schema.org/understanding-json-schema/reference/object" style="color:#59458e">JSON Schema Object Reference</a> — properties, required, additionalProperties의 validation 의미</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#59458e">12. 내일 예고</h2>
+  <div style="padding:16px;background:#f0edf9;border-left:5px solid #6f5aa8;border-radius:8px"><strong>Day 38 · Kafka Connect worker·task·offset·converter</strong><br>
+  Connector가 설정과 task lifecycle을 관리하고, task가 실제 data movement를 수행하며, converter가 Connect data/schema와 Kafka bytes 사이를 어떻게 잇는지 상태 소유자 관점에서 학습한다.</div>
+</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>

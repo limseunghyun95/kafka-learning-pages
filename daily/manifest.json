@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-10-15T09:14:09+09:00",
+  "updatedAt": "2026-10-16T09:10:39+09:00",
   "lessons": [
     {
       "day": 1,
@@ -329,6 +329,15 @@
       "path": "day-36.html",
       "kind": "lesson",
       "publishedAt": "2026-10-15T09:14:09+09:00"
+    },
+    {
+      "day": 37,
+      "week": 6,
+      "title": "Avro/Protobuf/JSON, compatibility 정책",
+      "summary": "Avro·Protobuf·JSON의 wire identity와 schema evolution 차이를 비교하고 backward·forward·full·transitive 정책을 rollout·replay·장애 복구에 연결합니다.",
+      "path": "day-37.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-16T09:10:39+09:00"
     }
   ]
 }
