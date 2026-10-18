@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 38 · Kafka Connect worker·task·offset·converter</title>
+</head>
+<body style="margin:0;background:#edf3f1;color:#24312d;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#edf3f1"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #cddbd6;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#16463c;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#b9ddd4;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 6 / DAY 38 · CONNECT RUNTIME</div>
+  <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.28">Kafka Connect worker·task·offset·converter</h1>
+  <p style="margin:0;color:#e5f4f0">누가 상태를 갖고, 어느 지점에서 성공이 확정되는가 · 이론 80분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#e8f4f0;border-left:5px solid #2b7a68;border-radius:10px"><strong>한 줄 요약</strong><br>
+  Connector는 일을 나누고, Task는 실제 record를 옮기며, Worker는 lifecycle·client·offset을 실행하고, Converter는 Connect의 Schema+Value와 Kafka의 byte[] 경계를 번역한다. 장애를 풀려면 “어느 프로세스가 죽었나”보다 “어느 상태가 어디까지 확정됐나”를 먼저 묻는다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#236858">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:9px;border:1px solid #cbdad5"><strong>Kafka Connect</strong></td><td style="padding:9px;border:1px solid #cbdad5">Kafka와 DB·object storage·search engine 같은 외부 시스템 사이의 data 이동을 표준화한 runtime. Connector plugin을 실행하고 확장·복구·offset 관리를 맡는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdad5"><strong>Worker</strong></td><td style="padding:9px;border:1px solid #cbdad5">Connect runtime JVM process. Connector와 Task instance를 올리고, producer/consumer, converter, REST, offset/status 저장을 제공하는 실행 노드다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdad5"><strong>Connector</strong></td><td style="padding:9px;border:1px solid #cbdad5">외부 시스템을 발견하고 작업을 어떻게 나눌지 결정하는 control-plane plugin. 실제 record 하나하나를 지속적으로 옮기는 주체는 보통 Task다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdad5"><strong>Task</strong></td><td style="padding:9px;border:1px solid #cbdad5">실제 data 이동을 수행하는 병렬 실행 단위. SourceTask는 외부에서 poll해 Kafka로 보내고, SinkTask는 Kafka record를 받아 외부 시스템에 쓴다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdad5"><strong>Source partition</strong></td><td style="padding:9px;border:1px solid #cbdad5">외부 source의 논리적 shard 식별자. 예: DB table+server, file path. Kafka partition과 같은 개념이 아니며 connector가 정의한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdad5"><strong>Source offset</strong></td><td style="padding:9px;border:1px solid #cbdad5">외부 source에서 어디까지 읽었는지 나타내는 위치. 예: binlog file+position. Kafka consumer offset과 형식·소유자가 다르다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdad5"><strong>Converter</strong></td><td style="padding:9px;border:1px solid #cbdad5">Connect 내부의 Schema+Value와 Kafka record의 byte[] 사이를 양방향 변환하는 plugin. key와 value converter를 따로 설정한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdad5"><strong>Standalone / Distributed</strong></td><td style="padding:9px;border:1px solid #cbdad5">Standalone은 한 process와 local offset file 중심이라 개발·작은 작업에 적합하다. Distributed는 여러 worker가 group을 이루고 config·offset·status를 Kafka internal topic에 저장해 재배치·복구한다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdad5"><strong>Rebalance</strong></td><td style="padding:9px;border:1px solid #cbdad5">Worker membership이나 connector/task 구성이 바뀔 때 실행 ownership을 다시 배치하는 과정. 짧은 정지와 중복 가능 구간을 만든다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #cbdad5"><strong>Poison pill</strong></td><td style="padding:9px;border:1px solid #cbdad5">Converter 또는 connector가 처리하지 못해 같은 위치에서 계속 실패하게 만드는 record. DLQ는 격리 수단이지 원인 해결이나 재처리 책임의 종착지가 아니다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#236858">2. 왜 중요한가</h2>
+  <p>Connect는 “설정 몇 줄로 DB를 Kafka에 붙이는 도구”처럼 보이지만, production에서는 분산 상태 기계다. Source system의 위치, Kafka produce 결과, source offset commit이 서로 다른 시점에 끝난다. Sink에서는 외부 side effect와 Kafka consumer offset commit이 원자적이지 않을 수 있다. 이 틈이 중복·유실의 failure window다.</p>
+  <p>또한 scale-out 단위는 worker가 아니라 <strong>실제로 생성된 task와 upstream/downstream partition</strong>이다. Worker를 10대로 늘리고 <code>tasks.max=100</code>을 줘도 connector가 source shard 하나만 발견하면 task 하나뿐일 수 있다. 반대로 task 수만 늘리면 DB connection·API quota·consumer group rebalance 비용이 커진다.</p>
+  <p>면접과 장애 대응에서 중요한 질문은 네 가지다. <strong>상태 소유자는 누구인가, 불변식은 무엇인가, 성공은 어느 지점에서 확정되는가, crash 후 어느 지점부터 replay되는가.</strong></p>
+
+  <h2 style="margin:30px 0 12px;color:#236858">3. Architecture와 요청 흐름</h2>
+  <h3 style="margin:18px 0 8px;color:#236858">3-1. Distributed Connect control path</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dff0eb"><th style="padding:8px;border:1px solid #cbdad5">Client</th><th style="padding:8px;border:1px solid #cbdad5">Connect cluster</th><th style="padding:8px;border:1px solid #cbdad5">Kafka state</th></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdad5"><strong>① REST</strong><br>connector config 제출</td><td style="padding:8px;border:1px solid #cbdad5">임의 worker가 validation·조정</td><td style="padding:8px;border:1px solid #cbdad5"><code>config.storage.topic</code>에 config 기록</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#2b7a68">↓ config log가 cluster의 source of truth</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdad5">상태 조회</td><td style="padding:8px;border:1px solid #cbdad5"><strong>② Connector</strong>가 <code>taskConfigs(maxTasks)</code>로 일을 분할</td><td style="padding:8px;border:1px solid #cbdad5"><code>status.storage.topic</code>에 connector/task 상태</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#2b7a68">↓ worker group assignment·rebalance</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdad5">운영자 관측</td><td style="padding:8px;border:1px solid #cbdad5"><strong>③ Worker A/B/C</strong>에 connector와 task instance 배치</td><td style="padding:8px;border:1px solid #cbdad5">Source offset은 <code>offset.storage.topic</code></td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>Config 제출:</strong> REST 200만 보고 end-to-end data 이동 성공으로 간주하지 않는다. Config가 accepted된 뒤 connector와 task가 RUNNING이 되고 실제 record가 흐르는지 별도 확인한다.</li>
+    <li><strong>Task 계획:</strong> Connector가 외부 table/shard/file을 발견해 최대 <code>tasks.max</code>개의 config를 만든다. 공식 문서대로 이 값은 상한이며 실제 task 수는 더 적을 수 있다.</li>
+    <li><strong>Assignment:</strong> 같은 <code>group.id</code>의 worker가 membership을 이루고 connector/task ownership을 나눈다. Worker 추가·종료나 config 변경은 rebalance를 일으킬 수 있다.</li>
+    <li><strong>State 복구:</strong> 새 owner는 internal topic의 config/status/source offset을 읽고 다시 시작한다. 따라서 internal topic의 replication·compaction·ACL은 application topic 못지않게 중요하다.</li>
+  </ol>
+
+  <h3 style="margin:22px 0 8px;color:#236858">3-2. Source data path: 외부 위치에서 Kafka offset까지</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr><td style="padding:10px;border:1px solid #cbdad5;background:#eef8f5"><strong>외부 source</strong><br>row/binlog/file<br><small>source partition+offset</small></td><td align="center" style="width:8%;color:#2b7a68">→</td><td style="padding:10px;border:1px solid #cbdad5;background:#eef8f5"><strong>SourceTask.poll()</strong><br>SourceRecord<br><small>Connect Schema+Value</small></td><td align="center" style="width:8%;color:#2b7a68">→</td><td style="padding:10px;border:1px solid #cbdad5;background:#eef8f5"><strong>Converter</strong><br>fromConnectData<br><small>byte[]</small></td></tr>
+    <tr><td colspan="5" align="center" style="padding:6px;color:#2b7a68">↓ Worker producer send/ack → Kafka topic log → offset flush</td></tr>
+    <tr><td colspan="2" style="padding:10px;border:1px solid #cbdad5"><strong>Kafka data topic</strong><br>topic-partition-offset</td><td style="padding:10px;border:1px solid #cbdad5"><strong>Worker</strong><br>batch·retry·producer callback</td><td colspan="2" style="padding:10px;border:1px solid #cbdad5"><strong>Source offset store</strong><br>external position checkpoint</td></tr>
+  </table>
+  <p><strong>핵심 failure window:</strong> Kafka produce는 성공했지만 source offset flush 전에 worker가 죽으면 같은 source record를 다시 읽어 Kafka에 중복 전송할 수 있다. 반대로 offset을 data 성공보다 먼저 확정하면 유실 위험이 생긴다. 기본적으로 delivery 범위를 명시하지 않은 채 “Connect니까 exactly-once”라고 말하면 안 된다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#236858">3-3. Sink data path: Kafka bytes에서 외부 side effect까지</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr><td style="padding:10px;border:1px solid #cbdad5;background:#eef8f5"><strong>Kafka consumer</strong><br>record byte[]<br><small>group offset</small></td><td align="center" style="width:8%;color:#2b7a68">→</td><td style="padding:10px;border:1px solid #cbdad5;background:#eef8f5"><strong>Converter</strong><br>toConnectData<br><small>Schema+Value</small></td><td align="center" style="width:8%;color:#2b7a68">→</td><td style="padding:10px;border:1px solid #cbdad5;background:#eef8f5"><strong>SinkTask.put()</strong><br>DB/API/object<br><small>external side effect</small></td></tr>
+    <tr><td colspan="5" align="center" style="padding:6px;color:#2b7a68">↓ flush/preCommit → Kafka consumer-group offset commit</td></tr>
+  </table>
+  <p><strong>핵심 failure window:</strong> 외부 DB write가 성공했지만 Kafka offset commit 전에 crash하면 replay되어 같은 write가 다시 실행될 수 있다. Sink의 멱등 key, upsert 조건, dedup table, destination transaction과 connector 보장을 함께 봐야 한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#236858">4. CS 내부 동작</h2>
+  <h3 style="margin:18px 0 6px;color:#236858">상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#dff0eb"><th style="padding:7px;border:1px solid #cbdad5">상태</th><th style="padding:7px;border:1px solid #cbdad5">소유자·저장소</th><th style="padding:7px;border:1px solid #cbdad5">지켜야 할 불변식</th></tr>
+    <tr><td style="padding:7px;border:1px solid #cbdad5">Connector config</td><td style="padding:7px;border:1px solid #cbdad5">Connect runtime / config topic</td><td style="padding:7px;border:1px solid #cbdad5">동일 connector name의 유효 config가 cluster 전체에서 일관되게 보인다.</td></tr>
+    <tr><td style="padding:7px;border:1px solid #cbdad5">Task assignment</td><td style="padding:7px;border:1px solid #cbdad5">Worker group coordinator/runtime</td><td style="padding:7px;border:1px solid #cbdad5">한 generation에서 하나의 connector/task id는 한 active owner만 가진다.</td></tr>
+    <tr><td style="padding:7px;border:1px solid #cbdad5">Source progress</td><td style="padding:7px;border:1px solid #cbdad5">Connector가 정의한 source partition+offset / offset store</td><td style="padding:7px;border:1px solid #cbdad5">Checkpoint는 성공이 확인된 record보다 앞서가면 안 된다.</td></tr>
+    <tr><td style="padding:7px;border:1px solid #cbdad5">Sink progress</td><td style="padding:7px;border:1px solid #cbdad5">Connect consumer group offset</td><td style="padding:7px;border:1px solid #cbdad5">외부 side effect 실패 record를 넘어서 offset을 확정하지 않는다.</td></tr>
+    <tr><td style="padding:7px;border:1px solid #cbdad5">Wire format</td><td style="padding:7px;border:1px solid #cbdad5">key/value/header Converter</td><td style="padding:7px;border:1px solid #cbdad5">같은 topic bytes를 producer 쪽과 consumer 쪽 converter가 호환되게 해석한다.</td></tr>
+  </table>
+
+  <h3 style="margin:20px 0 6px;color:#236858">왜 Connector와 Task를 분리했는가</h3>
+  <p>Connector는 전체 외부 topology를 알아야 한다. 어떤 table이 생겼는지, 어떤 shard를 몇 task로 나눌지 판단한다. Task는 자기에게 주어진 작은 config만 알고 hot loop에서 I/O를 수행한다. 이 분리는 control path를 비교적 가볍게 유지하고, task만 여러 worker에 분산할 수 있게 한다.</p>
+  <p><code>tasks.max</code>는 scheduler가 무조건 채워주는 replica count가 아니다. Connector의 <code>taskConfigs(maxTasks)</code>가 반환한 config 수, source shard 수, sink Kafka partition 수가 실질 병렬성의 상한이다. 병렬성은 대략 <strong>min(tasks.max, connector가 나눌 수 있는 단위, downstream 허용 동시성)</strong>으로 생각한다.</p>
+
+  <h3 style="margin:20px 0 6px;color:#236858">Converter는 Serializer와 같은가</h3>
+  <p>둘 다 bytes 경계를 다루지만 추상화가 다르다. 일반 Kafka client의 Serializer는 application object→byte[]에 초점을 둔다. Connect Converter는 connector가 포맷별 코드를 몰라도 되도록 <strong>Connect Schema+Value↔byte[]</strong> 계약을 제공한다. Source에서는 Task 뒤, producer 앞에 있고, Sink에서는 consumer 뒤, Task 앞에 있다. 그래서 sink poison pill은 <code>SinkTask.put()</code>에 도달하기 전에 converter에서 실패할 수 있다.</p>
+
+  <h3 style="margin:20px 0 6px;color:#236858">State transition과 성공 확정</h3>
+  <p>Connector/task는 보통 UNASSIGNED→RUNNING→PAUSED/FAILED/STOPPED 같은 운영 상태를 가진다. REST config 성공, RUNNING 상태, offset 증가, destination side effect 성공은 서로 다른 사건이다. Source record의 “완료”도 외부 poll, conversion, Kafka ack, source offset flush라는 여러 관측점이 있다. SLO와 alert는 단일 RUNNING flag가 아니라 input rate·success rate·error rate·offset age·task restart·destination latency를 함께 본다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#236858">5. 실무 설계 판단</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Distributed 기본:</strong> Production shared service는 distributed mode를 기본으로 하고 config/offset/status topic을 명시적으로 생성해 replication, partition, compaction, ACL을 검토한다. Single-broker lab에서만 replication factor 1을 쓴다.</li>
+    <li><strong>Connector cluster 분리:</strong> Security principal, failure domain, plugin 충돌, blast radius, workload 특성이 다르면 worker cluster를 분리한다. 모든 connector를 한 거대 cluster에 넣지 않는다.</li>
+    <li><strong>Plugin supply chain:</strong> Plugin version, checksum, CVE, Java/Kafka compatibility를 image에 고정하고 rolling upgrade 전 canary를 둔다. Runtime에 임의 JAR를 복사하지 않는다.</li>
+    <li><strong>Capacity:</strong> Task 수만 보지 말고 task별 records/sec, batch size, poll latency, CPU, heap, GC, network, external connection quota를 측정한다. Scale-out 전에 connector가 실제로 task를 더 만들 수 있는지 확인한다.</li>
+    <li><strong>Converter ownership:</strong> Worker default와 connector override 우선순위를 문서화한다. Key와 value를 동일 converter로 가정하지 말고 schema registry endpoint·auth·subject 전략도 배포 artifact로 관리한다.</li>
+    <li><strong>Offset reset:</strong> Pause/stop, impact range, destination idempotency, replay 예상 건수, rollback plan이 없는 상태에서 offset을 임의 수정하지 않는다. Kafka 4.3의 connector offset management endpoint도 stopped 상태 제약과 connector별 의미를 확인한다.</li>
+    <li><strong>Error handling:</strong> <code>errors.tolerance=all</code>은 가용성을 높일 수 있지만 data loss처럼 보이는 silent skip을 만든다. DLQ topic ownership, retention, PII, alert, replay tool, 최종 disposition을 함께 설계한다.</li>
+    <li><strong>Exactly-once 범위:</strong> Source exactly-once 지원 여부·worker mode·connector 구현을 확인한다. Sink의 외부 시스템까지 자동 원자성이 확장된다고 단정하지 않는다.</li>
+  </ul>
+  <p><strong>Version 차이:</strong> 이 자료는 Apache Kafka 4.3.1 문서를 기준으로 한다. Connector vendor마다 offset shape, task split, retry/DLQ, transaction, plugin isolation, supported REST 동작이 다르므로 connector 문서와 실제 plugin version을 별도 고정해야 한다.</p>
+  <p><strong>Anti-pattern:</strong> RUNNING만 보고 정상 판정, <code>tasks.max</code>를 실제 task 수로 오해, source offset과 Kafka offset 혼동, worker disk에만 중요 상태 저장, config/status/offset topic 자동 생성 방치, converter 변경을 connector 변경과 분리 배포, 무한 retry로 poison pill에 전체 task를 묶어두기.</p>
+
+  <h2 style="margin:30px 0 12px;color:#236858">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:13px;word-break:break-word">
+    <tr style="background:#dff0eb"><th style="padding:6px;border:1px solid #cbdad5">증상</th><th style="padding:6px;border:1px solid #cbdad5">먼저 수집할 증거/지표</th><th style="padding:6px;border:1px solid #cbdad5">가능한 가설</th><th style="padding:6px;border:1px solid #cbdad5">안전한 첫 조치</th><th style="padding:6px;border:1px solid #cbdad5">rollback/복구</th><th style="padding:6px;border:1px solid #cbdad5">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:6px;border:1px solid #cbdad5">Connector RUNNING인데 data가 안 흐름</td><td style="padding:6px;border:1px solid #cbdad5">Task별 state/trace, task 수, source input rate, poll/produce metrics, source offset age</td><td style="padding:6px;border:1px solid #cbdad5">Task FAILED, source shard 0개, ACL, downstream quota, connector만 RUNNING</td><td style="padding:6px;border:1px solid #cbdad5">Connector와 task 상태를 분리 조회하고 최초 failing task·offset을 고정</td><td style="padding:6px;border:1px solid #cbdad5">원인 config/ACL/plugin rollback 후 failed task만 bounded restart</td><td style="padding:6px;border:1px solid #cbdad5">전체 cluster 무조건 재시작, offset 삭제</td></tr>
+    <tr><td style="padding:6px;border:1px solid #cbdad5">특정 record에서 반복 실패</td><td style="padding:6px;border:1px solid #cbdad5">Topic-partition-offset 또는 source partition+offset, converter, schema ID, exception, bytes hash</td><td style="padding:6px;border:1px solid #cbdad5">Converter mismatch, schema incompatibility, malformed bytes, SMT 오류</td><td style="padding:6px;border:1px solid #cbdad5">Input을 보존하고 영향 connector를 pause; PII-safe evidence 수집</td><td style="padding:6px;border:1px solid #cbdad5">Converter/config rollback 또는 검증된 DLQ 격리 후 idempotent replay</td><td style="padding:6px;border:1px solid #cbdad5"><code>errors.tolerance=all</code>만 켜고 알림 없이 skip</td></tr>
+    <tr><td style="padding:6px;border:1px solid #cbdad5">Worker 재시작 뒤 중복 증가</td><td style="padding:6px;border:1px solid #cbdad5">Crash 시간, Kafka ack, source offset flush, destination key, task reassignment timeline</td><td style="padding:6px;border:1px solid #cbdad5">Data 성공 후 offset commit 전 crash, sink side effect 후 group commit 전 crash</td><td style="padding:6px;border:1px solid #cbdad5">중복 범위를 failure window로 계산하고 destination side effect 제한</td><td style="padding:6px;border:1px solid #cbdad5">Idempotency key/upsert/dedup로 reconcile하고 checkpoint 정책 수정</td><td style="padding:6px;border:1px solid #cbdad5">중복을 지우려고 source offset을 미래로 점프</td></tr>
+    <tr><td style="padding:6px;border:1px solid #cbdad5">Scale-out해도 처리량 동일</td><td style="padding:6px;border:1px solid #cbdad5">실제 task count, source shard/Kafka partition, task별 rate, external quota, CPU/network</td><td style="padding:6px;border:1px solid #cbdad5">Connector가 task 하나만 생성, partition 부족, DB/API 병목</td><td style="padding:6px;border:1px solid #cbdad5">병렬성 상한과 병목 resource를 수치로 확인</td><td style="padding:6px;border:1px solid #cbdad5">Shard/partition/connector split 또는 batch·quota 조정</td><td style="padding:6px;border:1px solid #cbdad5">Worker와 <code>tasks.max</code>만 계속 증가</td></tr>
+    <tr><td style="padding:6px;border:1px solid #cbdad5">Rebalance·task restart 반복</td><td style="padding:6px;border:1px solid #cbdad5">Worker membership, GC pause, session/heartbeat, config 변경 이력, status topic</td><td style="padding:6px;border:1px solid #cbdad5">Unstable worker, OOM/GC, rolling deploy, control topic 지연</td><td style="padding:6px;border:1px solid #cbdad5">변경 중지, unstable worker 격리, membership timeline 확보</td><td style="padding:6px;border:1px solid #cbdad5">자원·plugin rollback 후 한 worker씩 복귀하고 task state 확인</td><td style="padding:6px;border:1px solid #cbdad5">동시에 전 worker 재시작, internal topic 삭제</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#236858">7. 20~40분 실습: Task 수와 source offset failure window 관찰</h2>
+  <div style="padding:14px;background:#fff2d8;border-left:5px solid #d28b22;border-radius:8px"><strong>목표:</strong> Standalone worker에서 FileStreamSourceConnector를 실행한다. <code>tasks.max=2</code>여도 file 하나는 task 하나인 점, StringConverter가 bytes 경계를 담당하는 점, offset file 삭제가 replay와 중복을 만드는 점을 관찰한다.</div>
+  <p><strong>사전 조건:</strong> 이 저장소 root, Docker Desktop, 약 30분. Production 설계가 아니라 상태 경계를 눈으로 보는 single-broker lab이다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236858">0) 실행 전 예측</h3>
+  <ol style="padding-left:22px">
+    <li><code>tasks.max=2</code>이면 file 하나를 두 task가 절반씩 읽을까?</li>
+    <li>Kafka topic에 들어간 value는 Connect 내부 String 객체인가, byte[]인가?</li>
+    <li>Source offset file을 지우고 worker를 재시작하면 이미 보낸 line은 어떻게 될까?</li>
+  </ol>
+
+  <h3 style="margin:20px 0 8px;color:#236858">1) Broker와 실습 topic 준비</h3>
+  <pre style="margin:0;padding:14px;background:#17332d;color:#edfff9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose up -d --wait
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create --if-not-exists \
+  --topic day38-connect-output --partitions 1 --replication-factor 1</pre>
+
+  <h3 style="margin:20px 0 8px;color:#236858">2) Worker·connector config 생성</h3>
+  <pre style="margin:0;padding:14px;background:#17332d;color:#edfff9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose exec -T broker bash -lc \
+  'cat &gt; /tmp/day38-worker.properties' &lt;&lt;'EOF'
+bootstrap.servers=localhost:9092
+key.converter=org.apache.kafka.connect.storage.StringConverter
+value.converter=org.apache.kafka.connect.storage.StringConverter
+offset.storage.file.filename=/tmp/day38.offsets
+offset.flush.interval.ms=3000
+plugin.path=/opt/kafka/libs/connect-file-4.3.1.jar
+plugin.discovery=only_scan
+EOF
+
+docker compose exec -T broker bash -lc \
+  'cat &gt; /tmp/day38-file-source.properties' &lt;&lt;'EOF'
+name=day38-file-source
+connector.class=org.apache.kafka.connect.file.FileStreamSourceConnector
+tasks.max=2
+file=/tmp/day38-input.txt
+topic=day38-connect-output
+EOF
+
+docker compose exec broker bash -lc \
+  'printf "order-1\n" &gt; /tmp/day38-input.txt'</pre>
+  <p><strong>예상:</strong> Worker default converter가 key/value의 Connect String을 Kafka byte[]로 바꾼다. FileStream connector는 file 하나를 안전하게 두 reader가 나눌 수 없으므로 실제 task는 하나일 가능성이 높다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236858">3) Standalone worker 실행·관찰</h3>
+  <pre style="margin:0;padding:14px;background:#17332d;color:#edfff9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose exec -d broker bash -lc \
+  'nohup /opt/kafka/bin/connect-standalone.sh \
+    /tmp/day38-worker.properties \
+    /tmp/day38-file-source.properties \
+    &gt;/tmp/day38-connect.log 2&gt;&amp;1 &amp; echo $! &gt;/tmp/day38-connect.pid'
+
+docker compose exec broker bash -lc \
+  'tail -80 /tmp/day38-connect.log'
+
+docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic day38-connect-output --from-beginning \
+  --max-messages 1 --timeout-ms 10000</pre>
+  <p><strong>예상 관찰:</strong> Log에서 connector와 task 0의 start를 찾고 consumer에서 <code>order-1</code>을 본다. <code>tasks.max=2</code>는 두 task 생성 보장이 아니다. Kafka log에는 converter가 만든 bytes가 저장되며 console consumer가 이를 문자열로 보여줄 뿐이다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236858">4) 새 data와 checkpoint 확인</h3>
+  <pre style="margin:0;padding:14px;background:#17332d;color:#edfff9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">printf 'order-2\n' | docker compose exec -T broker bash -lc \
+  'cat &gt;&gt; /tmp/day38-input.txt'
+
+docker compose exec broker bash -lc \
+  'ls -l /tmp/day38.offsets; tail -40 /tmp/day38-connect.log'
+
+docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic day38-connect-output --from-beginning \
+  --max-messages 2 --timeout-ms 10000</pre>
+  <p><strong>예상:</strong> <code>order-1</code>, <code>order-2</code>가 보이고 offset file이 생긴다. 이 file은 “Kafka offset”이 아니라 file source의 읽은 위치를 standalone worker가 저장한 source checkpoint다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236858">5) 실패 주입: source offset 유실</h3>
+  <pre style="margin:0;padding:14px;background:#17332d;color:#edfff9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose exec broker bash -lc \
+  'kill "$(cat /tmp/day38-connect.pid)" || true'
+
+docker compose exec broker bash -lc \
+  'rm -f /tmp/day38.offsets'
+
+docker compose exec -d broker bash -lc \
+  'nohup /opt/kafka/bin/connect-standalone.sh \
+    /tmp/day38-worker.properties \
+    /tmp/day38-file-source.properties \
+    &gt;/tmp/day38-connect.log 2&gt;&amp;1 &amp; echo $! &gt;/tmp/day38-connect.pid'
+
+docker compose exec broker /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic day38-connect-output --from-beginning \
+  --max-messages 4 --timeout-ms 15000</pre>
+  <p><strong>예상:</strong> 기존 두 line이 replay되어 최대 네 record가 보인다. Offset state를 잃으면 source는 과거 위치를 모른다. 이것이 destination에 idempotency와 replay runbook이 필요한 이유다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#236858">6) 자주 나는 오류와 해결</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:38%;padding:8px;border:1px solid #cbdad5">Connector class not found</td><td style="padding:8px;border:1px solid #cbdad5"><code>/opt/kafka/libs/connect-file-4.3.1.jar</code>의 존재와 image version을 확인한다. 이 image의 file connector는 <code>service_load</code>만으로 발견되지 않아 실습은 <code>only_scan</code>을 쓴다. 임의 JAR를 production에 내려받지 않는다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdad5"><code>bootstrap.checkpoint.tmp</code> AccessDenied</td><td style="padding:8px;border:1px solid #cbdad5">Fresh volume UID 문제다. <code>docker run --rm --user 0 --entrypoint sh -v kafka-learning_kafka-data:/data apache/kafka:4.3.1 -c 'chown -R 1000:1000 /data'</code> 실행 후 <code>docker compose up -d --wait</code>를 다시 실행한다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdad5">Topic에 record가 없음</td><td style="padding:8px;border:1px solid #cbdad5">Task FAILED trace, input file path가 container 내부인지, topic ACL/존재, converter class를 차례로 본다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdad5">두 task가 안 생김</td><td style="padding:8px;border:1px solid #cbdad5">정상일 수 있다. <code>tasks.max</code>는 상한이고 단일 file connector가 생성할 수 있는 task config는 하나다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #cbdad5">Offset 삭제 후 4개 미만</td><td style="padding:8px;border:1px solid #cbdad5">Worker가 완전히 종료·재시작됐는지, consumer timeout 전 replay됐는지 log와 topic end offset으로 확인한다.</td></tr>
+  </table>
+
+  <h3 style="margin:20px 0 8px;color:#236858">7) Cleanup</h3>
+  <pre style="margin:0;padding:14px;background:#17332d;color:#edfff9;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">docker compose exec broker bash -lc \
+  'kill "$(cat /tmp/day38-connect.pid)" 2&gt;/dev/null || true; \
+   rm -f /tmp/day38-worker.properties \
+         /tmp/day38-file-source.properties \
+         /tmp/day38-input.txt /tmp/day38.offsets \
+         /tmp/day38-connect.log /tmp/day38-connect.pid'
+
+docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --delete --topic day38-connect-output
+docker compose down</pre>
+
+  <h2 style="margin:30px 0 12px;color:#236858">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Connector RUNNING ≠ Task RUNNING:</strong> connector control instance와 data-moving task 상태를 따로 본다.</li>
+    <li><strong><code>tasks.max</code> ≠ task count:</strong> connector가 분할 가능한 source unit보다 늘어날 수 없다.</li>
+    <li><strong>Source offset ≠ Kafka offset:</strong> source offset은 외부 위치이고, sink 쪽 Kafka offset은 consumer group progress다.</li>
+    <li><strong>Converter 위치:</strong> SourceTask는 Connect data를 내고 converter 뒤에 Kafka bytes가 생긴다. Sink에서는 converter 실패 시 SinkTask가 record를 보지도 못한다.</li>
+    <li><strong>Worker default 숨김:</strong> Connector config에 converter가 없어도 worker default가 작동한다. Cluster migration 때 default 차이가 사고를 만든다.</li>
+    <li><strong>Offset은 backup이 아님:</strong> Compact topic도 잘못된 tombstone·ACL·retention·cluster loss에서 보호하려면 DR와 복구 절차가 필요하다.</li>
+    <li><strong>DLQ 만능론:</strong> Serialization/converter 단계, connector 자체 오류, source connector에는 동일한 DLQ 의미가 적용되지 않을 수 있다.</li>
+    <li><strong>무한 retry:</strong> 한 poison pill이 task thread와 partition progress를 영구 정지시킬 수 있다.</li>
+    <li><strong>외부 side effect:</strong> Kafka offset commit과 DB/API write가 자동 원자적이라고 가정하지 않는다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#236858">9. 대기업 기술 면접 질문</h2>
+  <h3 style="margin:18px 0 6px;color:#236858">Q1. Worker 3대, <code>tasks.max=20</code>인데 task가 4개뿐이다. 왜이며 어떻게 확장할까?</h3>
+  <p><strong>좋은 답변 구조:</strong> Worker·Connector·Task 정의 → <code>tasks.max</code>는 상한이라는 불변식 → source shard/Kafka partition/connector taskConfigs 확인 → task별 throughput·외부 quota 수치화 → shard/partition/connector split과 worker scale의 순서 → rebalance·connection 비용까지 방어한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#236858">Q2. Source connector가 crash 후 일부 record를 중복 발행했다. 정확히 어떤 window인가?</h3>
+  <p><strong>좋은 답변 구조:</strong> Source partition+offset 정의 → poll→convert→produce ack→offset flush 순서 → ack 후 flush 전 crash라는 가설 → connector logs·producer metrics·offset topic evidence → idempotent destination/reconciliation → exactly-once 지원 범위와 대안까지 설명한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#236858">Q3. Converter를 JSON에서 Avro로 바꾸는 무중단 migration을 설계하라.</h3>
+  <p><strong>좋은 답변 구조:</strong> Topic의 기존 bytes와 consumer fleet inventory → worker default vs connector override → mixed-format 허용 여부와 schema registry dependency → 새 topic dual-publish 또는 tolerant reader-first 전환 → canary·lag·DLQ → rollback과 replay 기간 → key converter가 partition routing에 미치는 영향까지 답한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#236858">10. 복습과 정답</h2>
+  <h3 style="margin:18px 0 6px;color:#236858">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px">
+    <li>Backward compatibility를 writer/reader 방향으로 말하라.</li>
+    <li>Latest-only compatibility가 오래된 replay를 보장하지 못하는 이유는?</li>
+    <li>Schema syntax는 같지만 semantic breaking change가 되는 예를 하나 들어라.</li>
+  </ol>
+  <div style="padding:14px;background:#eef6f3;border-radius:8px"><strong>어제 정답/채점:</strong> ① 새 reader가 old writer data를 읽음(2점). ② 후보를 직전 version과만 검사해 더 오래된 writer schema와의 gap을 놓칠 수 있음(3점). ③ type은 같지만 통화 단위·timezone·enum 의미를 바꾸는 예(2점).</div>
+
+  <h3 style="margin:22px 0 6px;color:#236858">오늘 확인 문제 3개</h3>
+  <ol style="padding-left:22px">
+    <li>Connector와 Task의 책임을 한 문장씩 구분하라.</li>
+    <li>Source offset과 sink의 Kafka consumer offset은 각각 무엇을 가리키는가?</li>
+    <li>SinkTask가 DB write 후 offset commit 전에 죽으면 어떤 결과와 대응이 필요한가?</li>
+  </ol>
+  <div style="padding:14px;background:#eef6f3;border-radius:8px"><strong>오늘 정답/채점:</strong> ① Connector는 작업 분할·재구성, Task는 실제 data I/O(3점). ② Source offset은 외부 source 위치, sink offset은 Kafka topic progress(3점). ③ Replay로 중복 side effect 가능; idempotency key/upsert/dedup과 reconciliation 필요(3점). 총 9점 중 7점 이상이면 통과.</div>
+
+  <h2 style="margin:30px 0 12px;color:#236858">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/kafka-connect/overview/" style="color:#236858">Apache Kafka 4.3.1 Connect Overview</a> — standalone/distributed, REST, automatic offset management, worker scale-out 개요</li>
+    <li><a href="https://kafka.apache.org/43/kafka-connect/user-guide/" style="color:#236858">Apache Kafka 4.3.1 Connect User Guide</a> — connector config, <code>tasks.max</code>, converter override, REST·offset 운영</li>
+    <li><a href="https://kafka.apache.org/43/configuration/kafka-connect-configs/" style="color:#236858">Apache Kafka 4.3.1 Connect Configs</a> — config/offset/status topic, converter, offset flush, error handling 설정</li>
+    <li><a href="https://kafka.apache.org/43/javadoc/org/apache/kafka/connect/storage/Converter.html" style="color:#236858">Apache Kafka 4.3.1 Converter API</a> — Connect Schema+Value와 byte[]의 양방향 계약</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#236858">12. 내일 예고</h2>
+  <div style="padding:16px;background:#e8f4f0;border-left:5px solid #2b7a68;border-radius:8px"><strong>Day 39 · CDC ordering, snapshot, tombstone</strong><br>
+  DB snapshot과 transaction log가 만나는 경계, table별·key별 ordering, delete tombstone, schema history와 offset이 crash 후 일관성을 어떻게 복구하는지 학습한다.</div>
+</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>

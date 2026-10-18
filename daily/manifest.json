@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-10-16T09:10:39+09:00",
+  "updatedAt": "2026-10-18T09:17:34+09:00",
   "lessons": [
     {
       "day": 1,
@@ -338,6 +338,15 @@
       "path": "day-37.html",
       "kind": "lesson",
       "publishedAt": "2026-10-16T09:10:39+09:00"
+    },
+    {
+      "day": 38,
+      "week": 6,
+      "title": "Kafka Connect worker·task·offset·converter",
+      "summary": "Connector·Task·Worker·Converter의 책임과 source/sink offset 경계를 따라가며 scale-out, 중복 failure window, poison pill과 실무 복구를 설계합니다.",
+      "path": "day-38.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-18T09:17:34+09:00"
     }
   ]
 }
