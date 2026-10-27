@@ -4,7 +4,7 @@
   "tagline": "분산 로그에서 운영·장애 대응·설계 면접까지",
   "accent": "#7c9cff",
   "totalDays": 63,
-  "updatedAt": "2026-10-18T09:17:34+09:00",
+  "updatedAt": "2026-10-28T01:28:06+09:00",
   "lessons": [
     {
       "day": 1,
@@ -347,6 +347,15 @@
       "path": "day-38.html",
       "kind": "lesson",
       "publishedAt": "2026-10-18T09:17:34+09:00"
+    },
+    {
+      "day": 39,
+      "week": 6,
+      "title": "CDC ordering, snapshot, tombstone",
+      "summary": "DB transaction log와 snapshot 기준점을 gap 없이 연결하고 key별 ordering·multi-partition transaction·delete envelope·tombstone의 책임을 실무 복구까지 분석합니다.",
+      "path": "day-39.html",
+      "kind": "lesson",
+      "publishedAt": "2026-10-28T01:28:06+09:00"
     }
   ]
 }

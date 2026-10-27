@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kafka Day 39 · CDC ordering, snapshot, tombstone</title>
+</head>
+<body style="margin:0;background:#f5f0ea;color:#332b26;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px;line-height:1.72">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;background:#f5f0ea"><tr><td align="center" style="padding:24px 10px">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:680px;table-layout:fixed;word-break:break-word;overflow-wrap:anywhere;background:#fff;border:1px solid #dfd1c2;border-radius:20px">
+<tr><td style="padding:34px 30px;background:#593a2b;color:#fff;border-radius:20px 20px 0 0">
+  <div style="color:#efd1bd;font-size:12px;font-weight:800;letter-spacing:1.4px">APACHE KAFKA 4.3 · WEEK 6 / DAY 39 · CDC CONSISTENCY</div>
+  <h1 style="margin:10px 0 8px;font-size:28px;line-height:1.28">CDC ordering, snapshot, tombstone</h1>
+  <p style="margin:0;color:#f8e9df">DB의 현재 상태와 변경 로그를 손실 없이 이어 붙이는 법 · 이론 80분 + 실습 30분</p>
+</td></tr>
+<tr><td style="padding:30px">
+  <div style="padding:18px;background:#f8eee6;border-left:5px solid #a4603d;border-radius:10px"><strong>한 줄 요약</strong><br>
+  CDC의 정확성은 “변경 event를 보냈다”가 아니라 snapshot 기준점과 transaction log 위치를 일관되게 연결하고, 같은 business key는 같은 Kafka partition으로 보내며, delete event와 null tombstone의 서로 다른 책임을 끝까지 지키는 데서 나온다.</div>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">1. 선수 용어 사전</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:31%;padding:9px;border:1px solid #dfd1c2"><strong>CDC</strong></td><td style="padding:9px;border:1px solid #dfd1c2">Change Data Capture. Application이 DB를 다시 polling하지 않고 transaction log를 읽어 INSERT·UPDATE·DELETE 변화를 event로 만드는 방식이다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd1c2"><strong>Transaction log</strong></td><td style="padding:9px;border:1px solid #dfd1c2">DB가 복구·복제를 위해 쓰는 변경 기록. MySQL은 binlog, PostgreSQL은 WAL이라 부른다. Log의 위치가 CDC source offset이 된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd1c2"><strong>Log position</strong></td><td style="padding:9px;border:1px solid #dfd1c2">변경 로그에서 읽은 지점. Binlog file+position, GTID, LSN처럼 engine마다 표현이 다르며 단순 timestamp가 아니다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd1c2"><strong>Snapshot</strong></td><td style="padding:9px;border:1px solid #dfd1c2">CDC 시작 시 이미 DB에 존재하는 row를 기준 상태로 읽는 과정. 이후 log streaming과 이어져야 누락 없는 전체 상태가 된다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd1c2"><strong>Consistent snapshot</strong></td><td style="padding:9px;border:1px solid #dfd1c2">Snapshot의 모든 row가 하나의 논리 시점에서 읽힌 것처럼 보이는 상태. 격리 수준·lock·MVCC에 의해 만든다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd1c2"><strong>MVCC</strong></td><td style="padding:9px;border:1px solid #dfd1c2">Multi-Version Concurrency Control. Reader가 writer를 오래 막지 않고 특정 transaction 시점의 version을 읽게 하는 DB 기법이다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd1c2"><strong>Envelope</strong></td><td style="padding:9px;border:1px solid #dfd1c2">변경 event의 포장 구조. 보통 before, after, op, source position, transaction metadata를 담는다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd1c2"><strong>Tombstone</strong></td><td style="padding:9px;border:1px solid #dfd1c2">Key는 있고 value가 null인 Kafka record. Compacted topic에서 그 key의 과거 value를 제거해도 된다는 표식이다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd1c2"><strong>Log compaction</strong></td><td style="padding:9px;border:1px solid #dfd1c2">Partition 안에서 key별 최신 value를 남기도록 오래된 record를 background cleaner가 정리하는 정책. 즉시 실행되는 delete가 아니다.</td></tr>
+    <tr><td style="padding:9px;border:1px solid #dfd1c2"><strong>Projection</strong></td><td style="padding:9px;border:1px solid #dfd1c2">CDC event를 적용해 만든 검색 index·cache·warehouse table 같은 읽기 모델. Replay 시 동일한 최종 상태가 되어야 한다.</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">2. 왜 중요한가</h2>
+  <p>CDC는 DB의 현재 row를 Kafka로 복사하는 작업이 아니다. <strong>기준 상태(snapshot) + 기준점 이후의 모든 변화(log)</strong>를 합치는 작업이다. 기준점을 잘못 잡으면 snapshot 중 수정된 row가 빠지거나, 오래된 snapshot row가 더 최신 update를 덮어쓴다.</p>
+  <p>Ordering도 범위를 붙여 말해야 한다. DB binlog가 commit 순서를 기록해도 Kafka topic이 여러 partition이면 전체 event의 단일 순서는 없다. 동일 primary key를 같은 partition에 보내면 그 key에 대한 순서는 지킬 수 있지만, 한 DB transaction이 여러 key를 바꾸면 consumer는 여러 partition에서 서로 다른 시간에 볼 수 있다.</p>
+  <p>삭제는 더 까다롭다. Delete envelope는 consumer에게 before 값과 삭제 이유를 알려준다. Tombstone은 compacted log cleaner에게 그 key의 최종 value도 없애라고 알린다. 하나를 다른 하나로 대체하면 audit·sink delete·state 복구 중 하나가 깨질 수 있다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">3. 아키텍처 그림과 요청 흐름</h2>
+  <h3 style="margin:18px 0 8px;color:#8b4f31">3-1. Initial snapshot에서 streaming으로 넘어가는 control/data path</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#f5e4d8"><th style="padding:8px;border:1px solid #dfd1c2">Source DB</th><th style="padding:8px;border:1px solid #dfd1c2">CDC Connector</th><th style="padding:8px;border:1px solid #dfd1c2">Kafka</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd1c2"><strong>① Snapshot transaction</strong><br>일관된 view 시작</td><td style="padding:8px;border:1px solid #dfd1c2">Capture 대상·schema 확인</td><td style="padding:8px;border:1px solid #dfd1c2">Schema history·connector offset 준비</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#a4603d">↓ 짧은 lock 또는 MVCC 경계에서 log position L0 획득</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd1c2"><strong>② Row scan @ L0</strong><br>A, B, C의 과거 view</td><td style="padding:8px;border:1px solid #dfd1c2"><code>op=read</code> snapshot event 생성</td><td style="padding:8px;border:1px solid #dfd1c2">Key별 topic partition에 append</td></tr>
+    <tr><td colspan="3" align="center" style="padding:5px;color:#a4603d">↓ 동시에 DB write는 L0 뒤 transaction log에 계속 쌓임</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd1c2"><strong>③ COMMIT L1, L2…</strong><br>update/delete</td><td style="padding:8px;border:1px solid #dfd1c2">Snapshot 완료를 offset에 기록하고 L0 이후 log 재생</td><td style="padding:8px;border:1px solid #dfd1c2">Update/delete/tombstone append</td></tr>
+  </table>
+  <ol style="padding-left:22px">
+    <li><strong>시작:</strong> Connector는 현재 schema와 transaction log 기준점 L0를 함께 잡는다. Row만 읽고 log 위치를 나중에 얻으면 그 사이 변화가 사라진다.</li>
+    <li><strong>Snapshot scan:</strong> L0의 consistent view에서 row를 읽어 <code>read</code> event로 보낸다. MySQL Debezium initial snapshot에서는 이 read event들이 획득한 같은 binlog position을 가진다.</li>
+    <li><strong>Concurrent write:</strong> Snapshot이 오래 걸려도 DB 변경은 L0 이후 log에 남는다. Connector는 snapshot row와 streaming event가 충돌할 때 최신 변화가 최종 승자가 되도록 경계를 관리해야 한다.</li>
+    <li><strong>완료 확정:</strong> 모든 snapshot row를 안전하게 보낸 뒤에야 snapshot 완료를 connector offset에 기록한다. 중간 crash 시 connector 구현에 따라 snapshot을 다시 시작하거나 chunk checkpoint에서 재개한다.</li>
+    <li><strong>Streaming:</strong> L0 이후 log를 읽는다. Kafka produce 성공과 connector source offset commit 사이 crash는 중복을 만들 수 있으므로 downstream은 idempotent해야 한다.</li>
+  </ol>
+
+  <h3 style="margin:22px 0 8px;color:#8b4f31">3-2. Ordering의 범위</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr><td style="padding:10px;border:1px solid #dfd1c2;background:#fbf4ef"><strong>DB transaction T9</strong><br>A update<br>B update<br><small>하나의 commit</small></td><td align="center" style="width:8%;color:#a4603d">→</td><td style="padding:10px;border:1px solid #dfd1c2;background:#fbf4ef"><strong>CDC Task</strong><br>source position·tx metadata<br><small>event 2개</small></td><td align="center" style="width:8%;color:#a4603d">→</td><td style="padding:10px;border:1px solid #dfd1c2;background:#fbf4ef"><strong>Kafka</strong><br>A→P2, B→P1<br><small>partition별 offset</small></td></tr>
+  </table>
+  <p><strong>보장 가능한 것:</strong> 같은 key가 항상 같은 partition으로 가고 producer 순서가 유지되면 A의 update들은 partition-local order를 가진다. <strong>자동 보장되지 않는 것:</strong> T9의 A와 B가 여러 partition에서 consumer에게 동시에 보이는 global atomicity. Transaction boundary metadata나 별도 aggregation, Kafka transaction, downstream transaction 설계가 필요할 수 있다.</p>
+
+  <h3 style="margin:22px 0 8px;color:#8b4f31">3-3. Delete event와 tombstone</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#f5e4d8"><th style="padding:8px;border:1px solid #dfd1c2">Record</th><th style="padding:8px;border:1px solid #dfd1c2">Key</th><th style="padding:8px;border:1px solid #dfd1c2">Value</th><th style="padding:8px;border:1px solid #dfd1c2">책임</th></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd1c2">① Delete envelope</td><td style="padding:8px;border:1px solid #dfd1c2">customer-7</td><td style="padding:8px;border:1px solid #dfd1c2"><code>{op:d,before:…}</code></td><td style="padding:8px;border:1px solid #dfd1c2">Consumer에게 업무 삭제 event와 metadata 전달</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd1c2">② Tombstone</td><td style="padding:8px;border:1px solid #dfd1c2">customer-7</td><td style="padding:8px;border:1px solid #dfd1c2"><code>null</code></td><td style="padding:8px;border:1px solid #dfd1c2">Compactor가 key의 과거 value를 제거할 수 있게 함</td></tr>
+    <tr><td colspan="4" align="center" style="padding:7px;color:#a4603d">↓ cleaner가 eligible segment를 나중에 처리 — 즉시 물리 삭제 아님</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">4. CS 내부 동작</h2>
+  <h3 style="margin:18px 0 6px;color:#8b4f31">상태 소유자와 불변식</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:14px;word-break:break-word">
+    <tr style="background:#f5e4d8"><th style="padding:7px;border:1px solid #dfd1c2">상태</th><th style="padding:7px;border:1px solid #dfd1c2">소유자</th><th style="padding:7px;border:1px solid #dfd1c2">불변식</th></tr>
+    <tr><td style="padding:7px;border:1px solid #dfd1c2">Committed row order</td><td style="padding:7px;border:1px solid #dfd1c2">DB transaction log</td><td style="padding:7px;border:1px solid #dfd1c2">Rollback된 변화는 최종 stream state를 바꾸면 안 된다.</td></tr>
+    <tr><td style="padding:7px;border:1px solid #dfd1c2">Snapshot view</td><td style="padding:7px;border:1px solid #dfd1c2">DB isolation/MVCC + connector</td><td style="padding:7px;border:1px solid #dfd1c2">모든 snapshot row는 정의된 기준점과 모순되지 않는다.</td></tr>
+    <tr><td style="padding:7px;border:1px solid #dfd1c2">Source progress</td><td style="padding:7px;border:1px solid #dfd1c2">Connector offset</td><td style="padding:7px;border:1px solid #dfd1c2">Kafka에 성공하지 않은 log position을 완료로 앞당기지 않는다.</td></tr>
+    <tr><td style="padding:7px;border:1px solid #dfd1c2">Schema-at-position</td><td style="padding:7px;border:1px solid #dfd1c2">DB log + schema history</td><td style="padding:7px;border:1px solid #dfd1c2">각 row event는 그 log 위치에서 유효한 table schema로 decode한다.</td></tr>
+    <tr><td style="padding:7px;border:1px solid #dfd1c2">Key order</td><td style="padding:7px;border:1px solid #dfd1c2">Partitioner + Kafka partition log</td><td style="padding:7px;border:1px solid #dfd1c2">같은 logical key의 event는 동일 partition에서 offset 순으로 관찰된다.</td></tr>
+    <tr><td style="padding:7px;border:1px solid #dfd1c2">Materialized state</td><td style="padding:7px;border:1px solid #dfd1c2">Consumer/projection</td><td style="padding:7px;border:1px solid #dfd1c2">Replay와 live 처리의 최종 state가 같고 중복 적용이 안전하다.</td></tr>
+  </table>
+
+  <h3 style="margin:20px 0 6px;color:#8b4f31">Snapshot race를 집합으로 보기</h3>
+  <p>Snapshot 기준점 L0 이전에 commit된 row 집합을 S, L0 이후 log event 집합을 Δ라 하자. 목표 상태는 <strong>apply(S, Δ)</strong>다. 단순 arrival order로 적용하면 Δ의 update가 먼저 도착한 뒤 S의 오래된 row가 도착해 최신 값을 덮을 수 있다. 따라서 connector가 stream event를 buffer/deduplicate하거나 consumer가 source position과 snapshot flag를 이해해야 한다.</p>
+  <p>Incremental snapshot은 table을 primary key chunk로 나눠 streaming과 병행할 수 있다. Debezium은 snapshot window 동안 buffered READ key와 incoming streamed event key를 비교한다. 이 동작은 connector별 구현 세부이므로 “모든 CDC engine이 같은 방식”이라고 일반화하지 않는다.</p>
+
+  <h3 style="margin:20px 0 6px;color:#8b4f31">Ordering은 partial order다</h3>
+  <p>분산 pipeline에는 하나의 wall-clock total order보다 여러 순서가 있다. DB commit order, source log position order, Kafka partition offset order, consumer processing completion order가 서로 다르다. 같은 key에서는 partition order로 state transition을 직렬화할 수 있지만, 여러 key의 causal relation을 보존하려면 transaction ID·event sequence·aggregate version 같은 metadata가 필요하다.</p>
+
+  <h3 style="margin:20px 0 6px;color:#8b4f31">Compaction의 정확한 의미</h3>
+  <p><code>cleanup.policy=compact</code>는 key별 최신 value를 보존하도록 오래된 segment를 background에서 정리한다. Consumer는 cleaner 전에는 여러 version과 tombstone을 모두 볼 수 있다. Tombstone도 <code>delete.retention.ms</code> 이후 제거될 수 있으므로 offset 0부터 full scan하는 consumer가 그 시간 안에 head에 도달하지 못하면 삭제 표식을 놓칠 수 있다.</p>
+  <p><code>compact,delete</code>를 함께 쓰면 key별 최신값이라도 time/size retention 조건으로 segment가 삭제될 수 있다. “Compacted topic이면 최신 state가 영원히 보존된다”는 문장은 이 조합에서는 틀릴 수 있다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">5. 실무 설계 판단</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Ordering SLO를 문장으로:</strong> “한 customer_id의 event는 순서 보장”인지 “한 DB transaction의 모든 row가 원자적으로 보임”인지 구분한다. 후자는 훨씬 비싸다.</li>
+    <li><strong>Primary key를 Kafka key로:</strong> Keyless event나 random key는 같은 row가 여러 partition으로 흩어져 compaction·ordering·upsert가 깨진다. Primary key 변경은 old key delete+tombstone+new key create로 볼 수 있다.</li>
+    <li><strong>Snapshot 전 capacity:</strong> Table row 수·평균 row bytes·DB read IOPS·Kafka throughput·예상 시간·binlog retention을 계산한다. Snapshot 동안 log가 purge되면 streaming 기준점을 잃을 수 있다.</li>
+    <li><strong>Offset와 schema history 보호:</strong> Connector offset만 backup하고 schema history를 잃으면 과거 log를 올바른 schema로 decode하지 못할 수 있다. DR에 둘을 함께 넣는다.</li>
+    <li><strong>Downstream idempotency:</strong> Primary key+source position 또는 event ID로 dedup하고, upsert 시 aggregate version/position이 뒤로 가지 않게 compare-and-set한다.</li>
+    <li><strong>Tombstone retention:</strong> 가장 느린 full-rebuild consumer가 offset 0부터 head까지 도달하는 p99 시간보다 <code>delete.retention.ms</code>를 충분히 크게 잡고 alert한다.</li>
+    <li><strong>Schema evolution:</strong> DDL rollout, schema history, connector parsing, converter/registry compatibility, downstream migration 순서를 하나의 change plan으로 관리한다.</li>
+    <li><strong>PII와 before image:</strong> CDC envelope는 삭제된 row의 before 값까지 보존할 수 있다. Topic ACL·retention·masking·right-to-erasure 범위를 함께 설계한다.</li>
+  </ul>
+  <p><strong>Engine/version 차이:</strong> MySQL binlog, PostgreSQL WAL, SQL Server transaction log는 position·transaction metadata·lock·snapshot semantics가 다르다. 여기서는 Debezium 3.7 MySQL connector의 initial/incremental snapshot과 tombstone 설명을 구체 예로 사용한다. 다른 connector에 설정명과 재개 semantics를 그대로 복사하지 않는다.</p>
+  <p><strong>Anti-pattern:</strong> Event timestamp로 commit order 추정, partition을 늘리면서 key ordering 영향 미검토, snapshot 완료 전에 downstream cutover, binlog retention보다 긴 outage 허용, tombstone을 “빈 JSON”으로 대체, compaction을 즉시 삭제로 오해, offset을 미래로 강제 이동해 gap 숨기기.</p>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">6. 장애 대응 표</h2>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:13px;word-break:break-word">
+    <tr style="background:#f5e4d8"><th style="padding:6px;border:1px solid #dfd1c2">증상</th><th style="padding:6px;border:1px solid #dfd1c2">먼저 수집할 증거/지표</th><th style="padding:6px;border:1px solid #dfd1c2">가능한 가설</th><th style="padding:6px;border:1px solid #dfd1c2">안전한 첫 조치</th><th style="padding:6px;border:1px solid #dfd1c2">rollback/복구</th><th style="padding:6px;border:1px solid #dfd1c2">하지 말아야 할 조치</th></tr>
+    <tr><td style="padding:6px;border:1px solid #dfd1c2">Snapshot 후 일부 row가 옛 값</td><td style="padding:6px;border:1px solid #dfd1c2">Key별 snapshot flag, source position, Kafka partition/offset, DB audit, arrival order</td><td style="padding:6px;border:1px solid #dfd1c2">Live update 뒤 stale snapshot 적용, 잘못된 merge rule</td><td style="padding:6px;border:1px solid #dfd1c2">영향 key 범위를 고정하고 downstream write를 제한</td><td style="padding:6px;border:1px solid #dfd1c2">Position-aware replay 또는 검증된 resnapshot 후 reconcile</td><td style="padding:6px;border:1px solid #dfd1c2">Timestamp만 비교, offset 무작정 reset</td></tr>
+    <tr><td style="padding:6px;border:1px solid #dfd1c2">Connector가 log position 없음으로 실패</td><td style="padding:6px;border:1px solid #dfd1c2">Stored source offset, DB 보유 log/GTID, outage 시간, purge 설정</td><td style="padding:6px;border:1px solid #dfd1c2">Binlog/WAL retention보다 오래 중단되어 기준점 purge</td><td style="padding:6px;border:1px solid #dfd1c2">Connector 정지 유지, source backup·replica에 위치가 남았는지 확인</td><td style="padding:6px;border:1px solid #dfd1c2">승인된 resnapshot+reconciliation 또는 복구 log에서 재개</td><td style="padding:6px;border:1px solid #dfd1c2">임의 최신 위치로 점프해 gap 은폐</td></tr>
+    <tr><td style="padding:6px;border:1px solid #dfd1c2">삭제 row가 sink에서 부활</td><td style="padding:6px;border:1px solid #dfd1c2">Delete envelope·tombstone 존재, key bytes, compaction config, sink delete mode</td><td style="padding:6px;border:1px solid #dfd1c2">Tombstone drop, stale snapshot replay, key 변경, null 미지원 sink</td><td style="padding:6px;border:1px solid #dfd1c2">해당 key event chain을 원본 offset 순으로 보존·추적</td><td style="padding:6px;border:1px solid #dfd1c2">올바른 key로 delete/tombstone 재발행하고 projection rebuild</td><td style="padding:6px;border:1px solid #dfd1c2">Sink row만 수동 삭제하고 pipeline 원인 방치</td></tr>
+    <tr><td style="padding:6px;border:1px solid #dfd1c2">같은 DB transaction이 부분 반영</td><td style="padding:6px;border:1px solid #dfd1c2">Transaction ID/total_order, key별 partition/offset, consumer lag·commit</td><td style="padding:6px;border:1px solid #dfd1c2">여러 partition 비동기 소비, consumer 일부 실패</td><td style="padding:6px;border:1px solid #dfd1c2">Transaction scope와 누락 key를 식별하고 side effect 중지</td><td style="padding:6px;border:1px solid #dfd1c2">Tx buffer/aggregation 또는 idempotent replay로 완결</td><td style="padding:6px;border:1px solid #dfd1c2">Kafka 전체 순서가 있다고 가정</td></tr>
+    <tr><td style="padding:6px;border:1px solid #dfd1c2">Compacted rebuild에서 삭제 key 재등장</td><td style="padding:6px;border:1px solid #dfd1c2"><code>delete.retention.ms</code>, rebuild 소요, consumer 시작·head 시간, tombstone offset</td><td style="padding:6px;border:1px solid #dfd1c2">Consumer가 tombstone retention 내 head 도달 실패</td><td style="padding:6px;border:1px solid #dfd1c2">Rebuild 중지, authoritative DB와 diff 계산</td><td style="padding:6px;border:1px solid #dfd1c2">Retention 확대 후 새 baseline/snapshot으로 재구축</td><td style="padding:6px;border:1px solid #dfd1c2">Compaction을 synchronous delete로 간주</td></tr>
+  </table>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">7. 20~40분 실습: snapshot race·partition order·tombstone 모델</h2>
+  <div style="padding:14px;background:#fff3d8;border-left:5px solid #d28b22;border-radius:8px"><strong>목표:</strong> Python 표준 라이브러리만으로 stale snapshot overwrite, key별 partition order, delete envelope와 tombstone의 차이를 재현한다. 실제 Debezium 구현을 흉내 내는 것이 아니라 불변식을 검증하는 작은 모델이다.</div>
+  <p><strong>사전 조건:</strong> 저장소 root와 Python 3. Kafka·DB 실행은 필요 없다. 약 30분.</p>
+
+  <h3 style="margin:20px 0 8px;color:#8b4f31">0) 실행 전 예측</h3>
+  <ol style="padding-left:22px">
+    <li>A의 live update가 먼저 도착하고 옛 snapshot A가 나중에 도착하면 단순 upsert의 최종 값은?</li>
+    <li>한 DB transaction이 A와 B를 바꾸면 key partitioning 후 두 event가 같은 Kafka partition에 있을까?</li>
+    <li>Delete envelope만 있고 null tombstone이 없으면 compacted log에서 그 key는 완전히 사라질까?</li>
+  </ol>
+
+  <h3 style="margin:20px 0 8px;color:#8b4f31">1) 모델 실행</h3>
+  <pre style="margin:0;padding:14px;background:#36251e;color:#fff5ee;border-radius:8px;white-space:pre-wrap;word-break:break-all;font-size:13px">python3 - &lt;&lt;'PY'
+from zlib import crc32
+
+snapshot = [
+    {"key":"A","kind":"snapshot","pos":100,"value":"new"},
+    {"key":"B","kind":"snapshot","pos":100,"value":"open"},
+]
+stream = [
+    {"key":"A","kind":"update","pos":101,"value":"paid"},
+    {"key":"B","kind":"delete","pos":102,"value":None},
+]
+
+def apply(events):
+    state={}
+    for e in events:
+        if e["value"] is None:
+            state.pop(e["key"],None)
+        else:
+            state[e["key"]]=e["value"]
+    return state
+
+bad_arrival=[stream[0],snapshot[0],snapshot[1],stream[1]]
+naive=apply(bad_arrival)
+correct=apply(snapshot+sorted(stream,key=lambda e:e["pos"]))
+print("NAIVE arrival-order =",naive)
+print("POSITION-AWARE     =",correct)
+assert naive["A"]=="new" and correct["A"]=="paid"
+
+partition=lambda key: crc32(key.encode())%3
+print("TX T9 partitions   =",
+      {"A":partition("A"),"B":partition("B")})
+assert partition("A") != partition("B")
+
+delete_envelope={"op":"d","before":{"id":"B","status":"open"}}
+with_tombstone=[("B",{"op":"c"}),("B",delete_envelope),("B",None)]
+without_tombstone=with_tombstone[:-1]
+
+def compact(log):
+    latest={}
+    for key,value in log:
+        latest[key]=value
+    return {k:v for k,v in latest.items() if v is not None}
+
+print("COMPACT with null  =",compact(with_tombstone))
+print("COMPACT no null    =",compact(without_tombstone))
+assert "B" not in compact(with_tombstone)
+assert compact(without_tombstone)["B"]["op"]=="d"
+print("ALL ASSERTIONS PASSED")
+PY</pre>
+
+  <h3 style="margin:20px 0 8px;color:#8b4f31">2) 예상 관찰과 해석</h3>
+  <p><strong>Snapshot race:</strong> Arrival-order upsert는 A를 <code>new</code>로 되돌리지만, 기준 snapshot을 먼저 적용하고 L0 이후 source position 순서로 stream을 적용하면 <code>paid</code>가 된다.</p>
+  <p><strong>Partition:</strong> 예제 hash에서 A와 B는 서로 다른 partition이다. 같은 DB transaction이라는 사실만으로 Kafka consumer가 두 key를 동시에 보지는 않는다.</p>
+  <p><strong>Tombstone:</strong> Null이 있으면 compacted final map에서 B가 사라진다. Delete envelope만 있으면 B의 최신 value는 “op=d인 일반 record”이므로 compactor는 그것을 남긴다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#8b4f31">3) 실패 주입</h3>
+  <p><strong>실패 A:</strong> <code>correct</code> 계산을 <code>apply(stream+snapshot)</code>으로 바꾸고 assertion을 실행한다. Stale snapshot이 live update를 덮어 assertion이 실패한다.</p>
+  <p><strong>실패 B:</strong> <code>with_tombstone</code>의 마지막 <code>("B",None)</code>을 제거한다. B가 compacted state에 남아 assertion이 실패한다.</p>
+  <p><strong>복구 판단:</strong> Production에서는 단순 timestamp가 아니라 connector의 source position·snapshot flag·transaction metadata를 보존하고, authoritative DB와 key별 reconciliation을 수행한다.</p>
+
+  <h3 style="margin:20px 0 8px;color:#8b4f31">4) 자주 나는 오류와 해결</h3>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:break-word">
+    <tr><td style="width:38%;padding:8px;border:1px solid #dfd1c2"><code>SyntaxError</code> at <code>&lt;&lt;</code></td><td style="padding:8px;border:1px solid #dfd1c2">Code block 전체를 zsh/bash terminal에서 실행한다. Python REPL 안에 heredoc 문법을 넣지 않는다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd1c2">A와 B가 같은 partition</td><td style="padding:8px;border:1px solid #dfd1c2">Partition 수나 key를 바꿨기 때문이다. 핵심은 multi-key transaction이 서로 다른 partition으로 갈 수 있다는 사실이다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd1c2">Null을 JSON 문자열로 표현</td><td style="padding:8px;border:1px solid #dfd1c2"><code>"null"</code> 또는 <code>{"value":null}</code>은 Kafka record value 자체가 null인 tombstone과 다르다.</td></tr>
+    <tr><td style="padding:8px;border:1px solid #dfd1c2">Position을 시스템 간 비교</td><td style="padding:8px;border:1px solid #dfd1c2">Binlog position·LSN은 source별 domain이다. 서로 다른 DB의 position을 숫자 크기로 직접 비교하지 않는다.</td></tr>
+  </table>
+
+  <h3 style="margin:20px 0 8px;color:#8b4f31">5) Cleanup</h3>
+  <p>이 실습은 stdin code만 실행하므로 file·topic·container를 만들지 않는다. Terminal history에 실제 customer data나 credential을 붙여 넣지 않았는지만 확인한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">8. 놓치기 쉬운 함정</h2>
+  <ul style="padding-left:22px">
+    <li><strong>Commit time ≠ processing time:</strong> Event timestamp로 DB commit order를 복원하지 않는다.</li>
+    <li><strong>Global ordering 환상:</strong> Kafka ordering은 partition-local이다. 요구사항이 key-local이면 global order를 비싸게 만들지 않는다.</li>
+    <li><strong>Snapshot flag 무시:</strong> <code>op=read</code>를 일반 create와 구분하지 않으면 늦은 snapshot row가 최신 state를 덮을 수 있다.</li>
+    <li><strong>Primary key update:</strong> 하나의 update가 old key delete+tombstone+new key create로 나타날 수 있다.</li>
+    <li><strong>Tombstone 변형:</strong> SMT나 converter가 null record를 drop/변형하면 compaction과 sink delete semantics가 달라진다.</li>
+    <li><strong>Compaction 즉시성:</strong> Cleaner 전에는 모든 version이 존재하며 consumer는 중복·delete·tombstone을 볼 수 있다.</li>
+    <li><strong>Retention 이중 정책:</strong> <code>compact,delete</code>는 최신 key도 time/size에 따라 잃을 수 있다.</li>
+    <li><strong>Binlog/WAL purge:</strong> Outage RTO보다 source log retention이 짧으면 resnapshot 외 선택지가 사라진다.</li>
+    <li><strong>Schema history 손실:</strong> Data offset만 살아 있어도 과거 DDL 순서를 잃으면 decode가 실패할 수 있다.</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">9. 대기업 기술 면접 질문</h2>
+  <h3 style="margin:18px 0 6px;color:#8b4f31">Q1. 10억 row table을 무중단 CDC로 bootstrap하라.</h3>
+  <p><strong>좋은 답변 구조:</strong> DB engine·MVCC·허용 lock·RPO/RTO·throughput 수치화 → consistent snapshot 기준점 L0 → chunk/parallelism과 DB 부하 → L0 이후 log retention 계산 → snapshot/live merge와 dedup → schema history·offset DR → validation·cutover·rollback까지 답한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#8b4f31">Q2. DB transaction 하나가 여러 Kafka partition으로 갈 때 원자성을 어떻게 다룰까?</h3>
+  <p><strong>좋은 답변 구조:</strong> Key-local order와 global atomicity 구분 → transaction metadata·expected event count 확인 → consumer-side buffer/timeout 또는 aggregate 재설계 → Kafka transaction 가능 범위 → memory·latency·stuck transaction trade-off → reconciliation 대안을 제시한다.</p>
+
+  <h3 style="margin:18px 0 6px;color:#8b4f31">Q3. Delete event와 tombstone을 둘 다 보내는 이유는?</h3>
+  <p><strong>좋은 답변 구조:</strong> Delete envelope의 domain/audit 정보 → null tombstone의 compaction protocol → asynchronous cleaner와 <code>delete.retention.ms</code> → slow rebuild consumer failure window → sink null handling·PII·replay 정책까지 방어한다.</p>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">10. 복습/정답</h2>
+  <h3 style="margin:18px 0 6px;color:#8b4f31">어제 내용 회상 3문제</h3>
+  <ol style="padding-left:22px">
+    <li>Connector와 Task의 책임은 어떻게 다른가?</li>
+    <li>Source offset과 sink Kafka consumer offset은 각각 무엇을 뜻하는가?</li>
+    <li>Sink external write 후 offset commit 전 crash의 결과는?</li>
+  </ol>
+  <div style="padding:14px;background:#f8eee6;border-radius:8px"><strong>어제 정답/채점:</strong> ① Connector는 작업 분할·재구성, Task는 실제 data I/O(3점). ② Source offset은 외부 source 위치, sink offset은 Kafka progress(3점). ③ Replay와 중복 side effect가 가능하므로 idempotency·dedup·reconciliation 필요(3점).</div>
+
+  <h3 style="margin:22px 0 6px;color:#8b4f31">오늘 확인 문제 3개</h3>
+  <ol style="padding-left:22px">
+    <li>Initial snapshot 기준점 L0는 왜 row scan 전에 잡아야 하는가?</li>
+    <li>같은 DB transaction의 A·B event가 Kafka에서 원자적으로 보이지 않을 수 있는 이유는?</li>
+    <li>Delete envelope와 tombstone의 책임을 각각 말하라.</li>
+  </ol>
+  <div style="padding:14px;background:#f8eee6;border-radius:8px"><strong>오늘 정답/채점:</strong> ① L0 이전 consistent state와 이후 log를 gap 없이 합치기 위해서(3점). ② Key partitioning으로 서로 다른 partition에 append·소비될 수 있기 때문(3점). ③ Delete envelope는 업무 삭제 정보, tombstone은 compactor용 null marker(3점). 총 9점 중 7점 이상이면 통과.</div>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">11. 공식 자료</h2>
+  <ul style="padding-left:22px">
+    <li><a href="https://kafka.apache.org/43/configuration/topic-configs/" style="color:#8b4f31">Apache Kafka 4.3 Topic Configs</a> — <code>cleanup.policy</code>, <code>delete.retention.ms</code>, compaction lag의 정확한 의미</li>
+    <li><a href="https://kafka.apache.org/43/kafka-connect/overview/" style="color:#8b4f31">Apache Kafka 4.3 Connect Overview</a> — source connector와 automatic offset management의 framework 경계</li>
+    <li><a href="https://debezium.io/documentation/reference/stable/connectors/mysql.html" style="color:#8b4f31">Debezium 3.7 MySQL Connector</a> — binlog ordering, initial/incremental snapshot, schema history, delete+tombstone</li>
+    <li><a href="https://debezium.io/documentation/reference/stable/transformations/applying-transformations-selectively.html" style="color:#8b4f31">Debezium SMT Predicate Guide</a> — tombstone·heartbeat 등 서로 다른 event shape를 선택적으로 처리하는 법</li>
+  </ul>
+
+  <h2 style="margin:30px 0 12px;color:#8b4f31">12. 내일 예고</h2>
+  <div style="padding:16px;background:#f8eee6;border-left:5px solid #a4603d;border-radius:8px"><strong>Day 40 · dual write와 transactional outbox</strong><br>
+  DB commit과 Kafka publish를 두 번 따로 실행할 때 생기는 crash window를 분석하고, 같은 DB transaction에 business row와 outbox row를 기록한 뒤 CDC로 전달해 원자성 경계를 바꾸는 방법을 학습한다.</div>
+</td></tr>
+</table>
+</td></tr></table>
+</body>
+</html>
